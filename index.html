@@ -1,0 +1,507 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>日历待办 · 自用版</title>
+<meta name="theme-color" content="#2563eb" />
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="日历待办">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<style>
+:root{
+  --bg:#f4f7fb; --card:#ffffff; --text:#172033; --muted:#718096; --line:#e6eaf2;
+  --primary:#2563eb; --primary2:#1d4ed8; --danger:#dc2626; --ok:#16a34a; --warn:#f59e0b;
+  --shadow:0 10px 30px rgba(15,23,42,.08); --radius:18px;
+}
+[data-theme="dark"]{
+  --bg:#0b1220; --card:#111827; --text:#e5e7eb; --muted:#94a3b8; --line:#263244;
+  --primary:#60a5fa; --primary2:#3b82f6; --danger:#fb7185; --ok:#4ade80; --warn:#fbbf24;
+  --shadow:0 12px 40px rgba(0,0,0,.35);
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;background:var(--bg);color:var(--text)}
+body{padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+button,input,textarea,select{font:inherit}
+button{border:0;cursor:pointer}
+.app{max-width:1180px;margin:0 auto;padding:16px}
+.header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
+.brand{display:flex;align-items:center;gap:10px}
+.logo{width:42px;height:42px;border-radius:14px;background:linear-gradient(135deg,var(--primary),#7c3aed);display:grid;place-items:center;color:white;font-weight:900;box-shadow:var(--shadow)}
+.brand h1{font-size:22px;margin:0}
+.brand p{font-size:12px;color:var(--muted);margin:2px 0 0}
+.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.btn{padding:10px 12px;border-radius:12px;background:var(--card);color:var(--text);border:1px solid var(--line);box-shadow:0 2px 8px rgba(15,23,42,.04)}
+.btn.primary{background:var(--primary);color:white;border-color:transparent}
+.btn.danger{background:rgba(220,38,38,.1);color:var(--danger);border-color:rgba(220,38,38,.2)}
+.btn.small{padding:7px 9px;border-radius:10px;font-size:13px}
+.main{display:grid;grid-template-columns:1.35fr .85fr;gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}
+.calendar{padding:14px}
+.cal-top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+.month-title{font-size:22px;font-weight:800;letter-spacing:.5px}
+.month-sub{font-size:12px;color:var(--muted);margin-top:2px}
+.nav{display:flex;gap:8px}
+.weekdays,.grid{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}
+.weekdays div{text-align:center;font-size:12px;color:var(--muted);padding:6px 0}
+.day{min-height:104px;border:1px solid var(--line);border-radius:14px;background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(0,0,0,0));padding:8px;position:relative;overflow:hidden}
+.day:hover{outline:2px solid rgba(37,99,235,.15)}
+.day.other{opacity:.42}
+.day.selected{border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.14)}
+.day.today .date{background:var(--primary);color:white}
+.date{width:28px;height:28px;border-radius:10px;display:grid;place-items:center;font-size:13px;font-weight:700}
+.day-head{display:flex;justify-content:space-between;align-items:flex-start;gap:4px}
+.badge{font-size:11px;border-radius:999px;padding:2px 6px;background:rgba(37,99,235,.1);color:var(--primary);white-space:nowrap}
+.mini-list{margin-top:8px;display:flex;flex-direction:column;gap:4px}
+.mini{font-size:12px;line-height:1.2;padding:4px 6px;border-radius:8px;background:rgba(37,99,235,.08);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mini.done{text-decoration:line-through;opacity:.55}
+.mini.high{background:rgba(220,38,38,.12)}
+.mini.mid{background:rgba(245,158,11,.15)}
+.mini.low{background:rgba(22,163,74,.12)}
+.more{font-size:11px;color:var(--muted);margin-top:2px}
+.side{display:flex;flex-direction:column;gap:14px}
+.panel{padding:14px}
+.panel-title{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:12px}
+.panel-title h2{font-size:18px;margin:0}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.stat{padding:12px;border-radius:14px;border:1px solid var(--line);background:rgba(37,99,235,.04)}
+.stat b{font-size:21px;display:block}
+.stat span{font-size:12px;color:var(--muted)}
+.task-list{display:flex;flex-direction:column;gap:9px;max-height:50vh;overflow:auto;padding-right:2px}
+.task{border:1px solid var(--line);border-radius:14px;padding:10px;background:rgba(255,255,255,.03)}
+.task.done{opacity:.62}
+.task-row{display:flex;gap:9px;align-items:flex-start}
+.check{width:22px;height:22px;border-radius:8px;border:2px solid var(--line);display:grid;place-items:center;flex:0 0 auto;margin-top:1px;background:transparent;color:white}
+.task.done .check{background:var(--ok);border-color:var(--ok)}
+.task-body{min-width:0;flex:1}
+.task-title{font-weight:750;word-break:break-word}
+.task.done .task-title{text-decoration:line-through}
+.meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;color:var(--muted);font-size:12px}
+.pill{border-radius:999px;padding:2px 7px;background:rgba(148,163,184,.13)}
+.pill.high{color:var(--danger);background:rgba(220,38,38,.12)}
+.pill.mid{color:var(--warn);background:rgba(245,158,11,.15)}
+.pill.low{color:var(--ok);background:rgba(22,163,74,.12)}
+.task-actions{display:flex;gap:6px;margin-top:8px}
+.empty{padding:22px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:14px}
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:flex-end;justify-content:center;z-index:30}
+.modal-bg.show{display:flex}
+.modal{width:min(560px,100%);max-height:92vh;overflow:auto;background:var(--card);border-radius:24px 24px 0 0;padding:18px;border:1px solid var(--line);box-shadow:0 -20px 60px rgba(0,0,0,.25)}
+.modal h3{margin:0 0 14px;font-size:20px}
+.form{display:grid;gap:10px}
+label{font-size:13px;color:var(--muted);font-weight:700}
+input,textarea,select{width:100%;padding:11px 12px;border-radius:12px;border:1px solid var(--line);background:transparent;color:var(--text);outline:none}
+textarea{min-height:90px;resize:vertical}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:12px}
+.searchbar{display:flex;gap:8px}
+.searchbar input{flex:1}
+.search-results{display:none;margin-top:10px;max-height:260px;overflow:auto}
+.search-results.show{display:block}
+.result{padding:10px;border:1px solid var(--line);border-radius:12px;margin-bottom:8px}
+.tip{font-size:12px;color:var(--muted);line-height:1.6}
+.file{display:none}
+.toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:#111827;color:white;padding:10px 14px;border-radius:999px;box-shadow:var(--shadow);display:none;z-index:50;max-width:90%;text-align:center}
+.toast.show{display:block}
+@media(max-width:840px){
+  .app{padding:12px}
+  .header{align-items:flex-start}
+  .brand h1{font-size:19px}
+  .actions .btn:not(.primary){display:none}
+  .main{grid-template-columns:1fr}
+  .day{min-height:74px;padding:6px;border-radius:12px}
+  .weekdays,.grid{gap:5px}
+  .date{width:24px;height:24px;border-radius:8px;font-size:12px}
+  .mini-list{gap:3px;margin-top:5px}
+  .mini{font-size:10px;padding:3px 4px}
+  .badge{font-size:10px;padding:1px 5px}
+  .month-title{font-size:19px}
+  .task-list{max-height:none}
+  .row{grid-template-columns:1fr}
+}
+@media print{
+  body{background:white}
+  .actions,.nav,.searchbar,.task-actions,.btn,.modal-bg{display:none!important}
+  .main{grid-template-columns:1fr}
+  .card{box-shadow:none}
+}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <header class="header">
+    <div class="brand">
+      <div class="logo">✓</div>
+      <div>
+        <h1>日历待办</h1>
+        <p>按日期添加任务 · 本地保存 · 可导入导出</p>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn small" id="themeBtn">深色</button>
+      <button class="btn small" id="exportBtn">导出备份</button>
+      <button class="btn small" id="importBtn">导入备份</button>
+      <button class="btn small" id="csvBtn">导出CSV</button>
+      <button class="btn primary" id="addBtn">+ 新建待办</button>
+      <input id="importFile" class="file" type="file" accept=".json,application/json">
+    </div>
+  </header>
+
+  <main class="main">
+    <section class="card calendar">
+      <div class="cal-top">
+        <div>
+          <div class="month-title" id="monthTitle"></div>
+          <div class="month-sub" id="monthSub"></div>
+        </div>
+        <div class="nav">
+          <button class="btn small" id="prevBtn">‹</button>
+          <button class="btn small" id="todayBtn">今天</button>
+          <button class="btn small" id="nextBtn">›</button>
+        </div>
+      </div>
+      <div class="weekdays">
+        <div>一</div><div>二</div><div>三</div><div>四</div><div>五</div><div>六</div><div>日</div>
+      </div>
+      <div class="grid" id="grid"></div>
+    </section>
+
+    <aside class="side">
+      <section class="card panel">
+        <div class="panel-title">
+          <h2 id="selectedTitle">今日待办</h2>
+          <button class="btn small primary" id="addForDayBtn">添加</button>
+        </div>
+        <div class="task-list" id="taskList"></div>
+      </section>
+
+      <section class="card panel">
+        <div class="panel-title"><h2>本月概览</h2></div>
+        <div class="stats">
+          <div class="stat"><b id="statAll">0</b><span>本月任务</span></div>
+          <div class="stat"><b id="statDone">0</b><span>已完成</span></div>
+          <div class="stat"><b id="statRate">0%</b><span>完成率</span></div>
+        </div>
+      </section>
+
+      <section class="card panel">
+        <div class="panel-title"><h2>搜索</h2></div>
+        <div class="searchbar">
+          <input id="searchInput" placeholder="搜任务标题、标签、备注">
+          <button class="btn small" id="clearSearchBtn">清空</button>
+        </div>
+        <div class="search-results" id="searchResults"></div>
+        <p class="tip">提示：所有数据存在本机浏览器。换手机、清缓存、换浏览器前，请先“导出备份”。</p>
+      </section>
+    </aside>
+  </main>
+</div>
+
+<div class="modal-bg" id="modalBg">
+  <div class="modal">
+    <h3 id="modalTitle">新建待办</h3>
+    <div class="form">
+      <div>
+        <label>任务标题</label>
+        <input id="taskTitle" placeholder="例如：完成数学建模训练 / 取快递 / 背单词">
+      </div>
+      <div class="row">
+        <div>
+          <label>日期</label>
+          <input id="taskDate" type="date">
+        </div>
+        <div>
+          <label>时间，可不填</label>
+          <input id="taskTime" type="time">
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>优先级</label>
+          <select id="taskPriority">
+            <option value="low">低</option>
+            <option value="mid" selected>中</option>
+            <option value="high">高</option>
+          </select>
+        </div>
+        <div>
+          <label>标签</label>
+          <input id="taskTag" placeholder="学习 / 工作 / 生活 / 考试">
+        </div>
+      </div>
+      <div>
+        <label>备注</label>
+        <textarea id="taskNote" placeholder="可写具体步骤、地点、资料链接等"></textarea>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" id="cancelBtn">取消</button>
+      <button class="btn primary" id="saveBtn">保存</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+(function(){
+  const KEY = "kevin_calendar_todo_v1";
+  const $ = s => document.querySelector(s);
+  const state = {
+    current: new Date(),
+    selected: toDateKey(new Date()),
+    editingId: null,
+    tasks: [],
+    theme: localStorage.getItem("todo_theme") || "light"
+  };
+
+  function toDateKey(d){
+    const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,"0"), day=String(d.getDate()).padStart(2,"0");
+    return `${y}-${m}-${day}`;
+  }
+  function parseKey(k){
+    const [y,m,d]=k.split("-").map(Number);
+    return new Date(y,m-1,d);
+  }
+  function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,8); }
+  function esc(s){ return String(s||"").replace(/[&<>"']/g, m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m])); }
+  function load(){
+    try{
+      const raw = localStorage.getItem(KEY);
+      if(raw){ state.tasks = JSON.parse(raw).tasks || []; }
+    }catch(e){ state.tasks=[]; }
+  }
+  function save(){ localStorage.setItem(KEY, JSON.stringify({version:1, updatedAt:new Date().toISOString(), tasks:state.tasks})); }
+  function toast(msg){
+    const t=$("#toast"); t.textContent=msg; t.classList.add("show");
+    clearTimeout(toast._t); toast._t=setTimeout(()=>t.classList.remove("show"),1800);
+  }
+  function priorityName(p){ return p==="high"?"高":p==="mid"?"中":"低"; }
+  function priorityClass(p){ return p==="high"?"high":p==="mid"?"mid":"low"; }
+
+  function render(){
+    document.documentElement.dataset.theme = state.theme;
+    $("#themeBtn").textContent = state.theme==="dark" ? "浅色" : "深色";
+    renderCalendar();
+    renderDay();
+    renderStats();
+    doSearch();
+  }
+
+  function renderCalendar(){
+    const y = state.current.getFullYear(), m = state.current.getMonth();
+    $("#monthTitle").textContent = `${y}年${m+1}月`;
+    $("#monthSub").textContent = `点击日期查看或添加待办`;
+    const first = new Date(y,m,1);
+    const start = new Date(first);
+    const offset = (first.getDay()+6)%7;
+    start.setDate(first.getDate()-offset);
+    const todayKey = toDateKey(new Date());
+    const grid = $("#grid");
+    grid.innerHTML = "";
+    for(let i=0;i<42;i++){
+      const d = new Date(start); d.setDate(start.getDate()+i);
+      const key = toDateKey(d);
+      const items = state.tasks.filter(t=>t.date===key).sort(sortTasks);
+      const cell = document.createElement("div");
+      cell.className = "day" + (d.getMonth()!==m?" other":"") + (key===state.selected?" selected":"") + (key===todayKey?" today":"");
+      cell.onclick = ()=>{ state.selected=key; if(d.getMonth()!==state.current.getMonth()) state.current=new Date(d.getFullYear(),d.getMonth(),1); render(); };
+      const shown = items.slice(0,3).map(t=>`<div class="mini ${t.done?'done':''} ${priorityClass(t.priority)}">${esc(t.time? t.time+" ":"")}${esc(t.title)}</div>`).join("");
+      cell.innerHTML = `
+        <div class="day-head">
+          <div class="date">${d.getDate()}</div>
+          ${items.length?`<div class="badge">${items.filter(x=>!x.done).length}/${items.length}</div>`:""}
+        </div>
+        <div class="mini-list">${shown}${items.length>3?`<div class="more">+${items.length-3} 更多</div>`:""}</div>
+      `;
+      grid.appendChild(cell);
+    }
+  }
+
+  function sortTasks(a,b){
+    const pr = {high:0, mid:1, low:2};
+    return (a.done-b.done) || ((a.time||"99:99").localeCompare(b.time||"99:99")) || (pr[a.priority]-pr[b.priority]);
+  }
+
+  function renderDay(){
+    const key = state.selected;
+    const d = parseKey(key);
+    const week = "日一二三四五六"[d.getDay()];
+    $("#selectedTitle").textContent = `${d.getMonth()+1}月${d.getDate()}日 周${week}`;
+    const list = $("#taskList");
+    const items = state.tasks.filter(t=>t.date===key).sort(sortTasks);
+    if(!items.length){
+      list.innerHTML = `<div class="empty">这一天还没有待办<br><br><button class="btn primary" onclick="window.todoOpenAdd()">+ 添加一个</button></div>`;
+      return;
+    }
+    list.innerHTML = items.map(t=>`
+      <div class="task ${t.done?'done':''}">
+        <div class="task-row">
+          <button class="check" onclick="window.todoToggle('${t.id}')">${t.done?'✓':''}</button>
+          <div class="task-body">
+            <div class="task-title">${esc(t.title)}</div>
+            <div class="meta">
+              ${t.time?`<span class="pill">⏰ ${esc(t.time)}</span>`:""}
+              <span class="pill ${priorityClass(t.priority)}">优先级 ${priorityName(t.priority)}</span>
+              ${t.tag?`<span class="pill"># ${esc(t.tag)}</span>`:""}
+            </div>
+            ${t.note?`<div class="tip" style="margin-top:6px">${esc(t.note)}</div>`:""}
+            <div class="task-actions">
+              <button class="btn small" onclick="window.todoEdit('${t.id}')">编辑</button>
+              <button class="btn small danger" onclick="window.todoDelete('${t.id}')">删除</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    `).join("");
+  }
+
+  function renderStats(){
+    const y=state.current.getFullYear(), m=state.current.getMonth();
+    const items = state.tasks.filter(t=>{
+      const d=parseKey(t.date);
+      return d.getFullYear()===y && d.getMonth()===m;
+    });
+    const done = items.filter(t=>t.done).length;
+    $("#statAll").textContent=items.length;
+    $("#statDone").textContent=done;
+    $("#statRate").textContent=items.length?Math.round(done/items.length*100)+"%":"0%";
+  }
+
+  function openModal(id=null){
+    state.editingId=id;
+    const t = id ? state.tasks.find(x=>x.id===id) : null;
+    $("#modalTitle").textContent = id ? "编辑待办" : "新建待办";
+    $("#taskTitle").value = t?.title || "";
+    $("#taskDate").value = t?.date || state.selected;
+    $("#taskTime").value = t?.time || "";
+    $("#taskPriority").value = t?.priority || "mid";
+    $("#taskTag").value = t?.tag || "";
+    $("#taskNote").value = t?.note || "";
+    $("#modalBg").classList.add("show");
+    setTimeout(()=>$("#taskTitle").focus(),50);
+  }
+  function closeModal(){ $("#modalBg").classList.remove("show"); state.editingId=null; }
+
+  function saveTask(){
+    const title=$("#taskTitle").value.trim();
+    const date=$("#taskDate").value;
+    if(!title){ toast("先写任务标题"); return; }
+    if(!date){ toast("请选择日期"); return; }
+    const obj = {
+      title, date,
+      time: $("#taskTime").value,
+      priority: $("#taskPriority").value,
+      tag: $("#taskTag").value.trim(),
+      note: $("#taskNote").value.trim()
+    };
+    if(state.editingId){
+      const i=state.tasks.findIndex(t=>t.id===state.editingId);
+      if(i>=0) state.tasks[i] = {...state.tasks[i], ...obj, updatedAt:new Date().toISOString()};
+    }else{
+      state.tasks.push({id:uid(), done:false, createdAt:new Date().toISOString(), ...obj});
+    }
+    state.selected=date;
+    state.current=parseKey(date);
+    save(); closeModal(); render(); toast("已保存");
+  }
+
+  function doSearch(){
+    const q=$("#searchInput").value.trim().toLowerCase();
+    const box=$("#searchResults");
+    if(!q){ box.classList.remove("show"); box.innerHTML=""; return; }
+    const results = state.tasks.filter(t => [t.title,t.tag,t.note,t.date,t.time].join(" ").toLowerCase().includes(q)).sort((a,b)=>a.date.localeCompare(b.date)||sortTasks(a,b)).slice(0,80);
+    box.classList.add("show");
+    box.innerHTML = results.length ? results.map(t=>`
+      <div class="result" onclick="window.todoJump('${t.date}')">
+        <b>${esc(t.title)}</b>
+        <div class="meta"><span class="pill">${esc(t.date)}</span>${t.time?`<span class="pill">${esc(t.time)}</span>`:""}<span class="pill ${priorityClass(t.priority)}">${priorityName(t.priority)}</span></div>
+      </div>
+    `).join("") : `<div class="empty">没有找到</div>`;
+  }
+
+  function exportJSON(){
+    const data = JSON.stringify({app:"日历待办", version:1, exportedAt:new Date().toISOString(), tasks:state.tasks}, null, 2);
+    download("todo_backup_"+toDateKey(new Date())+".json", data, "application/json");
+  }
+  function exportCSV(){
+    const header = ["日期","时间","标题","优先级","标签","完成","备注"];
+    const rows = state.tasks.slice().sort((a,b)=>a.date.localeCompare(b.date)||sortTasks(a,b)).map(t=>[
+      t.date,t.time||"",t.title,priorityName(t.priority),t.tag||"",t.done?"是":"否",t.note||""
+    ]);
+    const csv = [header,...rows].map(r=>r.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(",")).join("\n");
+    download("todo_tasks_"+toDateKey(new Date())+".csv", "\ufeff"+csv, "text/csv;charset=utf-8");
+  }
+  function download(name, content, type){
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(new Blob([content],{type}));
+    a.download=name; a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+  }
+
+  window.todoOpenAdd = ()=>openModal();
+  window.todoToggle = id => { const t=state.tasks.find(x=>x.id===id); if(t){t.done=!t.done;t.updatedAt=new Date().toISOString();save();render();} };
+  window.todoEdit = id => openModal(id);
+  window.todoDelete = id => {
+    if(confirm("确定删除这个待办吗？")){
+      state.tasks=state.tasks.filter(t=>t.id!==id); save(); render(); toast("已删除");
+    }
+  };
+  window.todoJump = date => { state.selected=date; state.current=parseKey(date); render(); };
+
+  $("#prevBtn").onclick=()=>{ state.current.setMonth(state.current.getMonth()-1); render(); };
+  $("#nextBtn").onclick=()=>{ state.current.setMonth(state.current.getMonth()+1); render(); };
+  $("#todayBtn").onclick=()=>{ const d=new Date(); state.current=new Date(d.getFullYear(),d.getMonth(),1); state.selected=toDateKey(d); render(); };
+  $("#addBtn").onclick=()=>openModal();
+  $("#addForDayBtn").onclick=()=>openModal();
+  $("#cancelBtn").onclick=closeModal;
+  $("#saveBtn").onclick=saveTask;
+  $("#modalBg").onclick=e=>{ if(e.target.id==="modalBg") closeModal(); };
+  $("#themeBtn").onclick=()=>{ state.theme=state.theme==="dark"?"light":"dark"; localStorage.setItem("todo_theme",state.theme); render(); };
+  $("#exportBtn").onclick=exportJSON;
+  $("#csvBtn").onclick=exportCSV;
+  $("#importBtn").onclick=()=>$("#importFile").click();
+  $("#importFile").onchange=e=>{
+    const f=e.target.files[0]; if(!f) return;
+    const reader=new FileReader();
+    reader.onload=()=>{
+      try{
+        const data=JSON.parse(reader.result);
+        if(!Array.isArray(data.tasks)) throw new Error("格式错误");
+        if(confirm(`将导入 ${data.tasks.length} 条任务。是否覆盖当前数据？\n点“取消”则合并导入。`)){
+          state.tasks=data.tasks;
+        }else{
+          const old=new Set(state.tasks.map(t=>t.id));
+          data.tasks.forEach(t=>state.tasks.push(old.has(t.id)?{...t,id:uid()}:t));
+        }
+        save(); render(); toast("导入成功");
+      }catch(err){ alert("导入失败：不是有效的备份文件"); }
+      e.target.value="";
+    };
+    reader.readAsText(f);
+  };
+  $("#searchInput").oninput=doSearch;
+  $("#clearSearchBtn").onclick=()=>{$("#searchInput").value=""; doSearch();};
+
+  document.addEventListener("keydown", e=>{
+    if(e.key==="Escape") closeModal();
+    if((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="n"){ e.preventDefault(); openModal(); }
+  });
+
+  // 注入简易 manifest；在支持的移动浏览器中可添加到主屏幕。
+  try{
+    const iconSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="192" height="192"><rect width="192" height="192" rx="44" fill="#2563eb"/><text x="96" y="120" font-size="96" text-anchor="middle" fill="white" font-family="Arial">✓</text></svg>`;
+    const manifest = {
+      name:"日历待办", short_name:"待办", start_url:".", display:"standalone",
+      background_color:"#f4f7fb", theme_color:"#2563eb",
+      icons:[{src:"data:image/svg+xml;base64,"+btoa(unescape(encodeURIComponent(iconSvg))), sizes:"192x192", type:"image/svg+xml"}]
+    };
+    const link=document.createElement("link");
+    link.rel="manifest";
+    link.href="data:application/manifest+json,"+encodeURIComponent(JSON.stringify(manifest));
+    document.head.appendChild(link);
+  }catch(e){}
+
+  load(); render();
+})();
+</script>
+</body>
+</html>
