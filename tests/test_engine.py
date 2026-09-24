@@ -114,3 +114,30 @@ def test_rebalance_band_skips_small_adjustments():
     assert len(res.trades) == 1
     res = Backtester({"600000": df}, 1_000_000, NO_FEES, slippage=0, rebalance_band=0).run(Fixed(sched))
     assert len(res.trades) == 2
+
+
+def test_load_akshare_retries_network_errors(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    from ashare_quant.data import load_akshare
+
+    calls = []
+
+    def flaky(**kwargs):
+        calls.append(kwargs)
+        if len(calls) < 3:
+            raise ConnectionError("Remote end closed connection without response")
+        return pd.DataFrame(
+            {"日期": ["2024-01-02", "2024-01-03"], "开盘": [1.0, 1.1], "收盘": [1.1, 1.2],
+             "最高": [1.2, 1.3], "最低": [0.9, 1.0], "成交量": [100, 200]}
+        )
+
+    monkeypatch.setitem(sys.modules, "akshare", types.SimpleNamespace(fund_etf_hist_em=flaky, stock_zh_a_hist=flaky))
+    df = load_akshare("510300", "2024-01-01", "2024-01-31", cache_dir=tmp_path, retry_wait=0)
+    assert len(calls) == 3 and len(df) == 2 and list(df.columns) == ["open", "high", "low", "close", "volume"]
+
+    monkeypatch.setitem(sys.modules, "akshare", types.SimpleNamespace(fund_etf_hist_em=flaky, stock_zh_a_hist=flaky))
+    calls.clear()
+    with pytest.raises(ConnectionError):
+        load_akshare("600519", "2024-01-01", "2024-01-31", cache_dir=tmp_path, retries=2, retry_wait=0)

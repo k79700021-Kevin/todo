@@ -630,7 +630,17 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     try {
       for (const s of syms) {
         showStatus(`正在获取 ${s}（${Object.keys(got).length + 1}/${syms.length}）…`);
-        got[s] = await fetchEastmoney(s, start, end, $('#onAdjust').value);
+        // 东方财富偶尔直接断开连接，失败后稍等重试，最多 3 次
+        for (let attempt = 1; ; attempt++) {
+          try {
+            got[s] = await fetchEastmoney(s, start, end, $('#onAdjust').value);
+            break;
+          } catch (e) {
+            if (attempt >= 3 || /没有数据/.test(e.message)) throw e;
+            showStatus(`${s} 第 ${attempt} 次失败，${attempt * 2} 秒后重试…`);
+            await new Promise((r) => setTimeout(r, attempt * 2000));
+          }
+        }
       }
       state.online = got;
       saveData();

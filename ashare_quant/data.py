@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import numpy as np
@@ -43,6 +44,8 @@ def load_akshare(
     end: str,
     adjust: str = "qfq",
     cache_dir: str | Path = "data",
+    retries: int = 4,
+    retry_wait: float = 2.0,
 ) -> pd.DataFrame:
     """从东方财富（经 akshare）获取日线。股票与 ETF 自动区分。"""
     cache = Path(cache_dir) / f"{symbol}_{adjust or 'none'}_{start}_{end}.csv"
@@ -54,13 +57,21 @@ def load_akshare(
         raise ImportError("需要 akshare：pip install akshare") from exc
 
     fetch = ak.fund_etf_hist_em if is_etf(symbol) else ak.stock_zh_a_hist
-    raw = fetch(
-        symbol=symbol,
-        period="daily",
-        start_date=start.replace("-", ""),
-        end_date=end.replace("-", ""),
-        adjust=adjust,
-    )
+    # 东方财富接口偶尔直接断开连接（境外网络尤其常见），网络错误时退避重试
+    for attempt in range(retries):
+        try:
+            raw = fetch(
+                symbol=symbol,
+                period="daily",
+                start_date=start.replace("-", ""),
+                end_date=end.replace("-", ""),
+                adjust=adjust,
+            )
+            break
+        except OSError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(retry_wait * 2**attempt)
     if raw is None or raw.empty:
         raise ValueError(f"{symbol} 在 {start}~{end} 没有数据")
     df = normalize_bars(raw)
