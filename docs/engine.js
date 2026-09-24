@@ -91,7 +91,7 @@
           l[i] = src.low ? src.low[j] : Math.min(o[i], c[i]);
           v[i] = src.volume ? src.volume[j] : NaN;
           const vol = src.volume ? src.volume[j] : 1;
-          t[i] = Number.isFinite(o[i]) && Number.isFinite(c[i]) && vol > 0;
+          t[i] = o[i] > 0 && c[i] > 0 && vol > 0; // 价格非正（坏数据）也视为不可交易
         });
         high[s] = h; low[s] = l; volume[s] = v;
         const p = new Array(n).fill(NaN);

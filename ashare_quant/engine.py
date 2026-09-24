@@ -58,7 +58,8 @@ class Backtester:
         self.open = panel("open")
         self.close = panel("close")
         volume = panel("volume")
-        self.tradable = self.open.notna() & self.close.notna() & (volume.fillna(0) > 0)
+        # 价格非正（坏数据）也视为不可交易，避免按 0 价买入无穷多股
+        self.tradable = (self.open > 0) & (self.close > 0) & (volume.fillna(0) > 0)
         self.prev_close = self.close.ffill().shift(1)
 
     def run(self, strategy) -> BacktestResult:

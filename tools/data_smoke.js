@@ -9,15 +9,15 @@ const AQ = require(path.join(docs, 'engine.js'));
 const { RuleStrategy } = require(path.join(docs, 'rules.js'));
 const R = require(path.join(docs, 'research.js'));
 
-// 覆盖沪市 ETF、深市 ETF、沪市主板、创业板、科创板
-const SYMBOLS = ['510300', '510500', '159915', '600519', '300750', '688981'];
+// 覆盖沪市 ETF、深市 ETF、沪市主板、深市主板、创业板、科创板；000333 分红多，减法前复权会出现负价格
+const SYMBOLS = ['510300', '510500', '159915', '600519', '000333', '300750', '688981'];
 const START = '2016-01-01';
 const END = new Date().toISOString().slice(0, 10);
 const BASE = process.env.EM_BASE; // 测试时可指向本地假服务
 
-async function fetchOne(sym) {
+async function fetchRaw(sym, adjust) {
   const cb = 'cb_' + sym;
-  let url = em.klineUrl(sym, START, END, 'qfq', cb);
+  let url = em.klineUrl(sym, START, END, adjust, cb);
   if (BASE) url = url.replace('https://push2his.eastmoney.com', BASE);
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
@@ -32,6 +32,11 @@ async function fetchOne(sym) {
       await new Promise((r) => setTimeout(r, 2000 * attempt));
     }
   }
+}
+
+// 与网页"等比前复权"相同：后复权 + 不复权两份数据
+async function fetchOne(sym) {
+  return em.checkPositive(em.proportional(await fetchRaw(sym, 'hfq'), await fetchRaw(sym, 'none'), sym), sym);
 }
 
 function check(sym, d) {

@@ -7,6 +7,7 @@ const docs = path.join(__dirname, '..', '..', 'docs');
 const AQ = require(path.join(docs, 'engine.js'));
 const { RuleStrategy } = require(path.join(docs, 'rules.js'));
 const R = require(path.join(docs, 'research.js'));
+const em = require(path.join(docs, 'eastmoney.js'));
 
 const close = (a, b, tol = 1e-6) => assert.ok(Math.abs(a - b) <= tol, `${a} != ${b}`);
 
@@ -171,4 +172,26 @@ test('factor IC detects a planted predictive signal', () => {
   const q = R.factorQuantiles(bt, 'roc1', 1, 5);
   assert.equal(q.length, 5);
   assert.ok(q[4].mean > q[0].mean);
+});
+
+test('eastmoney: proportional forward adjustment stays positive and matches hfq returns', () => {
+  const dates = ['2014-01-02', '2014-01-03', '2014-01-06'];
+  const hfq = { dates, open: [100, 98, 98], high: [101, 99, 100], low: [99, 97, 97], close: [100, 97.5, 99], volume: [1, 1, 1] };
+  const raw = { dates, open: [40, 34, 34.2], high: [41, 35, 35], low: [39, 33, 34], close: [40, 34, 34.5], volume: [1, 1, 1] };
+  const q = em.proportional(hfq, raw, '000333');
+  close(q.close[2], 34.5, 1e-12);
+  close(q.close[1] / q.close[0], 97.5 / 100, 1e-12);
+  assert.ok(q.open.concat(q.close, q.high, q.low).every((v) => v > 0));
+  // 减法前复权产生的负价格必须被拒绝
+  assert.throws(() => em.checkPositive({ dates, open: [-10.3, 1, 1], close: [-0.29, 1, 1] }, '000333'), /价格为 -0.29/);
+  assert.equal(em.checkPositive(q, 'x'), q);
+});
+
+test('engine never trades at a non-positive price', () => {
+  const dates = ['2014-01-02', '2014-01-03', '2014-01-06', '2014-01-07'];
+  const px = [0, 0, 5, 5];
+  const bt = new AQ.Backtester({ '000333': { dates, open: px, close: px, volume: [1, 1, 1, 1] } }, { rebalanceBand: 0 });
+  const res = bt.run(new AQ.BuyAndHold());
+  assert.ok(res.trades.every((t) => t.price > 0 && Number.isFinite(t.shares)));
+  assert.ok(res.equity.every(Number.isFinite));
 });

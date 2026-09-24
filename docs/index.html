@@ -203,7 +203,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
         <div data-pane="online" hidden>
           <label for="onSymbols">代码（逗号分隔）<input id="onSymbols" value="510300,510500,159915,518880,511260" autocomplete="off"></label>
           <label for="onAdjust">复权
-            <select id="onAdjust"><option value="qfq">前复权</option><option value="hfq">后复权</option><option value="none">不复权</option></select>
+            <select id="onAdjust"><option value="qfq">等比前复权（推荐）</option><option value="hfq">后复权</option><option value="none">不复权</option></select>
           </label>
           <button type="button" class="btn btn-secondary block" id="fetchBtn">获取行情</button>
           <p class="note" id="onStatus">从东方财富获取日线，区间取"交易设置"里的起止日期。在 Claude 里打开时外部接口会被拦截，请用 GitHub Pages 地址。</p>
@@ -549,6 +549,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       out[s] = { dates: pick(src.dates), open: pick(src.open), high: pick(src.high), low: pick(src.low), close: pick(src.close), volume: pick(src.volume) };
     }
     if (!Object.keys(out).length) throw new Error('所选日期区间内没有行情');
+    for (const s of Object.keys(out)) AQ.em.checkPositive(out[s], s);
     return out;
   }
 
@@ -586,14 +587,14 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       if (!m) continue;
       const d = `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
       const o = parseFloat(p[col.open]), c = parseFloat(p[col.close]);
-      if (!(o > 0 && c > 0)) continue;
+      if (!(Number.isFinite(o) && Number.isFinite(c))) continue;
       const num = (k, fb) => { const v = col[k] >= 0 ? parseFloat(p[col[k]]) : NaN; return fin(v) ? v : fb; };
       rows.set(d, [o, num('high', Math.max(o, c)), num('low', Math.min(o, c)), c, num('volume', 1)]);
     }
     const dates = [...rows.keys()].sort();
     if (!dates.length) throw new Error('没有解析出有效行情');
     const f = (k) => dates.map((d) => rows.get(d)[k]);
-    return { dates, open: f(0), high: f(1), low: f(2), close: f(3), volume: f(4) };
+    return AQ.em.checkPositive({ dates, open: f(0), high: f(1), low: f(2), close: f(3), volume: f(4) }, '文件');
   }
 
   function renderCsvList() {
@@ -640,7 +641,12 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
         // 东方财富偶尔直接断开连接，失败后稍等重试，最多 3 次
         for (let attempt = 1; ; attempt++) {
           try {
-            got[s] = await fetchEastmoney(s, start, end, $('#onAdjust').value);
+            const adjust = $('#onAdjust').value;
+            // 等比前复权 = 后复权价按最新真实价缩放，需要后复权与不复权两份数据
+            got[s] = adjust === 'qfq'
+              ? AQ.em.proportional(await fetchEastmoney(s, start, end, 'hfq'), await fetchEastmoney(s, start, end, 'none'), s)
+              : await fetchEastmoney(s, start, end, adjust);
+            AQ.em.checkPositive(got[s], s);
             break;
           } catch (e) {
             if (attempt >= 3 || /没有数据/.test(e.message)) throw e;

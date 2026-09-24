@@ -40,7 +40,14 @@ def normalize_bars(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"缺少列: {missing}")
     df = df[REQUIRED_COLUMNS].astype(float)
     df = df[~df.index.duplicated(keep="last")].sort_index()
-    return df.dropna(subset=["open", "close"])
+    df = df.dropna(subset=["open", "close"])
+    bad = df[(df["open"] <= 0) | (df["close"] <= 0)]
+    if len(bad):
+        raise ValueError(
+            f"{bad.index[0].date()} 起有 {len(bad)} 天价格 ≤ 0，不能用于回测。这通常是减法前复权造成的"
+            "（分红多的股票早年价格会被减成负数），请改用等比前复权（--source eastmoney --adjust qfq）或后复权"
+        )
+    return df
 
 
 EASTMONEY_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -67,26 +74,14 @@ def parse_eastmoney(payload: dict, symbol: str) -> pd.DataFrame:
     return normalize_bars(df)
 
 
-def load_eastmoney(
-    symbol: str,
-    start: str,
-    end: str,
-    adjust: str = "qfq",
-    cache_dir: str | Path = "data",
-    retries: int = 4,
-    retry_wait: float = 2.0,
-) -> pd.DataFrame:
-    """直接请求东方财富日线接口（网页版 docs/eastmoney.js 使用同一接口），不依赖 akshare。"""
-    cache = Path(cache_dir) / f"{symbol}_{adjust or 'none'}_{start}_{end}.csv"
-    if cache.exists():
-        return normalize_bars(pd.read_csv(cache))
+def _eastmoney_request(symbol: str, start: str, end: str, fqt: int, retries: int, retry_wait: float) -> pd.DataFrame:
     query = urllib.parse.urlencode(
         {
             "secid": f"{eastmoney_market(symbol)}.{symbol}",
             "fields1": "f1,f2,f3",
             "fields2": "f51,f52,f53,f54,f55,f56",
             "klt": 101,
-            "fqt": FQT[adjust],
+            "fqt": fqt,
             "beg": start.replace("-", ""),
             "end": end.replace("-", ""),
         }
@@ -101,7 +96,48 @@ def load_eastmoney(
             if attempt == retries - 1:
                 raise
             time.sleep(retry_wait * 2**attempt)
-    df = parse_eastmoney(payload, symbol)
+    return parse_eastmoney(payload, symbol)
+
+
+def proportional_adjust(hfq: pd.DataFrame, raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """等比前复权：后复权价（按比例调整，恒为正）整体乘以"最新不复权价 / 最新后复权价"。
+
+    东方财富自带的前复权是减法调整，分红多的股票早年价格会被减成 0 或负数，无法用于回测。
+    与网页版 docs/eastmoney.js 的 proportional 算法相同。
+    """
+    common = hfq.index.intersection(raw.index[raw["close"] > 0])
+    if common.empty:
+        raise ValueError(f"{symbol} 无法对齐不复权与后复权数据")
+    last = common[-1]
+    factor = raw.at[last, "close"] / hfq.at[last, "close"]
+    out = hfq.copy()
+    out[["open", "high", "low", "close"]] = out[["open", "high", "low", "close"]] * factor
+    return out
+
+
+def load_eastmoney(
+    symbol: str,
+    start: str,
+    end: str,
+    adjust: str = "qfq",
+    cache_dir: str | Path = "data",
+    retries: int = 4,
+    retry_wait: float = 2.0,
+) -> pd.DataFrame:
+    """直接请求东方财富日线接口（网页版 docs/eastmoney.js 使用同一接口），不依赖 akshare。
+
+    adjust："qfq" 为等比前复权（默认），"hfq" 后复权，"" 或 "none" 不复权。
+    """
+    tag = {"qfq": "qfq-ratio", "hfq": "hfq"}.get(adjust, "none")
+    cache = Path(cache_dir) / f"{symbol}_{tag}_{start}_{end}.csv"
+    if cache.exists():
+        return normalize_bars(pd.read_csv(cache))
+    if adjust == "qfq":
+        hfq = _eastmoney_request(symbol, start, end, FQT["hfq"], retries, retry_wait)
+        raw = _eastmoney_request(symbol, start, end, FQT["none"], retries, retry_wait)
+        df = proportional_adjust(hfq, raw, symbol)
+    else:
+        df = _eastmoney_request(symbol, start, end, FQT[adjust], retries, retry_wait)
     cache.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(cache)
     return df

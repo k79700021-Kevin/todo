@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from ashare_quant.data import load_akshare, load_eastmoney  # noqa: E402
 
-SYMBOLS = ["510300", "600519"]
+SYMBOLS = ["510300", "600519", "000333"]
 START, END = "2020-01-01", "2024-12-31"
 
 
@@ -47,8 +47,8 @@ def main() -> None:
             common = [d for d in df.index.strftime("%Y-%m-%d") if d in ref]
             diff = np.max(np.abs(df.loc[common, "close"].to_numpy() / np.array([ref[d] for d in common]) - 1))
             lines.append(f"- {s} 与网页版取到的数据核对：{len(common)} 个交易日，最大相对差 {diff:.1e}")
-            # 前复权价随新的分红除权变化，同一时点拉取的两份应完全一致
-            assert len(common) > 900 and diff < 1e-6, f"{s} Python 与网页版数据不一致"
+            # 两边都是等比前复权（同一算法），同一时点拉取应完全一致
+            assert len(common) > 900 and diff < 1e-9, f"{s} Python 与网页版数据不一致"
 
     try:
         with tempfile.TemporaryDirectory() as cache:

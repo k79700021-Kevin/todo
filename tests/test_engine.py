@@ -163,17 +163,51 @@ def test_load_eastmoney_parses_and_retries(tmp_path, monkeypatch):
         return io.BytesIO(json.dumps(payload).encode())
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    df = data_mod.load_eastmoney("600519", "2024-01-01", "2024-01-31", cache_dir=tmp_path, retry_wait=0)
+    df = data_mod.load_eastmoney("600519", "2024-01-01", "2024-01-31", adjust="hfq", cache_dir=tmp_path, retry_wait=0)
     assert len(seen) == 2
     url = seen[0].full_url
-    assert "secid=1.600519" in url and "fqt=1" in url and "beg=20240101" in url
+    assert "secid=1.600519" in url and "fqt=2" in url and "beg=20240101" in url
     assert seen[0].get_header("Referer") == "https://quote.eastmoney.com/"
     assert df.loc["2024-01-03", "close"] == 1694.0 and df.loc["2024-01-02", "high"] == 1710.0
     # 第二次读缓存，不再请求
-    data_mod.load_eastmoney("600519", "2024-01-01", "2024-01-31", cache_dir=tmp_path)
+    data_mod.load_eastmoney("600519", "2024-01-01", "2024-01-31", adjust="hfq", cache_dir=tmp_path)
     assert len(seen) == 2
     assert data_mod.eastmoney_market("159915") == 0 and data_mod.eastmoney_market("510300") == 1
 
     monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: io.BytesIO(b'{"data": null}'))
     with pytest.raises(ValueError, match="没有数据"):
-        data_mod.load_eastmoney("000000", "2024-01-01", "2024-01-31", cache_dir=tmp_path)
+        data_mod.load_eastmoney("000000", "2024-01-01", "2024-01-31", adjust="hfq", cache_dir=tmp_path)
+
+
+def test_eastmoney_qfq_is_proportional_and_positive(tmp_path, monkeypatch):
+    """等比前复权 = 后复权按最新真实价缩放：涨跌幅与后复权一致、价格恒正、最新价等于真实价。"""
+    import io
+    import json
+    import urllib.parse
+    import urllib.request
+
+    from ashare_quant import data as data_mod
+
+    # 后复权（比例调整）与不复权：2024-01-03 除权，每股分红 5 元
+    hfq = ["2024-01-02,100,100,101,99,10", "2024-01-03,98,97.5,99,97,10", "2024-01-04,98,99,100,97,10"]
+    raw = ["2024-01-02,40,40,41,39,10", "2024-01-03,34,34,35,33,10", "2024-01-04,34.2,34.5,35,34,10"]
+
+    def fake_urlopen(req, timeout):
+        fqt = urllib.parse.parse_qs(urllib.parse.urlparse(req.full_url).query)["fqt"][0]
+        return io.BytesIO(json.dumps({"data": {"klines": hfq if fqt == "2" else raw}}).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    df = data_mod.load_eastmoney("000333", "2024-01-01", "2024-01-31", cache_dir=tmp_path)
+    assert df["close"].iloc[-1] == pytest.approx(34.5)
+    ret = df["close"].pct_change().dropna().to_numpy()
+    assert ret == pytest.approx(np.array([97.5 / 100 - 1, 99 / 97.5 - 1]))
+    assert (df[["open", "high", "low", "close"]] > 0).all().all()
+
+
+def test_non_positive_prices_are_rejected():
+    from ashare_quant.data import normalize_bars
+
+    bad = pd.DataFrame({"date": ["2014-01-02", "2014-01-03"], "open": [-1.2, 3.0], "high": [1, 3.1],
+                        "low": [-1.5, 2.9], "close": [-0.3, 3.05], "volume": [1, 1]})
+    with pytest.raises(ValueError, match="价格 ≤ 0"):
+        normalize_bars(bad)
