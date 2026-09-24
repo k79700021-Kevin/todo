@@ -1,0 +1,16 @@
+[project]
+name = "ashare-quant"
+version = "0.1.0"
+description = "A 股日线回测框架：贴近真实交易规则的事件驱动回测、策略与参数样本外检验"
+requires-python = ">=3.10"
+dependencies = ["pandas>=2.0", "numpy>=1.24", "matplotlib>=3.7"]
+
+[project.optional-dependencies]
+data = ["akshare>=1.12"]
+dev = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["ashare_quant"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
