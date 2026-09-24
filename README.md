@@ -67,7 +67,8 @@ python -m ashare_quant backtest --strategy momentum --symbols 510300,510500,1599
 指标口径与通达信一致（EMA 首值为种子，RSI/KDJ 用 SMA(X,N,1) 平滑，MACD 柱 = 2×(DIF−DEA)）。测试覆盖：`tests/test_web_indicators.py` 逐点对照 pandas 独立实现；`tests/test_web_parity.py` 比对网页版与 Python 版引擎的逐日净值；`tests/web/research.test.js` 覆盖策略状态机、优化、前推与统计函数。
 
 - 数据来源：内置示例（程序合成的模拟行情）、上传 CSV（可直接用 Python 版缓存在 `data/` 的文件）、在线从东方财富获取；上传与获取的数据保存在本机浏览器
-- 部署到 GitHub Pages：仓库 Settings → Pages → Build and deployment 选 **Deploy from a branch**，分支 `main`、目录 `/docs`，保存后访问 `https://<用户名>.github.io/<仓库名>/`
+- 部署到 GitHub Pages：`.github/workflows/pages.yml` 在 `main` 分支的 `docs/` 变动时自动部署；首次需在 Settings → Pages → Build and deployment 把 Source 设为 **GitHub Actions**（工作流会尝试自动开启）。访问 `https://<用户名>.github.io/<仓库名>/`
+- 真实数据检查：`.github/workflows/data-smoke.yml` 在 GitHub 服务器上用真实行情验证东方财富接口与 akshare，并在真实数据上跑一遍回测、优化与因子分析，结果见该工作流的运行摘要；每周一自动运行
 - iPhone：用 Safari 打开上面的地址，点分享 → **添加到主屏幕**，之后像 App 一样打开
 - 重新生成示例数据：`python tools/make_web_sample.py`
 

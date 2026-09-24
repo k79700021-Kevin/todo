@@ -399,6 +399,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
 <script src="engine.js"></script>
 <script src="rules.js"></script>
 <script src="research.js"></script>
+<script src="eastmoney.js"></script>
 <script src="sample-data.js"></script>
 <script>
 (function () {
@@ -599,11 +600,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   function fetchEastmoney(sym, start, end, adjust) {
     return new Promise((resolve, reject) => {
       const cb = 'aqcb_' + Date.now() + '_' + Math.random().toString(36).slice(2);
-      const market = /^[569]/.test(sym) ? 1 : 0;
-      const fqt = { qfq: 1, hfq: 2, none: 0 }[adjust];
-      const url = `https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=${market}.${sym}` +
-        `&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=${fqt}` +
-        `&beg=${start.replace(/-/g, '')}&end=${end.replace(/-/g, '')}&cb=${cb}`;
+      const url = AQ.em.klineUrl(sym, start, end, adjust, cb);
       const tag = document.createElement('script');
       const timer = setTimeout(() => done(new Error(`${sym}：请求超时`)), 15000);
       function done(err, val) {
@@ -613,15 +610,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
         if (err) reject(err); else resolve(val);
       }
       window[cb] = (json) => {
-        const k = json && json.data && json.data.klines;
-        if (!k || !k.length) return done(new Error(`${sym}：没有数据，检查代码是否正确`));
-        const out = { dates: [], open: [], close: [], high: [], low: [], volume: [] };
-        for (const line of k) {
-          const p = line.split(',');
-          out.dates.push(p[0]); out.open.push(+p[1]); out.close.push(+p[2]);
-          out.high.push(+p[3]); out.low.push(+p[4]); out.volume.push(+p[5]);
-        }
-        done(null, out);
+        try { done(null, AQ.em.parseKlines(json, sym)); } catch (e) { done(e); }
       };
       tag.onerror = () => done(new Error('连不上东方财富。在 Claude 里打开时外部接口会被拦截，请用 GitHub Pages 地址，或改用上传 CSV'));
       tag.src = url;

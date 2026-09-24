@@ -1,0 +1,31 @@
+name: Real data smoke test
+
+# 在 GitHub 的服务器上用真实行情检验数据接口；每周一自动跑一次，以便及时发现接口变化
+on:
+  push:
+    paths:
+      - docs/eastmoney.js
+      - tools/data_smoke.js
+      - tools/akshare_smoke.py
+      - ashare_quant/data.py
+      - .github/workflows/data-smoke.yml
+  schedule:
+    - cron: "0 1 * * 1"
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Eastmoney API used by the web page
+        run: node tools/data_smoke.js em.json
+      - run: pip install pandas numpy matplotlib akshare
+      - name: akshare path used by the Python package
+        run: python tools/akshare_smoke.py em.json
