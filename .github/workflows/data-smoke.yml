@@ -1,0 +1,45 @@
+name: Real data smoke test
+
+# 在 GitHub 的服务器上用真实行情检验数据接口；每周一自动跑一次，以便及时发现接口变化
+on:
+  push:
+    paths:
+      - docs/eastmoney.js
+      - tools/data_smoke.js
+      - tools/py_data_smoke.py
+      - ashare_quant/data.py
+      - .github/workflows/data-smoke.yml
+  schedule:
+    - cron: "0 1 * * 1"
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Network diagnostics
+        continue-on-error: true
+        run: |
+          Q='api/qt/stock/kline/get?secid=1.510300&fields1=f1&fields2=f51,f53&klt=101&fqt=1&beg=20240101&end=20240110'
+          for u in "https://push2his.eastmoney.com/$Q" "http://push2his.eastmoney.com/$Q"; do
+            echo "== $u"
+            curl -sS -m 20 -A 'Mozilla/5.0' -e 'https://quote.eastmoney.com/' -w '\nHTTP %{http_code}, %{time_total}s\n' "$u" | head -c 400 || true
+            echo
+          done
+      - name: Eastmoney API used by the web page
+        id: em
+        continue-on-error: true
+        run: node tools/data_smoke.js em.json
+      - run: pip install pandas numpy matplotlib akshare
+      - name: Python package data path
+        run: python tools/py_data_smoke.py $([ -f em.json ] && echo em.json)
+      - name: Fail if the web page's data source failed
+        if: steps.em.outcome == 'failure'
+        run: exit 1
