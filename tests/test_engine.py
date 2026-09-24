@@ -141,3 +141,39 @@ def test_load_akshare_retries_network_errors(tmp_path, monkeypatch):
     calls.clear()
     with pytest.raises(ConnectionError):
         load_akshare("600519", "2024-01-01", "2024-01-31", cache_dir=tmp_path, retries=2, retry_wait=0)
+
+
+def test_load_eastmoney_parses_and_retries(tmp_path, monkeypatch):
+    import io
+    import json
+    import urllib.request
+
+    from ashare_quant import data as data_mod
+
+    payload = {"data": {"code": "600519", "klines": [
+        "2024-01-02,1700.0,1685.0,1710.0,1680.0,30000,0,0",
+        "2024-01-03,1681.0,1694.0,1699.0,1675.0,28000,0,0",
+    ]}}
+    seen = []
+
+    def fake_urlopen(req, timeout):
+        seen.append(req)
+        if len(seen) == 1:
+            raise ConnectionResetError("Remote end closed connection without response")
+        return io.BytesIO(json.dumps(payload).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    df = data_mod.load_eastmoney("600519", "2024-01-01", "2024-01-31", cache_dir=tmp_path, retry_wait=0)
+    assert len(seen) == 2
+    url = seen[0].full_url
+    assert "secid=1.600519" in url and "fqt=1" in url and "beg=20240101" in url
+    assert seen[0].get_header("Referer") == "https://quote.eastmoney.com/"
+    assert df.loc["2024-01-03", "close"] == 1694.0 and df.loc["2024-01-02", "high"] == 1710.0
+    # 第二次读缓存，不再请求
+    data_mod.load_eastmoney("600519", "2024-01-01", "2024-01-31", cache_dir=tmp_path)
+    assert len(seen) == 2
+    assert data_mod.eastmoney_market("159915") == 0 and data_mod.eastmoney_market("510300") == 1
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: io.BytesIO(b'{"data": null}'))
+    with pytest.raises(ValueError, match="没有数据"):
+        data_mod.load_eastmoney("000000", "2024-01-01", "2024-01-31", cache_dir=tmp_path)

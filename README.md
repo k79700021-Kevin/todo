@@ -11,7 +11,7 @@
 | 交易规则 | 100 股一手、T+1、停牌不可交易、开盘涨停不可买/跌停不可卖（主板 10%，创业板 2020-08-24 起 20%，科创板 20%，北交所 30%），未成交订单次日自动重试 |
 | 交易成本 | 佣金（含最低 5 元）、过户费、印花税（按日期：2023-08-28 前 0.1%，之后 0.05%）、ETF 免印花税；可配置滑点 |
 | 无未来函数 | t 日收盘出信号 → t+1 日开盘成交；有单测验证"篡改未来数据不影响历史净值" |
-| 数据 | [akshare](https://github.com/akfamily/akshare) 获取股票/ETF 日线（自动识别、本地缓存），或本地 CSV，或合成数据 |
+| 数据 | 直接请求东方财富日线接口（与网页版同一接口，本地缓存，网络错误自动重试），可选 [akshare](https://github.com/akfamily/akshare)（`pip install akshare`），或本地 CSV、合成数据 |
 | 策略 | 买入持有（基准）、双均线趋势、ETF 动量轮动（含绝对动量过滤） |
 | 绩效 | 年化收益、波动率、夏普、索提诺、最大回撤及持续天数、卡玛比率、手续费、年化换手率 |
 | 参数优化 | 网格搜索，按样本内指标选参，同时输出样本外表现，识别过拟合 |
@@ -41,7 +41,7 @@ python -m ashare_quant backtest --strategy momentum --symbols 510300,510500,1599
 
 报告输出在 `output/`：`summary.md`、`report.png`、`equity.csv`、`trades.csv`。
 
-常用参数：`--cash` 初始资金、`--commission` 佣金率、`--min-commission` 最低佣金、`--slippage` 滑点、`--band` 调仓容差、`--adjust qfq|hfq|""` 复权方式、`--source akshare|csv|synthetic`、`--data-dir` 缓存/CSV 目录（CSV 命名为 `<代码>.csv`，需含 `date,open,high,low,close,volume` 列）。
+常用参数：`--cash` 初始资金、`--commission` 佣金率、`--min-commission` 最低佣金、`--slippage` 滑点、`--band` 调仓容差、`--adjust qfq|hfq|""` 复权方式、`--source eastmoney|akshare|csv|synthetic`、`--data-dir` 缓存/CSV 目录（CSV 命名为 `<代码>.csv`，需含 `date,open,high,low,close,volume` 列）。
 
 ## 网页版（手机可用）
 
@@ -68,7 +68,7 @@ python -m ashare_quant backtest --strategy momentum --symbols 510300,510500,1599
 
 - 数据来源：内置示例（程序合成的模拟行情）、上传 CSV（可直接用 Python 版缓存在 `data/` 的文件）、在线从东方财富获取；上传与获取的数据保存在本机浏览器
 - 部署到 GitHub Pages：`.github/workflows/pages.yml` 在 `main` 分支的 `docs/` 变动时自动部署；首次需在 Settings → Pages → Build and deployment 把 Source 设为 **GitHub Actions**（工作流会尝试自动开启）。访问 `https://<用户名>.github.io/<仓库名>/`
-- 真实数据检查：`.github/workflows/data-smoke.yml` 在 GitHub 服务器上用真实行情验证东方财富接口与 akshare，并在真实数据上跑一遍回测、优化与因子分析，结果见该工作流的运行摘要；每周一自动运行
+- 真实数据检查：`.github/workflows/data-smoke.yml` 在 GitHub 服务器上用真实行情验证网页版与 Python 版的东方财富数据源（两边逐日核对），顺带报告 akshare 是否可用，并在真实数据上跑一遍回测、优化与因子分析，结果见该工作流的运行摘要；每周一自动运行
 - iPhone：用 Safari 打开上面的地址，点分享 → **添加到主屏幕**，之后像 App 一样打开
 - 重新生成示例数据：`python tools/make_web_sample.py`
 

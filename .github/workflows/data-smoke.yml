@@ -6,7 +6,7 @@ on:
     paths:
       - docs/eastmoney.js
       - tools/data_smoke.js
-      - tools/akshare_smoke.py
+      - tools/py_data_smoke.py
       - ashare_quant/data.py
       - .github/workflows/data-smoke.yml
   schedule:
@@ -38,8 +38,8 @@ jobs:
         continue-on-error: true
         run: node tools/data_smoke.js em.json
       - run: pip install pandas numpy matplotlib akshare
-      - name: akshare path used by the Python package
-        run: python tools/akshare_smoke.py $([ -f em.json ] && echo em.json)
+      - name: Python package data path
+        run: python tools/py_data_smoke.py $([ -f em.json ] && echo em.json)
       - name: Fail if the web page's data source failed
         if: steps.em.outcome == 'failure'
         run: exit 1

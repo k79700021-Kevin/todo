@@ -1,11 +1,16 @@
-"""行情数据：akshare 在线获取（带本地缓存）、本地 CSV、合成数据。
+"""行情数据：东方财富在线获取（默认，与网页版同一接口）、akshare、本地 CSV、合成数据。
+
+在线数据带本地缓存。
 
 统一格式：以 DatetimeIndex 为索引，列为 open/high/low/close/volume 的日线 DataFrame。
 """
 
 from __future__ import annotations
 
+import json
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +41,70 @@ def normalize_bars(df: pd.DataFrame) -> pd.DataFrame:
     df = df[REQUIRED_COLUMNS].astype(float)
     df = df[~df.index.duplicated(keep="last")].sort_index()
     return df.dropna(subset=["open", "close"])
+
+
+EASTMONEY_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+# 东方财富会断开不带浏览器请求头的连接（境外网络尤其明显），因此模拟浏览器请求
+EASTMONEY_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Referer": "https://quote.eastmoney.com/",
+}
+FQT = {"qfq": 1, "hfq": 2, "": 0, "none": 0}
+
+
+def eastmoney_market(symbol: str) -> int:
+    """沪市（6 开头股票、5 开头基金、9 开头 B 股）为 1，深市与北交所为 0。"""
+    return 1 if symbol[:1] in "569" else 0
+
+
+def parse_eastmoney(payload: dict, symbol: str) -> pd.DataFrame:
+    klines = (payload.get("data") or {}).get("klines") or []
+    if not klines:
+        raise ValueError(f"{symbol} 没有数据，检查代码是否正确")
+    rows = [line.split(",")[:6] for line in klines]
+    df = pd.DataFrame(rows, columns=["date", "open", "close", "high", "low", "volume"])
+    return normalize_bars(df)
+
+
+def load_eastmoney(
+    symbol: str,
+    start: str,
+    end: str,
+    adjust: str = "qfq",
+    cache_dir: str | Path = "data",
+    retries: int = 4,
+    retry_wait: float = 2.0,
+) -> pd.DataFrame:
+    """直接请求东方财富日线接口（网页版 docs/eastmoney.js 使用同一接口），不依赖 akshare。"""
+    cache = Path(cache_dir) / f"{symbol}_{adjust or 'none'}_{start}_{end}.csv"
+    if cache.exists():
+        return normalize_bars(pd.read_csv(cache))
+    query = urllib.parse.urlencode(
+        {
+            "secid": f"{eastmoney_market(symbol)}.{symbol}",
+            "fields1": "f1,f2,f3",
+            "fields2": "f51,f52,f53,f54,f55,f56",
+            "klt": 101,
+            "fqt": FQT[adjust],
+            "beg": start.replace("-", ""),
+            "end": end.replace("-", ""),
+        }
+    )
+    request = urllib.request.Request(f"{EASTMONEY_URL}?{query}", headers=EASTMONEY_HEADERS)
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(request, timeout=15) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            break
+        except OSError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(retry_wait * 2**attempt)
+    df = parse_eastmoney(payload, symbol)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(cache)
+    return df
 
 
 def load_akshare(
@@ -127,7 +196,7 @@ def load_universe(
     symbols: list[str],
     start: str,
     end: str,
-    source: str = "akshare",
+    source: str = "eastmoney",
     csv_dir: str | Path = "data",
     adjust: str = "qfq",
     seed: int = 42,
@@ -137,6 +206,8 @@ def load_universe(
     if source == "csv":
         data = {s: load_csv(Path(csv_dir) / f"{s}.csv") for s in symbols}
         return {s: df.loc[start:end] for s, df in data.items()}
+    if source == "eastmoney":
+        return {s: load_eastmoney(s, start, end, adjust, csv_dir) for s in symbols}
     if source == "akshare":
         return {s: load_akshare(s, start, end, adjust, csv_dir) for s in symbols}
     raise ValueError(f"未知数据源: {source}")
