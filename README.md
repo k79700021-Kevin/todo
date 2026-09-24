@@ -43,6 +43,15 @@ python -m ashare_quant backtest --strategy momentum --symbols 510300,510500,1599
 
 常用参数：`--cash` 初始资金、`--commission` 佣金率、`--min-commission` 最低佣金、`--slippage` 滑点、`--band` 调仓容差、`--adjust qfq|hfq|""` 复权方式、`--source akshare|csv|synthetic`、`--data-dir` 缓存/CSV 目录（CSV 命名为 `<代码>.csv`，需含 `date,open,high,low,close,volume` 列）。
 
+## 网页版（手机可用）
+
+`docs/` 是纯前端的网页版：同样的交易规则和策略，用 JavaScript 实现，在浏览器里本地计算，不需要服务器。`tests/test_web_parity.py` 会在同一份数据上比对网页版与 Python 版的逐日净值和成交，保证两边结果一致。
+
+- 数据来源：内置示例（程序合成的模拟行情）、上传 CSV（可直接用 Python 版缓存在 `data/` 的文件）、在线从东方财富获取
+- 部署到 GitHub Pages：仓库 Settings → Pages → Build and deployment 选 **Deploy from a branch**，分支 `main`、目录 `/docs`，保存后访问 `https://<用户名>.github.io/<仓库名>/`
+- iPhone：用 Safari 打开上面的地址，点分享 → **添加到主屏幕**，之后像 App 一样打开
+- 重新生成示例数据：`python tools/make_web_sample.py`
+
 ## 编写自己的策略
 
 策略只需把收盘价矩阵映射为目标权重矩阵：
@@ -84,7 +93,9 @@ ashare_quant/
   optimize.py    网格搜索 + 样本外检验
   report.py      报告输出
   cli.py         命令行
-tests/           单元测试（pytest）
+docs/            网页版（engine.js 为 JS 版引擎）
+tools/           示例数据生成脚本
+tests/           单元测试（pytest，含网页版一致性测试）
 ```
 
 ## 已知局限

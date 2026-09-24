@@ -54,7 +54,8 @@ class DualMA(Strategy):
     def generate(self, close: pd.DataFrame) -> pd.DataFrame:
         fast = close.rolling(self.fast).mean()
         slow = close.rolling(self.slow).mean()
-        raw = (fast > slow).astype(float) / close.shape[1]
+        # 相对容差：两线数学上相等时不让浮点误差决定信号
+        raw = (fast > slow * (1 + 1e-9)).astype(float) / close.shape[1]
         changed = raw.ne(raw.shift()).any(axis=1)
         return raw.where(changed, np.nan)
 
