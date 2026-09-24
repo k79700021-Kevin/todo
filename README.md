@@ -45,9 +45,28 @@ python -m ashare_quant backtest --strategy momentum --symbols 510300,510500,1599
 
 ## 网页版（手机可用）
 
-`docs/` 是纯前端的网页版：同样的交易规则和策略，用 JavaScript 实现，在浏览器里本地计算，不需要服务器。`tests/test_web_parity.py` 会在同一份数据上比对网页版与 Python 版的逐日净值和成交，保证两边结果一致。
+`docs/` 是纯前端的研究工具，全部计算在浏览器本地完成，不需要服务器，手机上也能用。
 
-- 数据来源：内置示例（程序合成的模拟行情）、上传 CSV（可直接用 Python 版缓存在 `data/` 的文件）、在线从东方财富获取
+**回测**
+- 策略构建器：用指标规则像积木一样组合——均线交叉、EMA 交叉、价格与均线、MACD、RSI 超买超卖、布林带回归、唐奇安通道突破、KDJ、动量 ROC；入场"全部满足/任一满足"，出场"任一触发/全部触发"
+- 风控：止损、止盈、ATR 移动止损；仓位按 1/N 固定或在持仓间等分
+- 另有 ETF 动量轮动与买入持有
+- 最新信号：每只标的当前持仓、各规则的多空状态、下一交易日开盘要做的操作
+
+**参数优化**（后台线程运行，页面不卡）
+- 网格或随机搜索，目标可选夏普、索提诺、卡玛、年化收益，可设样本内最少成交笔数
+- 样本内/样本外切分，逐组对比
+- 滚动前推（walk-forward）：每个窗口只用之前的数据选参，拼接各检验窗口得到接近实盘的样本外净值
+- 通缩夏普比率（Bailey & López de Prado）：按试验次数折算，给出"真实夏普 > 0"的概率
+- 参数热力图：区分稳定的参数区域和孤立的过拟合尖峰
+
+**时序与因子**
+- 收益序列：偏度、超额峰度、自相关（含绝对收益的波动聚集）、Lo–MacKinlay 方差比检验
+- 13 个因子的时序 IC 与截面 IC（非重叠抽样，带 t 值），分组收益
+
+指标口径与通达信一致（EMA 首值为种子，RSI/KDJ 用 SMA(X,N,1) 平滑，MACD 柱 = 2×(DIF−DEA)）。测试覆盖：`tests/test_web_indicators.py` 逐点对照 pandas 独立实现；`tests/test_web_parity.py` 比对网页版与 Python 版引擎的逐日净值；`tests/web/research.test.js` 覆盖策略状态机、优化、前推与统计函数。
+
+- 数据来源：内置示例（程序合成的模拟行情）、上传 CSV（可直接用 Python 版缓存在 `data/` 的文件）、在线从东方财富获取；上传与获取的数据保存在本机浏览器
 - 部署到 GitHub Pages：仓库 Settings → Pages → Build and deployment 选 **Deploy from a branch**，分支 `main`、目录 `/docs`，保存后访问 `https://<用户名>.github.io/<仓库名>/`
 - iPhone：用 Safari 打开上面的地址，点分享 → **添加到主屏幕**，之后像 App 一样打开
 - 重新生成示例数据：`python tools/make_web_sample.py`
@@ -93,7 +112,7 @@ ashare_quant/
   optimize.py    网格搜索 + 样本外检验
   report.py      报告输出
   cli.py         命令行
-docs/            网页版（engine.js 为 JS 版引擎）
+docs/            网页版（indicators / engine / rules / research / worker）
 tools/           示例数据生成脚本
 tests/           单元测试（pytest，含网页版一致性测试）
 ```

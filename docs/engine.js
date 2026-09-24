@@ -77,17 +77,23 @@
       const dates = [...dateSet].sort();
       const pos = new Map(dates.map((d, i) => [d, i]));
       const n = dates.length;
-      const open = {}, close = {}, tradable = {}, prevClose = {};
+      const open = {}, close = {}, high = {}, low = {}, volume = {}, tradable = {}, prevClose = {};
       for (const s of symbols) {
         const src = data[s];
         const o = new Array(n).fill(NaN), c = new Array(n).fill(NaN), t = new Array(n).fill(false);
+        const h = new Array(n).fill(NaN), l = new Array(n).fill(NaN), v = new Array(n).fill(NaN);
         src.dates.forEach((d, j) => {
           const i = pos.get(d);
           o[i] = src.open[j];
           c[i] = src.close[j];
+          // 缺少最高/最低价时用开盘、收盘近似
+          h[i] = src.high ? src.high[j] : Math.max(o[i], c[i]);
+          l[i] = src.low ? src.low[j] : Math.min(o[i], c[i]);
+          v[i] = src.volume ? src.volume[j] : NaN;
           const vol = src.volume ? src.volume[j] : 1;
           t[i] = Number.isFinite(o[i]) && Number.isFinite(c[i]) && vol > 0;
         });
+        high[s] = h; low[s] = l; volume[s] = v;
         const p = new Array(n).fill(NaN);
         let last = NaN;
         for (let i = 0; i < n; i++) {
@@ -96,21 +102,37 @@
         }
         open[s] = o; close[s] = c; tradable[s] = t; prevClose[s] = p;
       }
-      Object.assign(this, { symbols, dates, open, close, tradable, prevClose, initialCash, fees, slippage, rebalanceBand });
+      Object.assign(this, { symbols, dates, open, close, high, low, volume, tradable, prevClose, initialCash, fees, slippage, rebalanceBand });
     }
 
     closeFfill() {
+      return this.ffill(this.close);
+    }
+
+    ffill(panel) {
       const out = {};
       for (const s of this.symbols) {
         let last = NaN;
-        out[s] = this.close[s].map((v) => (Number.isFinite(v) ? (last = v) : last));
+        out[s] = panel[s].map((v) => (Number.isFinite(v) ? (last = v) : last));
       }
       return out;
     }
 
+    // 停牌日前向填充后的完整行情，按需构建并缓存，供需要高低价、成交量的策略使用
+    bars() {
+      if (!this._bars) {
+        this._bars = {
+          open: this.ffill(this.open), high: this.ffill(this.high), low: this.ffill(this.low),
+          close: this.closeFfill(), volume: this.volume, cache: new Map(),
+        };
+      }
+      return this._bars;
+    }
+
     run(strategy) {
       const { symbols, dates } = this;
-      const signals = strategy.generate(this.closeFfill(), dates, symbols);
+      const bars = this.bars();
+      const signals = strategy.generate(bars.close, dates, symbols, bars);
       validateSignals(signals);
 
       let cash = this.initialCash;
@@ -139,6 +161,8 @@
         equity,
         trades,
         finalShares: { ...shares },
+        // 最后一个交易日收盘后尚未执行的目标仓位（即下一交易日开盘要做的调整）
+        nextTargets: pending ? Object.fromEntries(pending) : null,
         initialCash: this.initialCash,
       };
     }
@@ -336,5 +360,5 @@
     Backtester, BuyAndHold, DualMA, MomentumRotation, equityMetrics, summarize,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
-  else root.AQ = api;
+  else root.AQ = Object.assign(root.AQ || {}, api);
 })(typeof globalThis !== 'undefined' ? globalThis : this);

@@ -15,7 +15,10 @@ def main() -> None:
         s: {
             "dates": [d.strftime("%Y-%m-%d") for d in df.index],
             "open": df["open"].round(2).tolist(),
+            "high": df["high"].round(2).tolist(),
+            "low": df["low"].round(2).tolist(),
             "close": df["close"].round(2).tolist(),
+            "volume": (df["volume"] // 100).astype(int).tolist(),
         }
         for s, df in data.items()
     }
