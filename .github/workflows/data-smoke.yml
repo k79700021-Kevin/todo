@@ -28,7 +28,9 @@ jobs:
         continue-on-error: true
         run: |
           Q='api/qt/stock/kline/get?secid=1.510300&fields1=f1&fields2=f51,f53&klt=101&fqt=1&beg=20240101&end=20240110'
-          for u in "https://push2his.eastmoney.com/$Q" "http://push2his.eastmoney.com/$Q"; do
+          F='api/qt/stock/kline/get?secid=0.000333&fields1=f1&fields2=f51,f53&klt=101&beg=20130101&end=20500101&fqt='
+          for u in "https://push2his.eastmoney.com/$Q" "http://push2his.eastmoney.com/$Q" \
+                   "https://push2his.eastmoney.com/${F}0" "https://push2his.eastmoney.com/${F}1" "https://push2his.eastmoney.com/${F}2"; do
             echo "== $u"
             curl -sS -m 20 -A 'Mozilla/5.0' -e 'https://quote.eastmoney.com/' -w '\nHTTP %{http_code}, %{time_total}s\n' "$u" | head -c 400 || true
             echo
