@@ -27,6 +27,7 @@ async function fetchOne(sym) {
       if (!m) throw new Error(`返回不是预期的 JSONP：${text.slice(0, 120)}`);
       return em.parseKlines(JSON.parse(m[1]), sym);
     } catch (e) {
+      console.error(`${sym} 第 ${attempt} 次请求失败：${e.message}${e.cause ? ' / ' + (e.cause.code || e.cause.message) : ''}`);
       if (attempt === 3) throw e;
       await new Promise((r) => setTimeout(r, 2000 * attempt));
     }
@@ -78,6 +79,7 @@ function check(sym, d) {
   if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, report + '\n');
   if (process.argv[2]) fs.writeFileSync(process.argv[2], JSON.stringify(data));
 })().catch((e) => {
-  console.error('失败：' + e.message);
+  const cause = e.cause ? `（${e.cause.code || ''} ${e.cause.message || e.cause}）` : '';
+  console.error('失败：' + e.message + cause);
   process.exit(1);
 });

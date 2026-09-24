@@ -24,8 +24,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Network diagnostics
+        continue-on-error: true
+        run: |
+          Q='api/qt/stock/kline/get?secid=1.510300&fields1=f1&fields2=f51,f53&klt=101&fqt=1&beg=20240101&end=20240110'
+          for u in "https://push2his.eastmoney.com/$Q" "http://push2his.eastmoney.com/$Q"; do
+            echo "== $u"
+            curl -sS -m 20 -A 'Mozilla/5.0' -e 'https://quote.eastmoney.com/' -w '\nHTTP %{http_code}, %{time_total}s\n' "$u" | head -c 400 || true
+            echo
+          done
       - name: Eastmoney API used by the web page
+        id: em
+        continue-on-error: true
         run: node tools/data_smoke.js em.json
       - run: pip install pandas numpy matplotlib akshare
       - name: akshare path used by the Python package
-        run: python tools/akshare_smoke.py em.json
+        run: python tools/akshare_smoke.py $([ -f em.json ] && echo em.json)
+      - name: Fail if the web page's data source failed
+        if: steps.em.outcome == 'failure'
+        run: exit 1
