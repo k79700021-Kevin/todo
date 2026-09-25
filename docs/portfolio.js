@@ -95,12 +95,15 @@
 
   /* 均值-方差优化（FISTA 近端梯度）：
    *   max  αᵀw − λ·wᵀΣw − κ·‖w − w0‖₁ − ρ·Σ_g (Σ_{i∈g} w_i − b_g)²
-   *   s.t. 0 ≤ w_i ≤ cap，Σ w_i = budget
+   *   s.t. 0 ≤ w_i ≤ cap，Σ w_i = budget（N·cap < budget 时预算降为 N·cap，返回值带 infeasible = true）
    * alpha、Σ 需为同一持有期的量。groups[i] 为行业（可选），bench[g] 为基准行业权重。 */
   function optimize({ alpha, cov, w0, lambda = 10, kappa = 0, cap = 1, budget = 1, groups = null, bench = null, rho = 0, iters = 400 }) {
     const N = alpha.length;
-    if (!N) return new Float64Array(0);
-    const capEff = Math.max(cap, budget / N + 1e-12);
+    if (!N) return Object.assign(new Float64Array(0), { infeasible: budget > 0 });
+    // 单票上限是硬约束：N × cap < 预算时放不满，预算降为 N × cap，其余为现金（不放宽上限）
+    const infeasible = cap * N < budget - 1e-12;
+    if (infeasible) budget = cap * N;
+    const capEff = cap;
     w0 = w0 || new Float64Array(N);
     const gIdx = groups ? [...new Set(groups)] : [];
     const gOf = groups ? groups.map((g) => gIdx.indexOf(g)) : null;
@@ -133,6 +136,7 @@
       w = wn; tk = tn;
       if (diff < 1e-9) break;
     }
+    w.infeasible = infeasible;
     return w;
   }
 

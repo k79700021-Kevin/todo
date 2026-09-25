@@ -400,6 +400,15 @@
       return this.weights(desired, state, i, slots);
     }
 
+    // 连续账户切换参数时接手现有持仓与尚未成交的订单（如跌停没卖出的仍视为要卖）
+    adopt(ctx) {
+      this.ctx.symbols.forEach((s, k) => {
+        const want = ctx.pending && ctx.pending.has(s) ? ctx.pending.get(s) > 0 : ctx.shares[s] > 0;
+        this.ctx.desired[k] = want ? 1 : 0;
+      });
+      this.ctx.emitted = false;
+    }
+
     /* 理想化预览：假设信号当天按收盘价全部成交，用于检查信号逻辑本身。
      * 回测一律走引擎的 decide 路径，以实际成交为准。 */
     generate(close, dates, symbols, bars) {

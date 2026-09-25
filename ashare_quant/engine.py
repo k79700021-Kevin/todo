@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from .rules import LOT_SIZE, FeeModel, is_limit_down, is_limit_up
+from .rules import LOT_SIZE, FeeModel, is_limit_down, is_limit_up, is_star, lot_round
 
 
 @dataclass
@@ -114,7 +114,7 @@ class Backtester:
                     unfilled[s] = w
                 continue
             price = opens[s]
-            target = int(w * equity / price // LOT_SIZE) * LOT_SIZE if w > 0 else 0
+            target = lot_round(s, w * equity / price) if w > 0 else 0
             delta = target - shares[s]
             # 非清仓/建仓的小幅调整不值得付最低佣金，跳过
             if target and shares[s] and abs(delta) * price < self.rebalance_band * equity:
@@ -128,6 +128,9 @@ class Backtester:
             if is_limit_down(s, d, price, prev[s]):
                 unfilled[s] = w
                 continue
+            # 科创板：卖出后剩余不足 200 股的须一次卖完
+            if is_star(s) and 0 < shares[s] - qty < 200:
+                qty = shares[s]
             fill = price * (1 - self.slippage)
             amount = qty * fill
             fee = self.fees.cost(s, d, "sell", amount, qty)
@@ -135,12 +138,16 @@ class Backtester:
             shares[s] -= qty
             trades.append((d, s, "sell", qty, fill, amount, fee))
 
-        for s, qty, price, w in sorted(buys, key=lambda o: -o[1] * o[2]):
+        # 还有卖单没成交（跌停、停牌）：因现金不足少买的部分次日继续
+        cash_coming = any(shares[k] > 0 and w_ * equity < shares[k] * mark(k) - 1e-6 for k, w_ in unfilled.items())
+        for s, want, price, w in sorted(buys, key=lambda o: -o[1] * o[2]):
             if is_limit_up(s, d, price, prev[s]):
                 unfilled[s] = w
                 continue
             fill = price * (1 + self.slippage)
-            qty = self._affordable(s, d, qty, fill, cash)
+            qty = self._affordable(s, d, want, fill, cash)
+            if qty < want and cash_coming:
+                unfilled[s] = w
             if qty <= 0:
                 continue
             amount = qty * fill
@@ -152,9 +159,10 @@ class Backtester:
         return cash, (unfilled or None)
 
     def _affordable(self, s, d, qty, price, cash) -> int:
-        qty = min(qty, int(cash / price // LOT_SIZE) * LOT_SIZE)
+        step = 1 if is_star(s) else LOT_SIZE
+        qty = lot_round(s, min(qty, cash / price))
         while qty > 0 and qty * price + self.fees.cost(s, d, "buy", qty * price, qty) > cash + 1e-9:
-            qty -= LOT_SIZE
+            qty = lot_round(s, qty - step)
         return max(qty, 0)
 
 

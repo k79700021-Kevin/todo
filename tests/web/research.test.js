@@ -254,7 +254,7 @@ test('block bootstrap indices stay in range and keep blocks contiguous', () => {
   for (let k = 0; k < 100; k += 5) for (let j = 1; j < 5; j++) assert.equal(d[k + j], d[k] + j);
 });
 
-test('factor portfolios: tradable quintiles with turnover and cost', () => {
+test('factor portfolios: quintiles executed by the engine, with turnover and cost', () => {
   // 10 只标的，漂移与编号成正比；60 日动量越高的组收益越高
   const data = {};
   for (let k = 0; k < 10; k++) data['6000' + String(k).padStart(2, '0')] = series(1000, 50 + k, 0.0002 * (k - 4.5), 0.01);
@@ -264,13 +264,12 @@ test('factor portfolios: tradable quintiles with turnover and cost', () => {
   assert.equal(p.groups.length, 5);
   assert.ok(p.groups[4].annReturn > p.groups[0].annReturn, JSON.stringify(p.groups.map((g) => g.annReturn)));
   assert.ok(p.longShort.annReturn > 0);
+  assert.ok(p.engine);
   p.groups.forEach((g) => {
-    assert.ok(g.turnover >= 0 && g.turnover <= 1);
-    assert.ok(g.grossReturn >= g.annReturn, '扣成本后不高于毛收益');
-    assert.equal(g.equity.length, p.periods + 1);
+    assert.ok(g.turnover >= 0 && g.fees > 0 && g.costDrag > 0);
+    assert.equal(g.equity.length, p.dates.length);
   });
-  const free = R.factorPortfolios(bt, 'roc60', 20, { cost: 0 });
-  close(free.groups[2].annReturn, free.groups[2].grossReturn, 1e-12);
+  assert.equal(p.longShort.equity.length, p.dates.length);
   assert.equal(R.factorPortfolios(new AQ.Backtester({ a: series(300, 1), b: series(300, 2) }, {}), 'roc20', 5).q, 0);
 });
 
@@ -666,7 +665,10 @@ test('stock pool: plan windows, trim with warmup, assemble meta and coverage', (
   const dates = dayList(4000);
   const mk = () => ({ dates, open: dates.map(() => 10), close: dates.map(() => 10), volume: dates.map(() => 1) });
   const out = pool.assemble(members, { '600002': { code: '600002', bars: mk(), fin: [{ report: '2012-12-31', notice: '2013-03-01', eps: 1 }] } }, '2012-01-01', '2020-12-31');
-  assert.deepEqual(out.coverage, { wanted: 2, got: 1, missing: ['600003'], stale: 1 }, '没有版本号的旧记录计为待更新');
+  const { minDaily, worst, ...cov } = out.coverage;
+  assert.deepEqual(cov, { wanted: 2, got: 1, missing: ['600003'], stale: 1 }, '没有版本号的旧记录计为待更新');
+  assert.ok(minDaily <= 0.5 && worst.missing.includes('600003'));
+  assert.throws(() => pool.assemble(members, { '600002': { code: '600002', bars: mk(), fin: [] } }, '2012-01-01', '2020-12-31', { strict: true }), /覆盖率/);
   const d = out.data['600002'];
   assert.ok(d.dates[0] >= p['600002'].from && d.dates[d.dates.length - 1] <= '2020-12-31');
   assert.deepEqual(out.meta.universe['600002'], members.members['600002']);
@@ -694,7 +696,7 @@ test('eastmoney: klines with turnover and finance rows parse', () => {
 
 test('neutralize: industry demeaning removes industry effects; size regression removes size', () => {
   const syms = ['a', 'b', 'c', 'd', 'e', 'f'];
-  const b = { meta: { industry: { a: '银行', b: '银行', c: '银行', d: '白酒', e: '白酒', f: '白酒' } }, cache: new Map(), dates: ['x'], raw: {}, turnover: {}, volume: {} };
+  const b = { meta: { industryPIT: true, industry: { a: '银行', b: '银行', c: '银行', d: '白酒', e: '白酒', f: '白酒' } }, cache: new Map(), dates: ['x'], raw: {}, turnover: {}, volume: {} };
   // 因子值完全由行业决定：中性化后全为 0
   const x = [1, 1, 1, 5, 5, 5];
   assert.ok(R.neutralize(x, syms, 'industry', b, 0).every((v) => Math.abs(v) < 1e-12));

@@ -43,9 +43,28 @@ def _regime(table, date):
     return out
 
 
+# 跟踪创业板指数的 ETF 自 2020-08-24 起 ±20%（名单只含已核实的）；科创板 ETF（588 开头）±20%
+CHINEXT_ETFS = frozenset({"159915", "159949"})
+
+
+def is_star(symbol: str) -> bool:
+    return symbol.startswith(("688", "689"))
+
+
+def lot_round(symbol: str, qty: float) -> int:
+    """申报数量：科创板 200 股起、超出部分 1 股递增；其余 100 股整数倍。"""
+    if is_star(symbol):
+        return int(qty) if qty >= 200 else 0
+    return int(qty // LOT_SIZE) * LOT_SIZE
+
+
 def price_limit(symbol: str, date: pd.Timestamp) -> float:
-    """返回涨跌幅限制比例。未处理 ST（5%）与新股上市首日（无限制）。"""
+    """返回涨跌幅限制比例。未处理 ST（5%）；新股上市初期由引擎按上市日期处理。"""
     if is_etf(symbol):
+        if symbol.startswith("588"):
+            return 0.20
+        if symbol in CHINEXT_ETFS:
+            return 0.20 if date >= CHINEXT_REFORM else 0.10
         return 0.10
     if symbol.startswith(("688", "689")):  # 科创板
         return 0.20

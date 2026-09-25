@@ -230,8 +230,11 @@
     const mx = mean(pairs.map((p) => p[0])), my = mean(pairs.map((p) => p[1]));
     let sxy = 0, sxx = 0;
     for (const [x, y] of pairs) { sxy += (x - mx) * (y - my); sxx += (x - mx) ** 2; }
+    // 每块天数太少时，块内夏普噪声很大，PBO 本身也不稳定
+    const days = blocks[0].n.reduce((a, x) => a + x, 0) / S;
     return {
-      pbo: below / total, probLoss: loss / total, splits: total, blocks: S,
+      pbo: below / total, probLoss: loss / total, splits: total, blocks: S, blockDays: days,
+      warning: days < 60 ? `每块平均只有 ${Math.round(days)} 个交易日（< 60），样本太短，PBO 估计不稳定，仅作参考` : '',
       slope: sxx > 0 ? sxy / sxx : NaN,
       oosSharpe: my * Math.sqrt(TD), isSharpe: mx * Math.sqrt(TD),
       logits: logits.sort((a, b) => a - b),
@@ -241,7 +244,7 @@
   /* Hansen (2005) 高级预测能力检验（SPA）：H0 为"所有候选都不比基准好"。
    * d[k] 为第 k 组参数相对基准的日超额收益（Float32Array，长度 T）。用平稳自助法（平均块长 L）重抽样，
    * 并按 Hansen 的一致性修正只保留"不太差"的候选参与零分布。返回 p 值（越小越说明最优者确实优于基准）。 */
-  function spa(d, { B = 300, L = 10, seed = 11 } = {}) {
+  function spa(d, { B = 1000, L = 10, seed = 11 } = {}) {
     const K = d.length;
     if (!K) return null;
     const T = d[0].length;
@@ -287,7 +290,9 @@
       }
       if (mx >= stat) exceed++;
     }
-    return { p: exceed / B, stat, models: K, days: T, bootstrap: B };
+    const pv = exceed / B;
+    // 蒙特卡洛标准误：p 值本身来自 B 次重抽样，有抽样误差
+    return { p: pv, se: Math.sqrt(Math.max(pv * (1 - pv), 1 / B) / B), stat, models: K, days: T, bootstrap: B };
   }
 
   // ---------- 参数空间 ----------
@@ -410,7 +415,7 @@
       }
       const res = bt.run(strat);
       const eq = Float64Array.from(res.equity);
-      const tIdx = Int32Array.from(res.trades.map((tr) => dateIdx.get(tr.date)));
+      const tIdx = Int32Array.from(res.trades.filter(AQ.isFill).map((tr) => dateIdx.get(tr.date)));
       const blocks = { sum: new Float64Array(S), sq: new Float64Array(S), n: new Float64Array(S) };
       const excess = keepDaily ? new Float32Array(T) : null;
       for (let i = 1; i < t; i++) {
@@ -542,6 +547,8 @@
       let p = open[tr.symbol];
       if (!p) p = open[tr.symbol] = { symbol: tr.symbol, start: tr.date, shares: 0, cost: 0, proceeds: 0 };
       if (tr.side === 'buy') { p.shares += tr.shares; p.cost += tr.amount + tr.fee; }
+      else if (tr.side === 'corporate') { p.shares = tr.shares; p.proceeds += tr.cash || 0; continue; } // 送转：股数变为新的总数
+      else if (tr.side === 'dividend') { p.proceeds += tr.amount; continue; }
       else { p.shares -= tr.shares; p.proceeds += tr.amount - tr.fee; }
       if (p.shares <= 0) {
         if (tr.date >= lo) {
@@ -613,14 +620,7 @@
       if (!seg) return null;
       const st = seg.strategy;
       if (typeof st.decide === 'function') {
-        if (i === seg.from) {
-          // 接手现有持仓与尚未成交的订单（如跌停没卖出的仍视为要卖）
-          this.symbols.forEach((s, k) => {
-            const want = ctx.pending && ctx.pending.has(s) ? ctx.pending.get(s) > 0 : ctx.shares[s] > 0;
-            st.ctx.desired[k] = want ? 1 : 0;
-          });
-          st.ctx.emitted = false;
-        }
+        if (i === seg.from && typeof st.adopt === 'function') st.adopt(ctx);
         return st.decide(i, ctx);
       }
       if (i === seg.from) {
@@ -663,7 +663,7 @@
     const first = windows[0].t0, last = windows[windows.length - 1].b;
     const eqS = res.equity.slice(first, last + 1).map((v) => v / res.equity[first]);
     const bS = benchEq.slice(first, last + 1).map((v) => v / benchEq[first]);
-    const trades = res.trades.filter((tr) => tr.date > dates[first] && tr.date <= dates[last]);
+    const trades = res.trades.filter((tr) => AQ.isFill(tr) && tr.date > dates[first] && tr.date <= dates[last]);
     const traded = trades.reduce((acc, tr) => acc + tr.amount, 0);
     const years = (last - first) / TD;
     const meanEq = res.equity.slice(first, last + 1).reduce((acc, v) => acc + v, 0) / (last - first + 1);
@@ -865,11 +865,23 @@
   /* 截面中性化：先把因子值转成截面秩分（−0.5 ~ 0.5），'industry' 再减去所在行业均值（行业内只有 1 只时为 0），
    * 'industry_size' 再对行业内去均值后的对数流通市值回归取残差（Frisch–Waugh），缺市值的保留行业中性化结果。
    * xs 与 syms 一一对应（已剔除缺失值），t 为日期序号。 */
+  /* 行业分类必须是时点数据才能进入历史信号。data/hs300_industry.json 是今天的分类（公司会改行业、分类标准会修订），
+   * 用它在历史上做中性化或行业约束会引入前视偏差，所以只允许用于事后归因；meta.industryPIT === true 时才放行。 */
+  const NEUTRAL_MODES = ['none', 'size', 'industry', 'industry_size'];
+  const INDUSTRY_MODES = ['industry', 'industry_size'];
+  function assertIndustryPIT(b, what) {
+    if (!(b && b.meta && b.meta.industryPIT === true)) {
+      throw new Error(`${what}需要时点（point-in-time）行业分类；当前行业标签是今天的分类，用于历史信号会引入前视偏差，只能用于事后归因`);
+    }
+  }
+
   function neutralize(xs, syms, mode, b, t) {
+    if (INDUSTRY_MODES.includes(mode)) assertIndustryPIT(b, '行业中性化');
     const n = xs.length;
     const r = ranks(xs).map((v) => (v - 0.5) / n - 0.5);
     if (!mode || mode === 'none' || n < 3) return r;
-    const g = syms.map((s) => industryOf(b, s) || '—');
+    // 'size'：只对对数流通市值回归取残差（市值是时点数据）
+    const g = mode === 'size' ? syms.map(() => '—') : syms.map((s) => industryOf(b, s) || '—');
     const demean = (v, use) => {
       const sum = new Map(), cnt = new Map();
       v.forEach((x, k) => { if (use[k]) { sum.set(g[k], (sum.get(g[k]) || 0) + x); cnt.set(g[k], (cnt.get(g[k]) || 0) + 1); } });
@@ -877,7 +889,7 @@
     };
     const all = r.map(() => true);
     const xd = demean(r, all);
-    if (mode !== 'industry_size') return xd;
+    if (mode === 'industry') return xd;
     const z = syms.map((s) => { const c = floatCap(b, s)[t]; return c > 0 ? Math.log(c) : NaN; });
     const use = z.map(fin);
     const zd = demean(z.map((v) => (fin(v) ? v : 0)), use);
@@ -1081,7 +1093,7 @@
       if (!this.factors.length) throw new Error('至少选一个权重不为 0 的因子');
       if (!(topN >= 1 && rebalance >= 1 && trendN >= 0)) throw new Error('持有数量、调仓间隔至少为 1，趋势均线不能为负');
       Object.assign(this, { name: 'factor', topN: Math.floor(topN), rebalance: Math.floor(rebalance), trendN: Math.floor(trendN), sizing,
-        neutral: ['industry', 'industry_size'].includes(neutral) ? neutral : 'none' });
+        neutral: NEUTRAL_MODES.includes(neutral) ? neutral : 'none' });
       // 组合优化（sizing = 'optimize'）：Grinold 预期收益 α = IC × σ × z；单票上限与单边成本以百分比给出
       if (sizing === 'optimize') {
         if (!(ic > 0 && riskAversion >= 0 && maxWeight > 0 && turnoverCost >= 0 && industryPenalty >= 0)) throw new Error('组合优化参数需为正（IC、单票上限）或非负');
@@ -1096,9 +1108,12 @@
       return out;
     }
 
-    generate(close, dates, symbols, bars) {
-      const n = dates.length;
-      const N = symbols.length;
+    /* 回测引擎调用：预先计算因子值与趋势过滤用的指数。
+     * 趋势指数只用决策当时可知的信息：有官方指数（meta.index）时用它；否则为"前一交易日在股票池内的标的"日收益等权的链式指数，
+     * 未来才纳入的股票在纳入前不影响任何决策。 */
+    prepare(close, dates, symbols, bars) {
+      if (INDUSTRY_MODES.includes(this.neutral)) assertIndustryPIT(bars, '行业中性化');
+      if (this.sizing === 'optimize' && this.industryPenalty > 0) assertIndustryPIT(bars, '组合优化的行业偏离惩罚');
       const cache = (s, key, fn) => {
         const k = s + '|' + key;
         if (!bars.cache.has(k)) bars.cache.set(k, fn());
@@ -1106,79 +1121,119 @@
       };
       const vals = this.factors.map((f) => symbols.map((s) => cache(s, 'fac:' + f.id, () => FACTOR_BY_ID[f.id].f(bars, s))));
       const vol = this.sizing === 'invvol' ? symbols.map((s) => cache(s, 'vol20', () => AQ.annVol(bars.close[s], 20))) : null;
-      const member = bars.member;
-
-      // 等权指数：各标的相对自身首个价格的均值
       let riskOn = () => true;
       if (this.trendN > 0) {
-        const first = symbols.map((s) => close[s].find(fin));
-        const idx = dates.map((_, i) => {
-          let sum = 0, cnt = 0;
-          symbols.forEach((s, k) => { const c = close[s][i]; if (fin(c)) { sum += c / first[k]; cnt++; } });
-          return cnt ? sum / cnt : NaN;
-        });
+        const idx = trendIndex(close, dates, symbols, bars);
         const ma = ind.sma(idx, this.trendN);
         riskOn = (i) => !fin(ma[i]) || idx[i] > ma[i];
       }
+      this.lastW0 = null;
+      this.st = { close, dates, symbols, bars, vals, vol, riskOn, member: bars.member, N: symbols.length,
+        prevRow: new Array(symbols.length).fill(0), wasOn: true, lastRebal: -Infinity };
+    }
 
-      const out = new Array(n).fill(null);
-      let prevRow = new Array(N).fill(0);
-      let wasOn = true;
-      let lastRebal = -Infinity;
-      for (let i = WARM; i < n; i++) {
-        const on = riskOn(i);
-        const due = i - lastRebal >= this.rebalance;
-        if (!on) {
-          if (wasOn) out[i] = new Array(N).fill(0);
-          wasOn = false;
-          continue;
-        }
-        if (!due && wasOn) continue;
-        wasOn = true;
-        lastRebal = i;
-        const eligible = [];
-        for (let k = 0; k < N; k++) {
-          if (member && !member[symbols[k]][i]) continue;
-          if (vals.every((v) => fin(v[k][i])) && fin(close[symbols[k]][i])) eligible.push(k);
-        }
-        const score = new Array(N).fill(0);
-        this.factors.forEach((f, j) => {
-          // 截面秩分（−0.5 ~ 0.5），可选行业 / 行业 + 市值中性化
-          const z = neutralize(eligible.map((k) => vals[j][k][i]), eligible.map((k) => symbols[k]), this.neutral, bars, i);
-          eligible.forEach((k, e) => (score[k] += f.weight * z[e]));
-        });
-        const picked = eligible.slice().sort((a, b2) => score[b2] - score[a]).slice(0, this.topN);
-        const row = new Array(N).fill(0);
-        if (this.sizing === 'optimize' && eligible.length >= 2) {
-          const w = this.optimizeRow(i, eligible, score, prevRow, symbols, close, bars);
-          w.forEach((v, k) => (row[k] = v));
-          prevRow = row;
-          out[i] = row;
-          continue;
-        }
-        if (this.sizing === 'invvol' && picked.length) {
-          const inv = picked.map((k) => (vol[k][i] > 0 ? 1 / vol[k][i] : 0));
-          const avg = inv.filter((v) => v > 0).reduce((a, x) => a + x, 0) / (inv.filter((v) => v > 0).length || 1) || 1;
-          const raw = inv.map((v) => v || avg);
-          const total = raw.reduce((a, x) => a + x, 0);
-          const budget = picked.length / this.topN;
-          picked.forEach((k, e) => (row[k] = (raw[e] / total) * budget));
-        } else {
-          picked.forEach((k) => (row[k] = 1 / this.topN));
-        }
-        out[i] = row;
+    // 连续账户切换参数时：下一个决策日立即按新参数调仓
+    adopt() {
+      this.st.lastRebal = -Infinity;
+      this.st.wasOn = true;
+    }
+
+    /* 每个交易日收盘后决策。ctx 为引擎给出的实际账户状态（持股、总资产）；组合优化的换手惩罚以实际持仓权重为起点，
+     * 而不是上一次的目标（目标可能因涨跌停、停牌、容量没有成交）。ctx 为空时（预览）退回上一次的目标。 */
+    decide(i, ctx) {
+      const st = this.st;
+      const { close, symbols, bars, vals, vol, member, N } = st;
+      if (i < WARM) return null;
+      const on = st.riskOn(i);
+      const due = i - st.lastRebal >= this.rebalance;
+      if (!on) {
+        const out = st.wasOn ? new Array(N).fill(0) : null;
+        st.wasOn = false;
+        return out;
       }
-      return out;
+      if (!due && st.wasOn) return null;
+      st.wasOn = true;
+      st.lastRebal = i;
+      const eligible = [];
+      for (let k = 0; k < N; k++) {
+        if (member && !member[symbols[k]][i]) continue;
+        if (vals.every((v) => fin(v[k][i])) && fin(close[symbols[k]][i])) eligible.push(k);
+      }
+      const score = new Array(N).fill(0);
+      this.factors.forEach((f, j) => {
+        // 截面秩分（−0.5 ~ 0.5），可选市值 / 行业 / 行业 + 市值中性化
+        const z = neutralize(eligible.map((k) => vals[j][k][i]), eligible.map((k) => symbols[k]), this.neutral, bars, i);
+        eligible.forEach((k, e) => (score[k] += f.weight * z[e]));
+      });
+      const picked = eligible.slice().sort((a, b2) => score[b2] - score[a]).slice(0, this.topN);
+      const row = new Array(N).fill(0);
+      if (this.sizing === 'optimize' && eligible.length >= 2) {
+        const w0 = ctx && ctx.equity > 0 ? symbols.map((s) => Math.max(ctx.value(s), 0) / ctx.equity) : st.prevRow;
+        this.lastW0 = new Map(symbols.map((s, k) => [s, w0[k]]));
+        const w = this.optimizeRow(i, eligible, score, w0, symbols, close, bars);
+        w.forEach((v, k) => (row[k] = v));
+        st.prevRow = row;
+        return row;
+      }
+      if (this.sizing === 'invvol' && picked.length) {
+        const inv = picked.map((k) => (vol[k][i] > 0 ? 1 / vol[k][i] : 0));
+        const avg = inv.filter((v) => v > 0).reduce((a, x) => a + x, 0) / (inv.filter((v) => v > 0).length || 1) || 1;
+        const raw = inv.map((v) => v || avg);
+        const total = raw.reduce((a, x) => a + x, 0);
+        const budget = picked.length / this.topN;
+        picked.forEach((k, e) => (row[k] = (raw[e] / total) * budget));
+      } else {
+        picked.forEach((k) => (row[k] = 1 / this.topN));
+      }
+      st.prevRow = row;
+      return row;
+    }
+
+    /* 理想化预览：假设每个目标都按时全部成交（组合优化以上一次目标为起点）。回测一律走引擎的 decide 路径。 */
+    generate(close, dates, symbols, bars) {
+      this.prepare(close, dates, symbols, bars);
+      return dates.map((_, i) => this.decide(i, null));
     }
   }
 
+  // 趋势过滤用的指数（见 FactorStrategy.prepare）
+  function trendIndex(close, dates, symbols, bars) {
+    const n = dates.length;
+    const off = bars.meta && bars.meta.index;
+    if (off && off.dates && off.dates.length) {
+      // 官方指数按日期对齐，缺失日沿用前值
+      const out = new Float64Array(n).fill(NaN);
+      let j = 0, last = NaN;
+      for (let i = 0; i < n; i++) {
+        while (j < off.dates.length && off.dates[j] <= dates[i]) { if (off.close[j] > 0) last = off.close[j]; j++; }
+        out[i] = last;
+      }
+      if (out.some(fin)) return out;
+    }
+    const member = bars.member;
+    const out = new Float64Array(n).fill(NaN);
+    let level = 1, started = false;
+    for (let i = 1; i < n; i++) {
+      let sum = 0, cnt = 0;
+      for (const s of symbols) {
+        if (member && !member[s][i - 1]) continue;
+        const a = close[s][i - 1], c = close[s][i];
+        if (a > 0 && c > 0) { sum += c / a - 1; cnt++; }
+      }
+      if (cnt) { level *= 1 + sum / cnt; started = true; }
+      if (started) out[i] = level;
+    }
+    return out;
+  }
+
   /* 组合优化的一次调仓：候选 = 综合分最高的 max(3×topN, 30) 只 + 当前持有的；
-   * 协方差用候选过去 250 个交易日的日收益做 Ledoit–Wolf 收缩；α、Σ 都换算到调仓周期。返回每只标的的权重（Map: k → w）。 */
-  FactorStrategy.prototype.optimizeRow = function (i, eligible, score, prevRow, symbols, close, bars) {
+   * 协方差用候选过去 250 个交易日的日收益做 Ledoit–Wolf 收缩；α、Σ 都换算到调仓周期。
+   * w0 为起点权重（实际持仓）；单票上限是硬约束，放不满时剩余为现金。返回每只标的的权重（Map: k → w）。 */
+  FactorStrategy.prototype.optimizeRow = function (i, eligible, score, w0All, symbols, close, bars) {
     const W = 250;
     const K = Math.max(3 * this.topN, 30);
     const ranked = eligible.slice().sort((a, b) => score[b] - score[a]);
-    const cand = [...new Set([...ranked.slice(0, K), ...eligible.filter((k) => prevRow[k] > 0)])];
+    const cand = [...new Set([...ranked.slice(0, K), ...eligible.filter((k) => w0All[k] > 0)])];
     // 历史不足的剔除
     const X = [], use = [];
     for (const k of cand) {
@@ -1189,9 +1244,10 @@
     }
     const out = new Map();
     if (use.length < 2) {
-      // 历史不足以估计协方差：等权持有综合分最高的若干只，数量保证不超过单票上限
+      // 历史不足以估计协方差：等权持有综合分最高的若干只，每只不超过单票上限（只数不够时剩余为现金）
       const m = Math.min(ranked.length, Math.max(this.topN, Math.ceil(1 / this.maxWeight - 1e-9)));
-      ranked.slice(0, m).forEach((k) => out.set(k, 1 / m));
+      const w = m ? Math.min(1 / m, this.maxWeight) : 0;
+      ranked.slice(0, m).forEach((k) => out.set(k, w));
       return out;
     }
     for (let t = Math.max(1, i - W + 1); t <= i; t++) {
@@ -1203,7 +1259,7 @@
     const mu = mean(sc), sd = Math.sqrt(sc.reduce((a, x) => a + (x - mu) ** 2, 0) / Math.max(sc.length - 1, 1)) || 1;
     const alpha = Float64Array.from(use, (k, j) => this.ic * Math.sqrt(lw.cov[j * n + j] * R) * ((score[k] - mu) / sd));
     const cov = Float64Array.from(lw.cov, (v) => v * R);
-    const w0 = Float64Array.from(use, (k) => prevRow[k] || 0);
+    const w0 = Float64Array.from(use, (k) => w0All[k] || 0);
     let groups = null, bench = null;
     const industry = bars.meta && bars.meta.industry;
     if (this.industryPenalty > 0 && industry) {
@@ -1212,9 +1268,8 @@
       for (const k of eligible) { const g = industry[symbols[k]] || '—'; bench[g] = (bench[g] || 0) + 1 / eligible.length; }
     }
     const w = PF.optimize({ alpha, cov, w0, lambda: this.riskAversion, kappa: this.turnoverCost, cap: this.maxWeight, groups, bench, rho: this.industryPenalty });
-    let tot = 0;
-    use.forEach((k, j) => { if (w[j] > 1e-4) { out.set(k, w[j]); tot += w[j]; } });
-    for (const [k, v] of out) out.set(k, v / tot);
+    // 不再归一化：归一化会把权重放大到超过单票上限
+    use.forEach((k, j) => { if (w[j] > 1e-4) out.set(k, Math.min(w[j], this.maxWeight)); });
     return out;
   };
 
@@ -1255,6 +1310,7 @@
   /* 信号衰减：截面 IC 随预测周期的变化（各周期非重叠抽样）、按年份的截面 IC、因子自身的秩自相关（越低换手越高）。 */
   function factorDecay(bt, factorId, { horizons = [1, 5, 10, 20, 60], yearH = 5, neutral = 'none' } = {}) {
     const b = bt.bars();
+    if (INDUSTRY_MODES.includes(neutral)) assertIndustryPIT(b, '行业中性化');
     const syms = bt.symbols;
     const f = FACTOR_BY_ID[factorId];
     const vals = Object.fromEntries(syms.map((s) => [s, f.f(b, s)]));
@@ -1269,13 +1325,13 @@
       return spearman(neutral === 'none' ? x : neutralize(x, ss, neutral, b, t), y);
     };
     const byH = horizons.map((h) => {
-      const fwd = Object.fromEntries(syms.map((s) => [s, forwardReturns(b.open[s], h)]));
+      const fwd = Object.fromEntries(syms.map((s) => [s, forwardReturnsOf(bt, s, h)]));
       const ics = [];
       for (let t = WARM; t < bt.dates.length; t += h) { const c = csIC(t, fwd); if (fin(c)) ics.push(c); }
       const m = ics.length > 2 ? moments(ics) : null;
       return { h, ic: m ? m.mean : NaN, icir: m && m.std > 0 ? m.mean / m.std : NaN, n: ics.length };
     });
-    const fwdY = Object.fromEntries(syms.map((s) => [s, forwardReturns(b.open[s], yearH)]));
+    const fwdY = Object.fromEntries(syms.map((s) => [s, forwardReturnsOf(bt, s, yearH)]));
     const years = {};
     for (let t = WARM; t < bt.dates.length; t += yearH) {
       const c = csIC(t, fwdY);
@@ -1299,10 +1355,25 @@
     };
   }
 
-  // 未来收益：t 日收盘出信号，t+1 日开盘买入，持有 h 日后开盘卖出
+  // 未来收益（理想化，不检查能否成交）：t 日收盘出信号，t+1 日开盘买入，持有 h 日后开盘卖出
   function forwardReturns(open, h) {
     const out = new Float64Array(open.length).fill(NaN);
     for (let t = 0; t + 1 + h < open.length; t++) out[t] = open[t + 1 + h] / open[t + 1] - 1;
+    return out;
+  }
+
+  /* 可成交的未来收益：t+1 日开盘买入、t+1+h 日开盘卖出，用未填充的复权开盘价；
+   * 买入日停牌或开盘涨停、卖出日停牌或开盘跌停时为 NaN（该样本不参与 IC 与衰减统计，不用前值"成交"）。 */
+  function forwardReturnsOf(bt, s, h) {
+    const n = bt.dates.length, o = bt.open[s], tr = bt.tradable[s], px = bt.xopen[s], pc = bt.prevClose[s];
+    const out = new Float64Array(n).fill(NaN);
+    for (let t = 0; t + 1 + h < n; t++) {
+      const a = t + 1, e = t + 1 + h;
+      if (!tr[a] || !tr[e]) continue;
+      if (AQ.isLimitUp(s, bt.dates[a], px[a], pc[a], bt.limitOf(s, a))) continue;
+      if (AQ.isLimitDown(s, bt.dates[e], px[e], pc[e], bt.limitOf(s, e))) continue;
+      out[t] = o[e] / o[a] - 1;
+    }
     return out;
   }
 
@@ -1311,7 +1382,7 @@
     const factors = availableFactors(b, bt.symbols).filter((f) => !ids || ids.includes(f.id));
     const fwd = {}, vals = {};
     for (const s of bt.symbols) {
-      fwd[s] = forwardReturns(b.open[s], h);
+      fwd[s] = forwardReturnsOf(bt, s, h);
       vals[s] = {};
       for (const f of factors) vals[s][f.id] = f.f(b, s);
       // 时点股票池：不在池内的日子没有未来收益，自然不参与 IC 与分组
@@ -1408,6 +1479,7 @@
    * 以 95% 置信区间是否跨过 0 判断显著。 */
   function factorIC(bt, h, { B = 200, seed = 7, neutral = 'none' } = {}) {
     const b = bt.bars();
+    if (INDUSTRY_MODES.includes(neutral)) assertIndustryPIT(b, '行业中性化');
     const { factors, fwd, vals } = factorPanel(bt, h);
     const syms = bt.symbols;
     const ts = [];
@@ -1491,55 +1563,116 @@
     };
   }
 
-  /* 可交易的分组组合：每 h 天在 t 日收盘按因子值把标的从低到高分 q 组，各组等权，
-   * t+1 日开盘买入、持有 h 日后开盘卖出；每次调仓按权重变化扣成本（cost 为单边费率，含佣金、印花税、滑点）。
-   * 多空 = 最高组 - 最低组（A 股融券受限，仅作因子强弱的参考）。
+  /* 可交易的分组组合：每 h 天在 t 日收盘按因子值（可选中性化）把当期股票池从低到高分 q 组，各组等权；
+   * 每组都用同一个回测引擎实际成交：t+1 日开盘、真实价格、整手、涨跌停与停牌不能成交、费用与滑点（及启用时的容量、冲击）与回测一致。
+   * 资金规模默认 1 亿（避免高价股因整手买不起）。多空 = 最高组日收益 − 最低组日收益（A 股融券受限，仅作因子强弱的参考）。
    * 组数按标的数量：≥10 只分 5 组，6~9 只分 3 组，更少不分组。 */
-  function factorPortfolios(bt, factorId, h, { q, cost = 0.0015, neutral = 'none' } = {}) {
+  function factorPortfolios(bt, factorId, h, { q, neutral = 'none', capital = 1e8 } = {}) {
     const b = bt.bars();
+    if (INDUSTRY_MODES.includes(neutral)) assertIndustryPIT(b, '行业中性化');
     const syms = bt.symbols;
     const N = syms.length;
     q = q || (N >= 10 ? 5 : N >= 6 ? 3 : 0);
     if (!q) return { q: 0, error: '分组组合至少需要 6 只标的' };
-    const { fwd, vals } = factorPanel(bt, h, [factorId]);
-    const ppy = TD / h;
-    const groups = Array.from({ length: q }, () => ({ rets: [], gross: [], turn: [], w: new Map() }));
-    const dates = [], ls = [];
-    for (let t = WARM; t < bt.dates.length; t += h) {
-      const elig = syms.filter((s) => fin(vals[s][factorId][t]) && fin(fwd[s][t]));
+    const f = FACTOR_BY_ID[factorId];
+    const vals = syms.map((s) => cachedPanel(b, s, 'fac:' + factorId, () => f.f(b, s)));
+    const n = bt.dates.length;
+    const rows = Array.from({ length: q }, () => new Array(n).fill(null));
+    let t0 = -1, periods = 0;
+    for (let t = WARM; t < n; t += h) {
+      const elig = [];
+      syms.forEach((s, k) => { if ((!b.member || b.member[s][t]) && fin(vals[k][t]) && fin(b.close[s][t])) elig.push(k); });
       if (elig.length < q) continue;
-      const z = neutralize(elig.map((s) => vals[s][factorId][t]), elig, neutral, b, t);
-      const zs = new Map(elig.map((s, k) => [s, z[k]]));
-      elig.sort((p, q2) => zs.get(p) - zs.get(q2));
-      const m = elig.length;
-      groups.forEach((g, k) => {
-        const members = elig.slice(Math.floor((k * m) / q), Math.floor(((k + 1) * m) / q));
-        const w = new Map(members.map((s) => [s, 1 / members.length]));
-        let dw = 0;
-        for (const [s, v] of w) dw += Math.abs(v - (g.w.get(s) || 0));
-        for (const [s, v] of g.w) if (!w.has(s)) dw += v;
-        const gross = members.reduce((acc, s) => acc + fwd[s][t], 0) / members.length;
-        g.gross.push(gross);
-        g.rets.push(gross - dw * cost);
-        g.turn.push(dw / 2);
-        g.w = w;
-      });
-      ls.push(groups[q - 1].rets[groups[q - 1].rets.length - 1] - groups[0].rets[groups[0].rets.length - 1]);
-      dates.push(bt.dates[t]);
+      const z = neutralize(elig.map((k) => vals[k][t]), elig.map((k) => syms[k]), neutral, b, t);
+      const order = elig.map((k, e) => [k, z[e]]).sort((p, p2) => p[1] - p2[1]).map((p) => p[0]);
+      const m = order.length;
+      for (let g = 0; g < q; g++) {
+        const members = order.slice(Math.floor((g * m) / q), Math.floor(((g + 1) * m) / q));
+        const row = new Array(N).fill(0);
+        members.forEach((k) => (row[k] = 1 / members.length));
+        rows[g][t] = row;
+      }
+      if (t0 < 0) t0 = t;
+      periods++;
     }
+    if (t0 < 0) return { q: 0, error: '有效样本不足，无法分组' };
+    const saved = bt.initialCash;
+    const runs = [];
+    try {
+      bt.initialCash = capital;
+      for (let g = 0; g < q; g++) runs.push(bt.run({ name: 'quantile', params: () => ({ factor: factorId, h, q, group: g + 1 }), generate: () => rows[g] }));
+    } finally {
+      bt.initialCash = saved;
+    }
+    const dates = bt.dates.slice(t0);
+    const daily = (eq) => { const r = []; for (let i = t0 + 1; i < n; i++) r.push(eq[i] / eq[i - 1] - 1); return r; };
     const curve = (r) => { let v = 1; return [1].concat(r.map((x) => (v *= 1 + x))); };
+    const years = Math.max(n - 1 - t0, 1) / TD;
+    const groups = runs.map((res, g) => {
+      const eq = res.equity.slice(t0);
+      const meanEq = eq.reduce((a, v) => a + v, 0) / eq.length;
+      const tr = res.trades.filter(AQ.isFill);
+      const fees = tr.reduce((a, x) => a + x.fee, 0), impact = tr.reduce((a, x) => a + (x.impact || 0), 0);
+      return {
+        group: g + 1,
+        ...periodStats(daily(res.equity), TD),
+        fees, impact,
+        costDrag: (fees + impact) / meanEq / years,
+        turnover: tr.reduce((a, x) => a + x.amount, 0) / meanEq / years,
+        equity: eq.map((v) => v / eq[0]),
+      };
+    });
+    const top = daily(runs[q - 1].equity), bot = daily(runs[0].equity);
+    const ls = top.map((x, k) => x - bot[k]);
     return {
-      q, h, cost,
-      periods: dates.length,
-      dates,
-      groups: groups.map((g, k) => ({
-        group: k + 1,
-        ...periodStats(g.rets, ppy),
-        grossReturn: periodStats(g.gross, ppy)?.annReturn,
-        turnover: g.turn.length ? mean(g.turn.slice(1)) : NaN,
-        equity: curve(g.rets),
-      })),
-      longShort: { ...periodStats(ls, ppy), equity: curve(ls) },
+      q, h, engine: true, capital, periods, dates, groups,
+      longShort: { ...periodStats(ls, TD), equity: curve(ls) },
+    };
+  }
+
+  /* 影子账户（纸面交易）：把冻结的目标权重按时间顺序交给同一个回测引擎执行——次日开盘、真实价格、整手、
+   * 涨跌停与停牌不能成交（次日继续）、费用、滑点、容量与冲击都与回测一致，而不是"权重 × 收益"。
+   * entries: [{ date, targets: { 代码: 权重 }, engine }]，engine 为冻结时的执行假设（取第一条的；opts.engine 可覆盖）。
+   * 行情用全部数据（成交额均值、前收需要冻结日之前的数据），结果从第一条冻结日开始。 */
+  function paperReplay(data, entries, opts = {}) {
+    const list = entries.filter((e) => e && e.date && e.targets).slice().sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+    if (!list.length) return null;
+    const engine = { ...(list[0].engine || {}), ...(opts.engine || {}) };
+    if (opts.meta) engine.meta = opts.meta;
+    const syms = [...new Set(list.flatMap((e) => Object.keys(e.targets)))].filter((s) => data[s]);
+    const sub = Object.fromEntries(syms.map((s) => [s, data[s]]));
+    if (!syms.length) return null;
+    const bt = makeBacktester(sub, engine);
+    const rows = bt.dates.map(() => null);
+    let start = -1;
+    for (const e of list) {
+      const i = bt.dates.findIndex((d) => d >= e.date);
+      if (i < 0) continue;
+      if (start < 0) start = i;
+      rows[i] = bt.symbols.map((s) => +e.targets[s] || 0);
+    }
+    if (start < 0) return { dates: [], equity: [], trades: [], cash: engine.initialCash || 1e6, pending: null, positions: {}, start: list[0].date };
+    const res = bt.run({ name: 'paper', params: () => ({ entries: list.length }), generate: () => rows });
+    const last = bt.dates.length - 1;
+    let held = 0;
+    for (const s of bt.symbols) {
+      if (!res.finalShares[s]) continue;
+      let px = NaN;
+      for (let i = last; i >= 0 && !fin(px); i--) px = bt.xclose[s][i];
+      held += res.finalShares[s] * px;
+    }
+    const eq = res.equity.slice(start);
+    return {
+      start: list[0].date,
+      dates: bt.dates.slice(start),
+      equity: eq,
+      nav: eq.map((v) => v / eq[0]),
+      trades: res.trades.filter((t) => AQ.isFill(t) && t.date >= bt.dates[start]),
+      actions: res.trades.filter((t) => !AQ.isFill(t) && t.date >= bt.dates[start]),
+      positions: Object.fromEntries(Object.entries(res.finalShares).filter(([, v]) => v > 0)),
+      cash: res.equity[last] - held,
+      pending: res.nextTargets,
+      engine,
     };
   }
 
@@ -1612,7 +1745,7 @@
     moments, normCdf, normInv, ranks, spearman, acf, varianceRatio, segStats, deflatedSharpe,
     rangeValues, gridSize, gridIter, randomCombos, applyParams, makeBacktester, optimize, pbo, spa,
     relativeStats, roundTrips, monthlyReturns, SwitchingStrategy, olsHAC, styleFactors, exposure, neutralize, STYLE_DEFS,
-    FACTORS, availableFactors, factorCorrelation, buildAnyStrategy, stressTest, factorDecay, fundPanel, floatCap, sharesPanel, marketCap, FactorStrategy, buildStrategy, factorIC, factorPortfolios, seriesStats, forwardReturns, blockIndices,
+    FACTORS, availableFactors, factorCorrelation, buildAnyStrategy, stressTest, factorDecay, fundPanel, floatCap, sharesPanel, marketCap, FactorStrategy, buildStrategy, factorIC, factorPortfolios, seriesStats, paperReplay, forwardReturns, forwardReturnsOf, blockIndices, trendIndex, assertIndustryPIT, NEUTRAL_MODES,
   };
   if (isNode) module.exports = api;
   else AQ.research = api;
