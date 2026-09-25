@@ -110,7 +110,9 @@ test('4: execution uses raw prices with corporate actions; equity follows the ad
   const adjC = [10, 10, 10, 10.2, 10.4, 10.6];
   const data = { '600000': { dates, open: adjC.slice(), close: adjC.slice(), high: adjC.slice(), low: adjC.slice(), volume: dates.map(() => 1e6), raw: rawC.slice() } };
   const fees = new AQ.FeeModel({ commissionRate: 0, minCommission: 0, transferRate: 0, stampDutyRate: 0 });
-  const bt = new AQ.Backtester(data, { initialCash: 100000, fees, slippage: 0, rebalanceBand: 0 });
+  // 送转需要明细数据（仅凭复权因子无法区分派现与送转，见 audit2 的 1a/1b）
+  const corporateActions = { '600000': [{ date: dates[3], bonus: 1 }] };
+  const bt = new AQ.Backtester(data, { initialCash: 100000, fees, slippage: 0, rebalanceBand: 0, meta: { corporateActions } });
   const res = bt.run(new AQ.BuyAndHold());
   const buy = res.trades[0];
   assert.equal(buy.price, 20, '按真实开盘价成交');
@@ -130,7 +132,7 @@ test('4: execution uses raw prices with corporate actions; equity follows the ad
   // 买入 → 分红 → 送转后全部卖出：往返收益包含分红，送转后的股数正确结清
   const d3 = { '600000': { dates, open: adjC.slice(), close: adjC.slice(), volume: dates.map(() => 1e6), raw: rawC.slice() } };
   const rows = [[1], null, null, null, [0], null];
-  const r3 = new AQ.Backtester(d3, { initialCash: 100000, fees, slippage: 0, rebalanceBand: 0 }).run({ name: 'x', params: () => ({}), generate: () => rows });
+  const r3 = new AQ.Backtester(d3, { initialCash: 100000, fees, slippage: 0, rebalanceBand: 0, meta: { corporateActions } }).run({ name: 'x', params: () => ({}), generate: () => rows });
   const rt = R.roundTrips(r3.trades, r3.dates);
   assert.equal(rt.count, 1);
   assert.equal(rt.open, 0);

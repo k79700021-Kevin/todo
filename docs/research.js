@@ -190,17 +190,31 @@
    * blocks[k] = { sum: Float64Array(S), sq: Float64Array(S), n: Float64Array(S) }：第 k 组参数在 S 个时间块上的日收益和、平方和、天数。
    * 枚举所有"一半块做样本内、另一半做样本外"的组合：样本内夏普最高的参数，在样本外的相对排名 ω；
    * PBO = P(ω ≤ 1/2)，即样本内冠军在样本外落到后一半的概率。另给出样本外亏损概率与样本内外夏普的回归斜率。 */
-  function pbo(blocks) {
+  /* criterion 与优化目标一致：'sharpe'、'sortino'、'cagr'（按日均对数收益排名，与年化几何收益同序）可由分块统计精确合成；
+   * 'calmar' 依赖整条路径的最大回撤，无法由分块合成，按 'cagr' 近似（返回 approx = true）。
+   * 分块统计：sum / sq / n 为日收益的和、平方和、天数；lsum 为 ln(1+r) 之和；dsq 为超额收益负部的平方和。rfd 为日无风险利率。 */
+  function pbo(blocks, { criterion = 'sharpe', rfd = 0 } = {}) {
     const N = blocks.length;
     if (N < 2) return null;
     const S = blocks[0].sum.length;
     const half = S / 2;
+    const hasLog = blocks.every((b) => b.lsum), hasDown = blocks.every((b) => b.dsq);
+    const crit = criterion === 'calmar' ? 'cagr' : criterion;
+    const use = (crit === 'cagr' && !hasLog) || (crit === 'sortino' && !hasDown) || !['sharpe', 'sortino', 'cagr'].includes(crit) ? 'sharpe' : crit;
     const sharpe = (e, mask, want) => {
-      let s1 = 0, s2 = 0, n = 0;
-      for (let j = 0; j < S; j++) if (((mask >> j) & 1) === want) { s1 += e.sum[j]; s2 += e.sq[j]; n += e.n[j]; }
+      let s1 = 0, s2 = 0, n = 0, l = 0, d = 0;
+      for (let j = 0; j < S; j++) {
+        if (((mask >> j) & 1) !== want) continue;
+        s1 += e.sum[j]; s2 += e.sq[j]; n += e.n[j];
+        if (hasLog) l += e.lsum[j];
+        if (hasDown) d += e.dsq[j];
+      }
       if (n < 2) return NaN;
-      const m = s1 / n, v = (s2 - n * m * m) / (n - 1);
-      return v > 0 ? m / Math.sqrt(v) : NaN;
+      const m = s1 / n;
+      if (use === 'cagr') return l / n;
+      if (use === 'sortino') return d > 0 ? (m - rfd) / Math.sqrt(d / n) : NaN;
+      const v = (s2 - n * m * m) / (n - 1);
+      return v > 0 ? (m - rfd) / Math.sqrt(v) : NaN;
     };
     let below = 0, loss = 0, total = 0;
     const logits = [], pairs = [];
@@ -233,6 +247,7 @@
     // 每块天数太少时，块内夏普噪声很大，PBO 本身也不稳定
     const days = blocks[0].n.reduce((a, x) => a + x, 0) / S;
     return {
+      criterion: use, requested: criterion, approx: use !== criterion,
       pbo: below / total, probLoss: loss / total, splits: total, blocks: S, blockDays: days,
       warning: days < 60 ? `每块平均只有 ${Math.round(days)} 个交易日（< 60），样本太短，PBO 估计不稳定，仅作参考` : '',
       slope: sxx > 0 ? sxy / sxx : NaN,
@@ -416,12 +431,15 @@
       const res = bt.run(strat);
       const eq = Float64Array.from(res.equity);
       const tIdx = Int32Array.from(res.trades.filter(AQ.isFill).map((tr) => dateIdx.get(tr.date)));
-      const blocks = { sum: new Float64Array(S), sq: new Float64Array(S), n: new Float64Array(S) };
+      const blocks = { sum: new Float64Array(S), sq: new Float64Array(S), n: new Float64Array(S), lsum: new Float64Array(S), dsq: new Float64Array(S) };
       const excess = keepDaily ? new Float32Array(T) : null;
       for (let i = 1; i < t; i++) {
         const r = eq[i] / eq[i - 1] - 1;
         const j = blockOf(i);
         blocks.sum[j] += r; blocks.sq[j] += r * r; blocks.n[j]++;
+        blocks.lsum[j] += Math.log(Math.max(1 + r, 1e-12));
+        const e = r - rf / TD;
+        if (e < 0) blocks.dsq[j] += e * e;
         if (excess) excess[i - 1] = r - benchRet[i - 1];
       }
       entries.push({
@@ -447,9 +465,11 @@
     const shortlist = ranked.slice(0, topK);
     const selected = shortlist.slice().sort((x, y) => score(y.va, objective) - score(x.va, objective) || x.trainRank - y.trainRank)[0];
 
-    // 通缩夏普：以全部合格试验的训练集夏普为"噪声分布"，检验训练集第一名
+    /* 通缩夏普：以全部合格试验的训练集夏普为"噪声分布"，检验最终选定的参数（训练集夏普 vs N 次试验的期望最大值）。
+     * 选定参数是训练前列里验证集最好的，其训练集夏普不高于第一名，因此这个检验比检验第一名更保守。
+     * 优化目标不是夏普时，这是以夏普为尺度的辅助诊断。 */
     let dsr = null;
-    const best = ranked[0];
+    const best = selected;
     if (best && fin(best.tr.srDaily)) {
       const srs = eligible.map((e) => e.tr.srDaily).filter(fin);
       const bestEq = best.eq || Float64Array.from(bt.run(buildStrategy(applyParams(config, space, best.combo))).equity);
@@ -461,6 +481,8 @@
       dsr.probThisRun = deflatedSharpe(srs, best.tr.srDaily, trEnd, mom.skew, mom.kurt).prob;
       dsr.sr0Annual = dsr.sr0 * Math.sqrt(TD);
       dsr.bestAnnual = best.tr.srDaily * Math.sqrt(TD);
+      dsr.target = 'selected';
+      dsr.objective = objective;
     }
 
     // 测试集：只对选定参数计算一次
@@ -484,7 +506,7 @@
 
     // 回测过拟合概率（CSCV）与 Hansen SPA：候选为全部合格的参数组合
     const overfit = {
-      pbo: eligible.length >= 2 ? pbo(eligible.map((e) => e.blocks)) : null,
+      pbo: eligible.length >= 2 ? pbo(eligible.map((e) => e.blocks), { criterion: objective, rfd: rf / TD }) : null,
       spa: keepDaily && eligible.length ? spa(eligible.map((e) => e.excess)) : null,
       spaSkipped: !keepDaily,
     };
@@ -916,23 +938,33 @@
     return annual && same && fin(annual[key]) && fin(same[key]) && fin(r[key]) ? r[key] + annual[key] - same[key] : NaN;
   }
 
-  // 股本在某天（含）之前最近一次变动后的值
-  function sharesAt(list, date, key) {
-    let v = NaN;
-    for (const x of list) { if (x.date > date) break; v = x[key]; }
+  /* 股本记录是双时态的：date = 生效日，known = 公告日（缺省同生效日）。
+   * sharesAt(list, date, key, asOf)：站在 asOf 这一天（只用公告日早于 asOf 的记录），还原 date 当天（含）生效的股本。 */
+  const knownOf = (x) => x.known || x.date;
+  function sharesAt(list, date, key, asOf) {
+    let v = NaN, best = '';
+    for (const x of list) {
+      if (x.date > date || !(knownOf(x) < asOf)) continue;
+      if (x.date >= best) { best = x.date; v = x[key]; }
+    }
     return v;
   }
 
-  /* 股本（总股本、流通 A 股）按变动日对齐的逐日序列，来自 meta.shares（股本变动历史）。 */
+  /* 股本（总股本、流通 A 股）的逐日序列：第 i 天用"公告日早于当天、且已生效"的最新一条（按生效日）。 */
   function sharesPanel(b, s) {
     return cachedPanel(b, s, 'shares', () => {
       const n = b.dates.length;
       const total = new Float64Array(n).fill(NaN), float = new Float64Array(n).fill(NaN);
       const list = (((b.meta || {}).shares || {})[s]) || [];
-      let j = -1;
+      // 可用时刻：生效日与"公告日之后"两者中较晚的那个（'!' 排在同一天之后，表示公告日的下一个交易日起）
+      const act = list.map((x) => ({ x, at: knownOf(x) >= x.date ? knownOf(x) + '!' : x.date })).sort((p, q) => (p.at < q.at ? -1 : p.at > q.at ? 1 : 0));
+      let j = 0, cur = null;
       for (let i = 0; i < n; i++) {
-        while (j + 1 < list.length && list[j + 1].date <= b.dates[i]) j++;
-        if (j >= 0) { total[i] = list[j].total; float[i] = list[j].float; }
+        while (j < act.length && act[j].at <= b.dates[i]) {
+          const x = act[j++].x;
+          if (!cur || x.date >= cur.date) cur = x;
+        }
+        if (cur) { total[i] = cur.total; float[i] = cur.float; }
       }
       return { total, float, has: list.length > 0 };
     });
@@ -955,7 +987,7 @@
       const col = () => new Float32Array(n).fill(NaN); // 财务指标单精度足够，省内存
       const out = { profitTTM: col(), epsTTM: col(), bps: col(), equity: col(), revYoy: col(), profitYoy: col() };
       const known = new Map();
-      let latest = null, j = 0, cur = null;
+      let latest = null, j = 0, cur = null, eqShares = NaN;
       for (let i = 0; i < n; i++) {
         let changed = false;
         while (j < recs.length && recs[j].avail < dates[i]) {
@@ -965,13 +997,16 @@
           changed = true;
         }
         if (!latest) continue;
-        if (changed) {
+        // 报告期末的总股本：站在今天（只用已公告的股本记录）还原报告期末的状态；股本公告可能晚于财报，所以每天都要看
+        const sh = sharesAt(shares, latest.report, 'total', dates[i]);
+        if (changed || !Object.is(sh, eqShares)) {
+          eqShares = sh;
           const bps = latest.bps > 0 ? latest.bps : NaN;
           cur = {
             profitTTM: ttm(latest, known, 'profit'),
             epsTTM: ttm(latest, known, 'eps'),
             bps,
-            equity: bps * sharesAt(shares, latest.report, 'total'), // 报告期末归母净资产
+            equity: bps * sh, // 报告期末归母净资产（数据源的每股净资产是报告期口径，未被之后的送转追溯调整）
             revYoy: fin(latest.revYoy) ? latest.revYoy : NaN,
             profitYoy: fin(latest.profitYoy) ? latest.profitYoy : NaN,
           };
@@ -1052,8 +1087,10 @@
     {
       id: 'illiq', label: '非流动性（Amihud）', needsVolume: true,
       f: (b, s) => {
+        // 成交额必须用真实价格：成交量（手）× 100 × 不复权价；复权价的尺度随历史公司行为而变，会把因子放大缩小
         const r = ind.roc(b.close[s], 1);
-        const x = r.map((v, i) => Math.abs(v) / (b.close[s][i] * b.volume[s][i]) * 1e9);
+        const px = b.raw[s] || b.close[s];
+        const x = r.map((v, i) => Math.abs(v) / (px[i] * b.volume[s][i] * 100) * 1e11);
         return ind.sma(Float64Array.from(x, (v) => (Number.isFinite(v) ? v : NaN)), 20);
       },
     },
@@ -1066,7 +1103,14 @@
         return Float64Array.from(b.dates, (_, i) => (cap[i] > 0 ? F.profitTTM[i] / cap[i] : b.raw[s] && b.raw[s][i] > 0 ? F.epsTTM[i] / b.raw[s][i] : NaN));
       },
     },
-    { id: 'bp', label: '账面市值比 B/P', needsFund: true, f: (b, s) => byPrice(b, s, fundPanel(b, s).bps) },
+    {
+      // 报告期末归母净资产 / 当前总市值；每股净资产 / 当前股价在报告期后送转时会被放大（股价除权、每股净资产还是旧口径）
+      id: 'bp', label: '账面市值比 B/P', needsFund: true,
+      f: (b, s) => {
+        const F = fundPanel(b, s), cap = marketCap(b, s);
+        return Float64Array.from(b.dates, (_, i) => (cap[i] > 0 && F.equity[i] > 0 ? F.equity[i] / cap[i] : b.raw[s] && b.raw[s][i] > 0 ? F.bps[i] / b.raw[s][i] : NaN));
+      },
+    },
     {
       id: 'roe', label: 'ROE（TTM）', needsFund: true,
       f: (b, s) => {
@@ -1226,14 +1270,26 @@
     return out;
   }
 
-  /* 组合优化的一次调仓：候选 = 综合分最高的 max(3×topN, 30) 只 + 当前持有的；
+  /* 组合优化的一次调仓。"持有几只"（topN）是持仓数量上限：
+   *   候选 = 综合分最高的 topN 只 + 仍排在前 2×topN 的现有持仓（减少来回换手）；
+   *   优化后非零权重多于 topN 只时，保留权重最大的 topN 只再优化一次。
    * 协方差用候选过去 250 个交易日的日收益做 Ledoit–Wolf 收缩；α、Σ 都换算到调仓周期。
    * w0 为起点权重（实际持仓）；单票上限是硬约束，放不满时剩余为现金。返回每只标的的权重（Map: k → w）。 */
   FactorStrategy.prototype.optimizeRow = function (i, eligible, score, w0All, symbols, close, bars) {
-    const W = 250;
-    const K = Math.max(3 * this.topN, 30);
     const ranked = eligible.slice().sort((a, b) => score[b] - score[a]);
-    const cand = [...new Set([...ranked.slice(0, K), ...eligible.filter((k) => w0All[k] > 0)])];
+    const buffer = new Set(ranked.slice(0, 2 * this.topN));
+    const cand = [...new Set([...ranked.slice(0, this.topN), ...ranked.filter((k) => w0All[k] > 0 && buffer.has(k))])];
+    let out = this.solveRow(i, cand, eligible, score, w0All, symbols, close, bars);
+    if (out.size > this.topN) {
+      const keep = [...out.entries()].sort((a, b) => b[1] - a[1]).slice(0, this.topN).map(([k]) => k);
+      out = this.solveRow(i, keep, eligible, score, w0All, symbols, close, bars);
+    }
+    return out;
+  };
+
+  FactorStrategy.prototype.solveRow = function (i, cand, eligible, score, w0All, symbols, close, bars) {
+    const W = 250;
+    const ranked = cand.slice().sort((a, b) => score[b] - score[a]);
     // 历史不足的剔除
     const X = [], use = [];
     for (const k of cand) {
@@ -1244,8 +1300,8 @@
     }
     const out = new Map();
     if (use.length < 2) {
-      // 历史不足以估计协方差：等权持有综合分最高的若干只，每只不超过单票上限（只数不够时剩余为现金）
-      const m = Math.min(ranked.length, Math.max(this.topN, Math.ceil(1 / this.maxWeight - 1e-9)));
+      // 历史不足以估计协方差：等权持有候选里综合分最高的（不超过 topN 只），每只不超过单票上限，其余为现金
+      const m = Math.min(ranked.length, this.topN);
       const w = m ? Math.min(1 / m, this.maxWeight) : 0;
       ranked.slice(0, m).forEach((k) => out.set(k, w));
       return out;
@@ -1630,49 +1686,95 @@
     };
   }
 
-  /* 影子账户（纸面交易）：把冻结的目标权重按时间顺序交给同一个回测引擎执行——次日开盘、真实价格、整手、
+  /* 影子账户（纸面交易）：把冻结的目标权重按时间顺序交给回测引擎执行——次日开盘、真实价格、整手、
    * 涨跌停与停牌不能成交（次日继续）、费用、滑点、容量与冲击都与回测一致，而不是"权重 × 收益"。
-   * entries: [{ date, targets: { 代码: 权重 }, engine }]，engine 为冻结时的执行假设（取第一条的；opts.engine 可覆盖）。
-   * 行情用全部数据（成交额均值、前收需要冻结日之前的数据），结果从第一条冻结日开始。 */
+   * entries: [{ date, targets: { 代码: 权重 }, engine }]。按冻结分段：每次冻结之后到下一次冻结为止，用这次冻结时保存的执行假设
+   *   （opts.engine 可整体覆盖）；新的冻结在当天收盘后替换尚未成交的旧目标。
+   * opts.snapshot = { date, cash, shares, pending }：从已冻结的结算状态接着算（之前的日子不再重放，数据修订也不会改变它们）。
+   * 行情用全部数据（成交额均值、前收需要更早的数据）。返回新结算的日期、净值、成交与期末状态。 */
   function paperReplay(data, entries, opts = {}) {
     const list = entries.filter((e) => e && e.date && e.targets).slice().sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
     if (!list.length) return null;
-    const engine = { ...(list[0].engine || {}), ...(opts.engine || {}) };
-    if (opts.meta) engine.meta = opts.meta;
-    const syms = [...new Set(list.flatMap((e) => Object.keys(e.targets)))].filter((s) => data[s]);
-    const sub = Object.fromEntries(syms.map((s) => [s, data[s]]));
+    const snap = opts.snapshot || null;
+    const syms = [...new Set([...list.flatMap((e) => Object.keys(e.targets)), ...Object.keys((snap && snap.shares) || {})])].filter((s) => data[s]);
     if (!syms.length) return null;
-    const bt = makeBacktester(sub, engine);
-    const rows = bt.dates.map(() => null);
-    let start = -1;
-    for (const e of list) {
-      const i = bt.dates.findIndex((d) => d >= e.date);
-      if (i < 0) continue;
-      if (start < 0) start = i;
-      rows[i] = bt.symbols.map((s) => +e.targets[s] || 0);
+    const sub = Object.fromEntries(syms.map((s) => [s, data[s]]));
+    const engineOf = (e) => {
+      const eng = { ...((e && e.engine) || {}), ...(opts.engine || {}) };
+      if (opts.meta) eng.meta = opts.meta;
+      return eng;
+    };
+    const cache = new Map();
+    const btFor = (eng) => {
+      const { meta, ...rest } = eng;
+      const k = JSON.stringify(rest);
+      if (!cache.has(k)) cache.set(k, makeBacktester(sub, eng));
+      return cache.get(k);
+    };
+    const first = btFor(engineOf(list[0]));
+    const dates = first.dates, n = dates.length;
+    const idxOf = (d) => dates.findIndex((x) => x >= d);
+    let state, a, inForce;
+    if (snap) {
+      a = dates.findIndex((x) => x > snap.date);
+      state = { cash: snap.cash, shares: { ...snap.shares }, pending: snap.pending || null };
+      inForce = list.filter((e) => e.date <= snap.date).pop() || list[0];
+    } else {
+      a = idxOf(list[0].date);
+      state = { cash: engineOf(list[0]).initialCash || 1e6, shares: {}, pending: null };
+      inForce = list[0];
     }
-    if (start < 0) return { dates: [], equity: [], trades: [], cash: engine.initialCash || 1e6, pending: null, positions: {}, start: list[0].date };
-    const res = bt.run({ name: 'paper', params: () => ({ entries: list.length }), generate: () => rows });
-    const last = bt.dates.length - 1;
-    let held = 0;
-    for (const s of bt.symbols) {
-      if (!res.finalShares[s]) continue;
-      let px = NaN;
-      for (let i = last; i >= 0 && !fin(px); i--) px = bt.xclose[s][i];
-      held += res.finalShares[s] * px;
+    const empty = { start: list[0].date, dates: [], equity: [], nav: [], trades: [], actions: [], state: snap || null, segments: 0 };
+    if (a < 0) return empty;
+    // 需要在区间 [a, n) 内生效的冻结：落在 a 之前的已经体现在 snapshot（或是第一次冻结本身）
+    const due = list.map((e) => ({ e, i: idxOf(e.date) })).filter((x) => x.i >= a);
+    const outDates = [], outEq = [], trades = [], actions = [];
+    let segments = 0, cur = a;
+    while (cur < n) {
+      const nextK = due.findIndex((x) => x.i >= cur && x.e !== inForce);
+      const stop = nextK >= 0 ? due[nextK].i : n - 1;
+      const bt = btFor(engineOf(inForce));
+      const rows = dates.map(() => null);
+      // 本段起点就是冻结日（第一次冻结）：当天收盘后下达目标
+      for (const x of due) if (x.i === cur && x.e === inForce) rows[cur] = bt.symbols.map((s) => +x.e.targets[s] || 0);
+      if (nextK >= 0) rows[stop] = bt.symbols.map((s) => +due[nextK].e.targets[s] || 0);
+      const res = bt.run({ name: 'paper', params: () => ({}), generate: () => rows }, { start: cur, end: stop, state });
+      for (let i = cur; i <= stop; i++) { outDates.push(dates[i]); outEq.push(res.equity[i]); }
+      for (const t of res.trades) (AQ.isFill(t) ? trades : actions).push(t);
+      state = { cash: res.finalCash, shares: Object.fromEntries(Object.entries(res.finalShares).filter(([, v]) => v > 0)), pending: res.nextTargets };
+      segments++;
+      if (nextK < 0) break;
+      inForce = due[nextK].e;
+      cur = stop + 1;
     }
-    const eq = res.equity.slice(start);
+    const last = outDates.length - 1;
+    const eq0 = outEq[0];
+    // 期末持仓的真实收盘价（估值依据）一并冻结：下次接着结算时，若这一天的行情已被数据源修订，差额会体现在下一天，需要提示
+    const lastIdx = dates.indexOf(outDates[last]);
+    const markAt = (s, i) => { const c = first.xclose[s]; for (let t = i; t >= 0; t--) if (c[t] > 0) return c[t]; return NaN; };
+    const marks = Object.fromEntries(Object.keys(state.shares).map((s) => [s, markAt(s, lastIdx)]));
+    let revisions = [];
+    if (snap && snap.marks) {
+      const k = dates.findIndex((x) => x >= snap.date);
+      if (k >= 0 && dates[k] === snap.date) {
+        revisions = Object.entries(snap.marks).map(([s, v]) => ({ symbol: s, frozen: v, now: markAt(s, k) }))
+          .filter((x) => fin(x.now) && fin(x.frozen) && Math.abs(x.now / x.frozen - 1) > 1e-9);
+      }
+    }
     return {
+      revisions,
       start: list[0].date,
-      dates: bt.dates.slice(start),
-      equity: eq,
-      nav: eq.map((v) => v / eq[0]),
-      trades: res.trades.filter((t) => AQ.isFill(t) && t.date >= bt.dates[start]),
-      actions: res.trades.filter((t) => !AQ.isFill(t) && t.date >= bt.dates[start]),
-      positions: Object.fromEntries(Object.entries(res.finalShares).filter(([, v]) => v > 0)),
-      cash: res.equity[last] - held,
-      pending: res.nextTargets,
-      engine,
+      dates: outDates,
+      equity: outEq,
+      nav: outEq.map((v) => v / eq0),
+      trades,
+      actions,
+      positions: state.shares,
+      cash: state.cash,
+      pending: state.pending,
+      state: { date: outDates[last], cash: state.cash, shares: state.shares, pending: state.pending, equity: outEq[last], marks },
+      engine: engineOf(inForce),
+      segments,
     };
   }
 

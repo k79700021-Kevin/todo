@@ -46,14 +46,32 @@
       `&filter=(SECUCODE%3D%22${secucode(sym)}%22)&pageSize=500&sortColumns=END_DATE&sortTypes=1` + (cb ? `&callback=${cb}` : '');
   }
 
+  // 分红送配明细：除权除息日、每 10 股派现（税前）、每 10 股送转
+  function bonusUrl(sym, cb) {
+    return DC + 'RPT_SHAREBONUS_DET&columns=EX_DIVIDEND_DATE,PRETAX_BONUS_RMB,BONUS_IT_RATIO,ASSIGN_PROGRESS,NOTICE_DATE' +
+      `&filter=(SECUCODE%3D%22${secucode(sym)}%22)&pageSize=200&sortColumns=EX_DIVIDEND_DATE&sortTypes=1` + (cb ? `&callback=${cb}` : '');
+  }
+
+  const per10 = (v) => Math.round(((+v || 0) / 10) * 1e8) / 1e8; // 每 10 股 → 每股，去掉浮点尾差
+  // 只取已实施的方案；返回 [{ date: 除权除息日, cash: 每股派现（税前）, bonus: 每股送转 }]
+  function parseBonus(json) {
+    const rows = (json && json.result && json.result.data) || [];
+    return rows
+      .filter((r) => r.EX_DIVIDEND_DATE && r.ASSIGN_PROGRESS === '实施分配')
+      .map((r) => ({ date: r.EX_DIVIDEND_DATE.slice(0, 10), cash: per10(r.PRETAX_BONUS_RMB), bonus: per10(r.BONUS_IT_RATIO) }))
+      .filter((r) => r.cash > 0 || r.bonus > 0)
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  }
+
   function parseShares(json) {
     const rows = (json && json.result && json.result.data) || [];
     return rows
       .filter((r) => r.END_DATE && r.TOTAL_SHARES > 0)
       .map((r) => {
         const end = r.END_DATE.slice(0, 10), notice = (r.NOTICE_DATE || r.END_DATE).slice(0, 10);
-        // 公告晚于变动日时（如定期报告披露的期末股本）以公告日为准，避免前视
-        return { date: notice > end ? notice : end, total: +r.TOTAL_SHARES, float: +r.LISTED_A_SHARES || NaN };
+        /* 双时态：date = 股本生效日（变动日 / 报告期末），known = 公告日（此后才可知）。
+         * 例如年报披露的期末股本：公告前不可用，公告后用于还原报告期末的状态（报告期净资产 = 每股净资产 × 当期股本）。 */
+        return { date: end, known: notice, total: +r.TOTAL_SHARES, float: +r.LISTED_A_SHARES || NaN };
       })
       .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
   }
@@ -111,7 +129,7 @@
     return d;
   }
 
-  const api = { market, klineUrl, parseKlines, proportional, checkPositive, financeUrl, parseFinance, sharesUrl, parseShares, indexKlineUrl };
+  const api = { market, klineUrl, parseKlines, proportional, checkPositive, financeUrl, parseFinance, sharesUrl, parseShares, bonusUrl, parseBonus, indexKlineUrl };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else (root.AQ = root.AQ || {}).em = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

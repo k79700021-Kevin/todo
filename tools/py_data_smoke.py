@@ -45,10 +45,13 @@ def main() -> None:
                 continue
             ref = dict(zip(em[s]["dates"], em[s]["close"]))
             common = [d for d in df.index.strftime("%Y-%m-%d") if d in ref]
-            diff = np.max(np.abs(df.loc[common, "close"].to_numpy() / np.array([ref[d] for d in common]) - 1))
-            lines.append(f"- {s} 与网页版取到的数据核对：{len(common)} 个交易日，最大相对差 {diff:.1e}")
-            # 两边都是等比前复权（同一算法），同一时点拉取应完全一致
-            assert len(common) > 900 and diff < 1e-9, f"{s} Python 与网页版数据不一致"
+            # 等比前复权以区间最后一天的真实价格为锚：网页版取到今天、这里取到 END，两者之间若有分红送转，
+            # 整条序列会差一个常数倍。所以比较两条序列之比是否为常数（逐日收益完全一致），而不是绝对价格。
+            ratio = df.loc[common, "close"].to_numpy() / np.array([ref[d] for d in common])
+            diff = np.max(np.abs(ratio / ratio[0] - 1)) if len(common) else np.inf
+            lines.append(f"- {s} 与网页版取到的数据核对：{len(common)} 个交易日，比值 {ratio[0]:.6f}，比值最大相对波动 {diff:.1e}")
+            # 两边都是等比前复权（同一算法），比值必须是常数（只差分位舍入）
+            assert len(common) > 900 and diff < 1e-6, f"{s} Python 与网页版数据不一致"
 
     try:
         with tempfile.TemporaryDirectory() as cache:

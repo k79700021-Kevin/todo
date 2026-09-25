@@ -8,7 +8,7 @@
   const DB_NAME = 'aq-stockpool';
   const STORE = 'stocks';
   const WARMUP_DAYS = 420; // 纳入前预留约 280 个交易日，供 250 日指标预热
-  const VERSION = 2;       // 本地记录格式：2 = 含股本变动历史、原始净利润与更新日
+  const VERSION = 3;       // 本地记录格式：2 = 含股本变动历史、原始净利润与更新日；3 = 股本双时态（生效日 + 公告日）、分红送配明细
   const INDEX_KEY = 'IDX000300';
 
   const addDays = (d, n) => {
@@ -52,7 +52,7 @@
    * （删掉的往往是后来表现差、退市或被剔除的股票，会造成幸存者偏差）。 */
   function assemble(members, records, start, end, { industry = null, fundAvail = 'notice', strict = false, minCoverage = 0.995, listDate = null } = {}) {
     const want = plan(members, start, end);
-    const data = {}, universe = {}, fundamentals = {}, delisted = {}, shares = {}, ind = {};
+    const data = {}, universe = {}, fundamentals = {}, delisted = {}, shares = {}, ind = {}, corporateActions = {};
     let got = 0;
     const missing = [];
     for (const code of Object.keys(want)) {
@@ -64,6 +64,7 @@
       universe[code] = want[code].intervals;
       if (r.fin && r.fin.length) fundamentals[code] = r.fin;
       if (r.shares && r.shares.length) shares[code] = r.shares;
+      if (Array.isArray(r.ca)) corporateActions[code] = r.ca;
       if (industry && industry[code]) ind[code] = industry[code];
       if (members.delisted && members.delisted[code]) delisted[code] = members.delisted[code];
       got++;
@@ -98,7 +99,7 @@
     return {
       data,
       meta: {
-        universe, fundamentals, delisted, shares, fundAvail,
+        universe, fundamentals, delisted, shares, fundAvail, corporateActions,
         industry: Object.keys(ind).length ? ind : null,
         index: idx && idx.bars ? { code: '000300', name: '沪深300（价格指数）', dates: idx.bars.dates, close: idx.bars.close } : null,
         listDate: Object.keys(ld).length ? ld : null,
@@ -190,7 +191,10 @@
     try { fin = em.parseFinance(await withRetry(() => jsonp((cb) => em.financeUrl(code, cb)))); } catch (e) { /* 财务数据缺失不影响行情 */ }
     let shares = [];
     try { shares = em.parseShares(await withRetry(() => jsonp((cb) => em.sharesUrl(code, cb)))); } catch (e) { /* 缺股本时估值退回每股口径 */ }
-    return { code, v: VERSION, name: raw.name || hfq.name || '', bars, fin, shares, from, to, fetched: new Date().toISOString().slice(0, 10) };
+    // 分红送配明细：取不到时为 null，回测对复权因子跳变按"价值不变折现"处理并计数
+    let ca = null;
+    try { ca = em.parseBonus(await withRetry(() => jsonp((cb) => em.bonusUrl(code, cb)))); } catch (e) { ca = null; }
+    return { code, v: VERSION, name: raw.name || hfq.name || '', bars, fin, shares, ca, from, to, fetched: new Date().toISOString().slice(0, 10) };
   }
 
   /* 构建股票池：已存且覆盖所需区间的股票跳过（可中断后继续）。onProgress(done, total, code, failed) */
