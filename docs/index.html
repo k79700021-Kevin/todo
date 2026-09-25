@@ -1178,6 +1178,13 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
     ['annual_turnover', '年化换手（倍）', 'num'],
   ];
 
+  // 持仓估值用的价格：真实（不复权）收盘价，停牌沿用前值——股数 × 复权价与账户金额不是同一单位
+  function lastPx(bt, s, i) {
+    const c = bt.xclose[s];
+    for (let t = i; t >= 0; t--) if (c[t] > 0) return c[t];
+    return NaN;
+  }
+
   function kpi(label, v, b, f, colored = true) {
     return `<div class="kpi"><span class="k">${label}</span><span class="v ${colored ? tone(v) : ''}">${f(v)}</span><span class="b">${b}</span></div>`;
   }
@@ -1270,7 +1277,7 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
     let nb = 0;
     for (const s of bt.symbols) {
       const g = industry[s] || '其他';
-      const w = (res.finalShares[s] || 0) * bars.close[s][i] / eq;
+      const w = (res.finalShares[s] || 0) * lastPx(bt, s, i) / eq;
       if (w > 0) port.set(g, (port.get(g) || 0) + w);
       if (bt.member[s][i]) { bench.set(g, (bench.get(g) || 0) + 1); nb++; }
     }
@@ -1302,7 +1309,7 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
     const X = [];
     for (let t = t0; t <= i; t++) X.push(names.map((s) => { const r = bars.close[s][t] / bars.close[s][t - 1] - 1; return fin(r) ? r : 0; }));
     const lw = AQ.portfolio.ledoitWolf(X);
-    const w = Float64Array.from(names, (s) => ((res.finalShares[s] || 0) * bars.close[s][i]) / eq);
+    const w = Float64Array.from(names, (s) => ((res.finalShares[s] || 0) * lastPx(bt, s, i)) / eq);
     const inBench = names.filter((s) => benchSyms.includes(s)).length;
     const wb = Float64Array.from(names, (s) => (benchSyms.includes(s) ? 1 / inBench : 0));
     const industry = bt.meta && bt.meta.industry;
@@ -1363,7 +1370,7 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
     if (res.nextTargets) {
       for (const [s, w] of Object.entries(res.nextTargets)) if (w > 0) targets[s] = w;
     } else {
-      for (const s of bt.symbols) if (res.finalShares[s] > 0) targets[s] = (res.finalShares[s] * bars.close[s][i]) / eq;
+      for (const s of bt.symbols) if (res.finalShares[s] > 0) targets[s] = (res.finalShares[s] * lastPx(bt, s, i)) / eq;
     }
     const configHash = await LG.sha256(LG.canon(config));
     const date = res.dates[i];
@@ -1484,7 +1491,7 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
     const shown = many ? bt.symbols.filter((s) => res.finalShares[s] > 0 || (res.nextTargets && res.nextTargets[s] > 0)) : bt.symbols;
     const rows = shown.map((s) => {
       const sh = res.finalShares[s];
-      const w = sh * bars.close[s][i] / eq;
+      const w = sh * lastPx(bt, s, i) / eq;
       const tgt = res.nextTargets ? res.nextTargets[s] : null;
       let action = '<span class="note">维持</span>';
       if (tgt !== null && tgt !== undefined) {
@@ -1499,7 +1506,7 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
           return `<td>${sig > 0 ? '<span class="up">看多</span>' : sig < 0 ? '<span class="down">看空</span>' : '<span class="note">中性</span>'}</td>`;
         }).join('');
       }
-      return `<tr><td class="num">${s}</td><td class="num">${bars.close[s][i].toFixed(3)}</td><td class="num">${sh.toLocaleString('zh-CN')}</td>` +
+      return `<tr><td class="num">${s}</td><td class="num">${lastPx(bt, s, i).toFixed(3)}</td><td class="num">${sh.toLocaleString('zh-CN')}</td>` +
         `<td class="num">${fmt.pctPlain(w)}</td>${ruleCells}<td>${action}</td></tr>`;
     }).join('');
     const ruleHeads = config.type === 'rules' ? config.rules.map((r) => `<th>${esc(AQ.RULES[r.id].label)}</th>`).join('') : '';
