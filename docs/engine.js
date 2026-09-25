@@ -5,13 +5,27 @@
 
   const LOT_SIZE = 100;
   const CHINEXT_REFORM = '2020-08-24';
-  const STAMP_DUTY_CUT = '2023-08-28';
   const LIMIT_REL_TOL = 0.001;
   const TRADING_DAYS = 244;
 
   // ---------- 交易规则 ----------
 
   const isEtf = (s) => /^(51|15|56|58)/.test(s);
+
+  // 历史规则表（规则本身也是时点数据），与 Python 版 rules.py 一致
+  // 印花税：[生效日, 税率, 是否买卖双向]
+  const STAMP_DUTY_HISTORY = [
+    ['1900-01-01', 0.002, true], ['2005-01-24', 0.001, true], ['2007-05-30', 0.003, true],
+    ['2008-04-24', 0.001, true], ['2008-09-19', 0.001, false], ['2023-08-28', 0.0005, false],
+  ];
+  // 过户费：2015-08-01 前仅沪市股票按股数（每股 0.001 元、最低 1 元），之后沪深统一按成交额
+  const TRANSFER_PER_SHARE_UNTIL = '2015-08-01';
+  const TRANSFER_HISTORY = [['2015-08-01', 0.00002], ['2022-04-29', 0.00001]];
+  function regime(table, date) {
+    let out = null;
+    for (const row of table) if (row[0] <= date) out = row;
+    return out;
+  }
 
   function priceLimit(symbol, date) {
     if (isEtf(symbol)) return 0.10;
@@ -47,19 +61,25 @@
   }
 
   class FeeModel {
-    constructor({ commissionRate = 0.00025, minCommission = 5.0, transferRate = 0.00001, stampDutyRate = null } = {}) {
+    constructor({ commissionRate = 0.00025, minCommission = 5.0, transferRate = null, stampDutyRate = null } = {}) {
       Object.assign(this, { commissionRate, minCommission, transferRate, stampDutyRate });
     }
-    stampDuty(date) {
-      if (this.stampDutyRate !== null) return this.stampDutyRate;
-      return date >= STAMP_DUTY_CUT ? 0.0005 : 0.001;
+    stampDuty(date, side = 'sell') {
+      if (this.stampDutyRate !== null && this.stampDutyRate !== undefined) return side === 'sell' ? this.stampDutyRate : 0;
+      const [, rate, both] = regime(STAMP_DUTY_HISTORY, date);
+      return side === 'sell' || both ? rate : 0;
     }
-    cost(symbol, date, side, amount) {
+    transfer(symbol, date, amount, shares) {
+      if (this.transferRate !== null && this.transferRate !== undefined) return amount * this.transferRate;
+      if (date < TRANSFER_PER_SHARE_UNTIL) return /^[69]/.test(symbol) ? Math.max((shares || 0) * 0.001, 1) : 0;
+      return amount * regime(TRANSFER_HISTORY, date)[1];
+    }
+    cost(symbol, date, side, amount, shares) {
       if (amount <= 0) return 0;
       let fee = Math.max(amount * this.commissionRate, this.minCommission);
       if (!isEtf(symbol)) {
-        fee += amount * this.transferRate;
-        if (side === 'sell') fee += amount * this.stampDuty(date);
+        fee += this.transfer(symbol, date, amount, shares);
+        fee += amount * this.stampDuty(date, side);
       }
       return Number(fee.toFixed(2));
     }
@@ -320,7 +340,7 @@
         if (qty <= 0) continue;
         const fill = price * (1 - cap.slip);
         const amount = qty * fill;
-        const fee = this.fees.cost(s, d, 'sell', amount);
+        const fee = this.fees.cost(s, d, 'sell', amount, qty);
         cash += amount - fee;
         shares[s] -= qty;
         trades.push({ date: d, symbol: s, side: 'sell', shares: qty, price: fill, amount, fee, impact: qty * price * (cap.slip - this.slippage) });
@@ -336,7 +356,7 @@
         const qty = this.affordable(s, d, cap.qty, fill, cash);
         if (qty <= 0) continue;
         const amount = qty * fill;
-        const fee = this.fees.cost(s, d, 'buy', amount);
+        const fee = this.fees.cost(s, d, 'buy', amount, qty);
         cash -= amount + fee;
         if (book) {
           const bk = book[s];
@@ -352,7 +372,7 @@
 
     affordable(s, d, qty, price, cash) {
       qty = Math.min(qty, Math.floor(cash / price / LOT_SIZE) * LOT_SIZE);
-      while (qty > 0 && qty * price + this.fees.cost(s, d, 'buy', qty * price) > cash + 1e-9) qty -= LOT_SIZE;
+      while (qty > 0 && qty * price + this.fees.cost(s, d, 'buy', qty * price, qty) > cash + 1e-9) qty -= LOT_SIZE;
       return Math.max(qty, 0);
     }
   }

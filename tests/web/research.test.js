@@ -776,3 +776,78 @@ test('makeBacktester forwards capacity, impact, delisting and meta settings', ()
   assert.equal(bt.meta.industry['600000'], '银行');
   assert.ok(bt.adv && bt.sigma, '启用容量或冲击时预先计算成交额与波动率');
 });
+
+// ---------- 过拟合检验：PBO（CSCV）与 SPA ----------
+
+function noiseReturns(K, T, seed, edge = []) {
+  let x = seed;
+  const rnd = () => ((x = (x * 1664525 + 1013904223) >>> 0) / 4294967296);
+  return Array.from({ length: K }, (_, k) => Float32Array.from({ length: T }, () => {
+    const z = Math.sqrt(-2 * Math.log(rnd() + 1e-12)) * Math.cos(2 * Math.PI * rnd());
+    return 0.01 * z + (edge[k] || 0);
+  }));
+}
+function toBlocks(r, S = 12) {
+  const T = r.length, b = { sum: new Float64Array(S), sq: new Float64Array(S), n: new Float64Array(S) };
+  for (let t = 0; t < T; t++) { const j = Math.min(S - 1, Math.floor((t * S) / T)); b.sum[j] += r[t]; b.sq[j] += r[t] * r[t]; b.n[j]++; }
+  return b;
+}
+
+test('PBO is high for pure noise and near zero with a persistent edge', () => {
+  const noise = noiseReturns(40, 1200, 5);
+  const p1 = R.pbo(noise.map((r) => toBlocks(r)));
+  assert.equal(p1.splits, 924);
+  // 纯噪声：全样本均值固定，样本内冠军在样本外往往落到中位数以下，PBO 通常 ≥ 0.5
+  assert.ok(p1.pbo >= 0.4, `噪声 PBO = ${p1.pbo}`);
+  const edged = noiseReturns(40, 1200, 5, { 7: 0.002 });
+  const p2 = R.pbo(edged.map((r) => toBlocks(r)));
+  assert.ok(p2.pbo < 0.05, `有真实优势时 PBO = ${p2.pbo}`);
+});
+
+test('SPA does not reject for noise and rejects when one candidate truly beats the benchmark', () => {
+  // 零假设成立时 p 值应近似均匀：20 组纯噪声里 p < 0.05 的比例不应明显超过 5%
+  const ps = Array.from({ length: 20 }, (_, i) => R.spa(noiseReturns(30, 1000, 7 * i + 8), { B: 150 }).p);
+  const rej = ps.filter((p) => p < 0.05).length / ps.length;
+  assert.ok(rej <= 0.2, `噪声下的拒绝比例 ${rej}：${ps.map((p) => p.toFixed(2)).join(' ')}`);
+  const edged = noiseReturns(30, 1000, 9, { 3: 0.0015 });
+  const b = R.spa(edged, { B: 200 });
+  assert.ok(b.p < 0.05, `真实优势 SPA p = ${b.p}`);
+});
+
+test('factor strategy with portfolio optimization: weights obey cap and budget', () => {
+  const data = {};
+  for (let k = 0; k < 8; k++) data['6000' + k] = series(600, 200 + k, 0.0003 * (k - 3), 0.015);
+  const bt = new AQ.Backtester(data, { rebalanceBand: 0 });
+  const b = bt.bars();
+  const rows = new R.FactorStrategy({ factors: [{ id: 'roc60', weight: 1 }], topN: 2, rebalance: 20, sizing: 'optimize', maxWeight: 35 })
+    .generate(b.close, bt.dates, bt.symbols, b).filter(Boolean);
+  assert.ok(rows.length > 5);
+  for (const r of rows) {
+    const sum = r.reduce((a, x) => a + x, 0);
+    assert.ok(Math.abs(sum - 1) < 1e-6, `权重和 ${sum}`);
+    assert.ok(r.every((x) => x >= 0 && x <= 0.35 + 1e-6), JSON.stringify(r));
+  }
+  assert.throws(() => new R.FactorStrategy({ factors: [{ id: 'roc60', weight: 1 }], sizing: 'optimize', ic: 0 }), /组合优化/);
+});
+
+test('stress test: higher capital and higher costs never help', () => {
+  const data = { '600000': series(700, 301), '600001': series(700, 302), '600002': series(700, 303) };
+  const out = R.stressTest({
+    data, engine: { initialCash: 1e6, fees: {}, slippage: 0.0005, rebalanceBand: 0.01, participation: 0.1, impact: 0.5 },
+    config: { type: 'rules', rules: [{ id: 'price_ma', params: { n: 20 } }] }, capitals: [1e6, 1e8], multipliers: [1, 3],
+  });
+  assert.equal(out.capacity.length, 2);
+  assert.ok(out.capacity[1].impactShare > out.capacity[0].impactShare, '资金越大冲击成本占比越高');
+  assert.ok(out.cost[1].cagr < out.cost[0].cagr, '成本放大后收益下降');
+});
+
+test('factor decay reports IC by horizon, by year and factor autocorrelation', () => {
+  const data = {};
+  for (let k = 0; k < 8; k++) data['6000' + k] = series(800, 400 + k);
+  const bt = new AQ.Backtester(data, {});
+  const d = R.factorDecay(bt, 'roc20', { horizons: [1, 5, 20] });
+  assert.deepEqual(d.byH.map((x) => x.h), [1, 5, 20]);
+  assert.ok(d.years.length >= 2);
+  // 20 日动量：相隔 1 天的秩自相关远高于相隔 20 天
+  assert.ok(d.autocorr[0].rho > d.autocorr[2].rho && d.autocorr[0].rho > 0.8, JSON.stringify(d.autocorr));
+});

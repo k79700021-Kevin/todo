@@ -7,6 +7,7 @@
     ? Object.assign({ ind: require('./indicators.js') }, require('./engine.js'), require('./rules.js'))
     : root.AQ;
   const ind = AQ.ind;
+  const PF = isNode ? require('./portfolio.js') : root.AQ.portfolio;
   const TD = 244;
   const fin = Number.isFinite;
 
@@ -185,6 +186,110 @@
     return { sr0, prob: normCdf(z), trials: N };
   }
 
+  /* 回测过拟合概率（Bailey, Borwein, López de Prado & Zhu 的 CSCV）。
+   * blocks[k] = { sum: Float64Array(S), sq: Float64Array(S), n: Float64Array(S) }：第 k 组参数在 S 个时间块上的日收益和、平方和、天数。
+   * 枚举所有"一半块做样本内、另一半做样本外"的组合：样本内夏普最高的参数，在样本外的相对排名 ω；
+   * PBO = P(ω ≤ 1/2)，即样本内冠军在样本外落到后一半的概率。另给出样本外亏损概率与样本内外夏普的回归斜率。 */
+  function pbo(blocks) {
+    const N = blocks.length;
+    if (N < 2) return null;
+    const S = blocks[0].sum.length;
+    const half = S / 2;
+    const sharpe = (e, mask, want) => {
+      let s1 = 0, s2 = 0, n = 0;
+      for (let j = 0; j < S; j++) if (((mask >> j) & 1) === want) { s1 += e.sum[j]; s2 += e.sq[j]; n += e.n[j]; }
+      if (n < 2) return NaN;
+      const m = s1 / n, v = (s2 - n * m * m) / (n - 1);
+      return v > 0 ? m / Math.sqrt(v) : NaN;
+    };
+    let below = 0, loss = 0, total = 0;
+    const logits = [], pairs = [];
+    for (let mask = 0; mask < 1 << S; mask++) {
+      let bits = 0;
+      for (let j = 0; j < S; j++) bits += (mask >> j) & 1;
+      if (bits !== half) continue;
+      let best = -1, bestIs = -Infinity;
+      const oos = new Float64Array(N);
+      for (let k = 0; k < N; k++) {
+        const is = sharpe(blocks[k], mask, 1);
+        oos[k] = sharpe(blocks[k], mask, 0);
+        if (is > bestIs) { bestIs = is; best = k; }
+      }
+      if (best < 0 || !fin(oos[best])) continue;
+      let rank = 1;
+      for (let k = 0; k < N; k++) if (fin(oos[k]) && oos[k] < oos[best]) rank++;
+      const w = rank / (N + 1);
+      const lam = Math.log(w / (1 - w));
+      logits.push(lam);
+      pairs.push([bestIs, oos[best]]);
+      if (lam <= 0) below++;
+      if (oos[best] < 0) loss++;
+      total++;
+    }
+    if (!total) return null;
+    const mx = mean(pairs.map((p) => p[0])), my = mean(pairs.map((p) => p[1]));
+    let sxy = 0, sxx = 0;
+    for (const [x, y] of pairs) { sxy += (x - mx) * (y - my); sxx += (x - mx) ** 2; }
+    return {
+      pbo: below / total, probLoss: loss / total, splits: total, blocks: S,
+      slope: sxx > 0 ? sxy / sxx : NaN,
+      oosSharpe: my * Math.sqrt(TD), isSharpe: mx * Math.sqrt(TD),
+      logits: logits.sort((a, b) => a - b),
+    };
+  }
+
+  /* Hansen (2005) 高级预测能力检验（SPA）：H0 为"所有候选都不比基准好"。
+   * d[k] 为第 k 组参数相对基准的日超额收益（Float32Array，长度 T）。用平稳自助法（平均块长 L）重抽样，
+   * 并按 Hansen 的一致性修正只保留"不太差"的候选参与零分布。返回 p 值（越小越说明最优者确实优于基准）。 */
+  function spa(d, { B = 300, L = 10, seed = 11 } = {}) {
+    const K = d.length;
+    if (!K) return null;
+    const T = d[0].length;
+    const rnd = lcg(seed);
+    const P = d.map((x) => { const p = new Float64Array(T + 1); for (let t = 0; t < T; t++) p[t + 1] = p[t] + x[t]; return p; });
+    const mu = d.map((x) => { let s = 0; for (let t = 0; t < T; t++) s += x[t]; return s / T; });
+    // 长期方差（Newey–West，带宽 L）
+    const omega = d.map((x, k) => {
+      let v = 0;
+      for (let l = 0; l <= L; l++) {
+        let c = 0;
+        for (let t = l; t < T; t++) c += (x[t] - mu[k]) * (x[t - l] - mu[k]);
+        c /= T;
+        v += l === 0 ? c : 2 * (1 - l / (L + 1)) * c;
+      }
+      return Math.sqrt(Math.max(v, 1e-18));
+    });
+    const stat = Math.max(0, ...mu.map((m, k) => (Math.sqrt(T) * m) / omega[k]));
+    const thr = (k) => -omega[k] * Math.sqrt((2 * Math.log(Math.log(T))) / T);
+    const g = mu.map((m, k) => (m >= thr(k) ? m : 0)); // μ̂ᶜ：明显差于基准的候选中心取 0，其余取样本均值
+    let exceed = 0;
+    const p = 1 / L;
+    for (let b = 0; b < B; b++) {
+      // 平稳自助法：块起点均匀、块长几何分布；块用前缀和累加
+      const segs = [];
+      for (let t = 0; t < T;) {
+        const start = Math.floor(rnd() * T);
+        let len = 1;
+        while (rnd() > p && len < T) len++;
+        len = Math.min(len, T - t);
+        segs.push([start, len]);
+        t += len;
+      }
+      let mx = 0;
+      for (let k = 0; k < K; k++) {
+        let s = 0;
+        for (const [st, len] of segs) {
+          const end = st + len;
+          s += end <= T ? P[k][end] - P[k][st] : P[k][T] - P[k][st] + P[k][end - T];
+        }
+        const z = (Math.sqrt(T) * (s / T - g[k])) / omega[k]; // Hansen 的一致性中心化：减去 μ̂ᶜ
+        if (z > mx) mx = z;
+      }
+      if (mx >= stat) exceed++;
+    }
+    return { p: exceed / B, stat, models: K, days: T, bootstrap: B };
+  }
+
   // ---------- 参数空间 ----------
 
   function rangeValues({ min, max, step }) {
@@ -288,6 +393,11 @@
     const combos = input.method === 'random' ? randomCombos(space, input.samples || 200, input.seed) : [...gridIter(space)];
     const keepEquity = input.wf && input.wf.enabled;
     const bench = bt.run(new AQ.BuyAndHold());
+    // 过拟合检验只用训练 + 验证段（第 1 ~ t−1 天的日收益）：CSCV 按 12 个时间块汇总；SPA 需要逐日超额收益，内存允许时保留
+    const S = 12, T = t - 1;
+    const blockOf = (i) => Math.min(S - 1, Math.floor(((i - 1) * S) / T));
+    const keepDaily = combos.length * T <= 1.2e7;
+    const benchRet = Float64Array.from({ length: T }, (_, j) => bench.equity[j + 1] / bench.equity[j] - 1);
     const entries = [];
     let invalid = 0;
     combos.forEach((combo, c) => {
@@ -301,6 +411,14 @@
       const res = bt.run(strat);
       const eq = Float64Array.from(res.equity);
       const tIdx = Int32Array.from(res.trades.map((tr) => dateIdx.get(tr.date)));
+      const blocks = { sum: new Float64Array(S), sq: new Float64Array(S), n: new Float64Array(S) };
+      const excess = keepDaily ? new Float32Array(T) : null;
+      for (let i = 1; i < t; i++) {
+        const r = eq[i] / eq[i - 1] - 1;
+        const j = blockOf(i);
+        blocks.sum[j] += r; blocks.sq[j] += r * r; blocks.n[j]++;
+        if (excess) excess[i - 1] = r - benchRet[i - 1];
+      }
       entries.push({
         combo,
         tr: segStats(eq, 0, trEnd, rf),
@@ -309,6 +427,8 @@
         vaTrades: tradesIn(tIdx, trEnd, vaEnd),
         eq: keepEquity ? eq : null,
         tIdx: keepEquity ? tIdx : null,
+        blocks,
+        excess,
       });
       if (c % 10 === 0) onProgress(c + 1, combos.length);
     });
@@ -357,6 +477,13 @@
       };
     }
 
+    // 回测过拟合概率（CSCV）与 Hansen SPA：候选为全部合格的参数组合
+    const overfit = {
+      pbo: eligible.length >= 2 ? pbo(eligible.map((e) => e.blocks)) : null,
+      spa: keepDaily && eligible.length ? spa(eligible.map((e) => e.excess)) : null,
+      spaSkipped: !keepDaily,
+    };
+    if (overfit.pbo) delete overfit.pbo.logits;
     const wf = keepEquity ? walkForward(entries, bt, bench.equity, dates.slice(0, t), input.wf, objective, minTrades, rf, config, space) : null;
     const slim = (e) => ({ combo: e.combo, tr: e.tr, va: e.va, trTrades: e.trTrades, vaTrades: e.vaTrades, trainRank: e.trainRank });
     return {
@@ -373,6 +500,7 @@
       all: entries.map((e) => ({ combo: e.combo, tr: score(e.tr, objective), va: score(e.va, objective), ok: e.trTrades >= minTrades })),
       bench: { tr: segStats(bench.equity, 0, trEnd, rf), va: segStats(bench.equity, trEnd, vaEnd, rf) },
       dsr,
+      overfit,
       wf,
       test,
     };
@@ -945,7 +1073,8 @@
    * 买入综合分最高的 topN 只。权重为负表示因子值越小越好（如反转、低波动）。
    * trendN > 0 时加大盘趋势过滤：全部标的等权指数跌破其 trendN 日均线就空仓。 */
   class FactorStrategy {
-    constructor({ factors = [], topN = 2, rebalance = 20, trendN = 0, sizing = 'equal', neutral = 'none' } = {}) {
+    constructor({ factors = [], topN = 2, rebalance = 20, trendN = 0, sizing = 'equal', neutral = 'none',
+      ic = 0.05, riskAversion = 10, maxWeight = 10, turnoverCost = 0.15, industryPenalty = 0 } = {}) {
       const unknown = factors.find((f) => !FACTOR_BY_ID[f.id]);
       if (unknown) throw new Error('未知因子：' + unknown.id);
       this.factors = factors.map((f) => ({ id: f.id, weight: +f.weight || 0 })).filter((f) => f.weight !== 0);
@@ -953,10 +1082,16 @@
       if (!(topN >= 1 && rebalance >= 1 && trendN >= 0)) throw new Error('持有数量、调仓间隔至少为 1，趋势均线不能为负');
       Object.assign(this, { name: 'factor', topN: Math.floor(topN), rebalance: Math.floor(rebalance), trendN: Math.floor(trendN), sizing,
         neutral: ['industry', 'industry_size'].includes(neutral) ? neutral : 'none' });
+      // 组合优化（sizing = 'optimize'）：Grinold 预期收益 α = IC × σ × z；单票上限与单边成本以百分比给出
+      if (sizing === 'optimize') {
+        if (!(ic > 0 && riskAversion >= 0 && maxWeight > 0 && turnoverCost >= 0 && industryPenalty >= 0)) throw new Error('组合优化参数需为正（IC、单票上限）或非负');
+        Object.assign(this, { ic: +ic, riskAversion: +riskAversion, maxWeight: +maxWeight / 100, turnoverCost: +turnoverCost / 100, industryPenalty: +industryPenalty });
+      }
     }
 
     params() {
-      const out = { topN: this.topN, rebalance: this.rebalance, trendN: this.trendN };
+      const out = { topN: this.topN, rebalance: this.rebalance, trendN: this.trendN, neutral: this.neutral };
+      if (this.sizing === 'optimize') Object.assign(out, { ic: this.ic, riskAversion: this.riskAversion, maxWeight: this.maxWeight, turnoverCost: this.turnoverCost, industryPenalty: this.industryPenalty });
       this.factors.forEach((f) => (out['w.' + f.id] = f.weight));
       return out;
     }
@@ -987,6 +1122,7 @@
       }
 
       const out = new Array(n).fill(null);
+      let prevRow = new Array(N).fill(0);
       let wasOn = true;
       let lastRebal = -Infinity;
       for (let i = WARM; i < n; i++) {
@@ -1013,6 +1149,13 @@
         });
         const picked = eligible.slice().sort((a, b2) => score[b2] - score[a]).slice(0, this.topN);
         const row = new Array(N).fill(0);
+        if (this.sizing === 'optimize' && eligible.length >= 2) {
+          const w = this.optimizeRow(i, eligible, score, prevRow, symbols, close, bars);
+          w.forEach((v, k) => (row[k] = v));
+          prevRow = row;
+          out[i] = row;
+          continue;
+        }
         if (this.sizing === 'invvol' && picked.length) {
           const inv = picked.map((k) => (vol[k][i] > 0 ? 1 / vol[k][i] : 0));
           const avg = inv.filter((v) => v > 0).reduce((a, x) => a + x, 0) / (inv.filter((v) => v > 0).length || 1) || 1;
@@ -1029,10 +1172,131 @@
     }
   }
 
+  /* 组合优化的一次调仓：候选 = 综合分最高的 max(3×topN, 30) 只 + 当前持有的；
+   * 协方差用候选过去 250 个交易日的日收益做 Ledoit–Wolf 收缩；α、Σ 都换算到调仓周期。返回每只标的的权重（Map: k → w）。 */
+  FactorStrategy.prototype.optimizeRow = function (i, eligible, score, prevRow, symbols, close, bars) {
+    const W = 250;
+    const K = Math.max(3 * this.topN, 30);
+    const ranked = eligible.slice().sort((a, b) => score[b] - score[a]);
+    const cand = [...new Set([...ranked.slice(0, K), ...eligible.filter((k) => prevRow[k] > 0)])];
+    // 历史不足的剔除
+    const X = [], use = [];
+    for (const k of cand) {
+      const c = close[symbols[k]];
+      let ok = 0, moved = 0;
+      for (let t = Math.max(1, i - W + 1); t <= i; t++) if (c[t] > 0 && c[t - 1] > 0) { ok++; if (c[t] !== c[t - 1]) moved++; }
+      if (ok >= W * 0.8 && moved >= 20) use.push(k); // 整段停牌（方差为 0）的不参与优化
+    }
+    const out = new Map();
+    if (use.length < 2) {
+      // 历史不足以估计协方差：等权持有综合分最高的若干只，数量保证不超过单票上限
+      const m = Math.min(ranked.length, Math.max(this.topN, Math.ceil(1 / this.maxWeight - 1e-9)));
+      ranked.slice(0, m).forEach((k) => out.set(k, 1 / m));
+      return out;
+    }
+    for (let t = Math.max(1, i - W + 1); t <= i; t++) {
+      X.push(use.map((k) => { const c = close[symbols[k]]; const r = c[t] / c[t - 1] - 1; return fin(r) ? r : 0; }));
+    }
+    const lw = PF.ledoitWolf(X);
+    const n = use.length, R = this.rebalance;
+    const sc = eligible.map((k) => score[k]);
+    const mu = mean(sc), sd = Math.sqrt(sc.reduce((a, x) => a + (x - mu) ** 2, 0) / Math.max(sc.length - 1, 1)) || 1;
+    const alpha = Float64Array.from(use, (k, j) => this.ic * Math.sqrt(lw.cov[j * n + j] * R) * ((score[k] - mu) / sd));
+    const cov = Float64Array.from(lw.cov, (v) => v * R);
+    const w0 = Float64Array.from(use, (k) => prevRow[k] || 0);
+    let groups = null, bench = null;
+    const industry = bars.meta && bars.meta.industry;
+    if (this.industryPenalty > 0 && industry) {
+      groups = use.map((k) => industry[symbols[k]] || '—');
+      bench = {};
+      for (const k of eligible) { const g = industry[symbols[k]] || '—'; bench[g] = (bench[g] || 0) + 1 / eligible.length; }
+    }
+    const w = PF.optimize({ alpha, cov, w0, lambda: this.riskAversion, kappa: this.turnoverCost, cap: this.maxWeight, groups, bench, rho: this.industryPenalty });
+    let tot = 0;
+    use.forEach((k, j) => { if (w[j] > 1e-4) { out.set(k, w[j]); tot += w[j]; } });
+    for (const [k, v] of out) out.set(k, v / tot);
+    return out;
+  };
+
   // 按配置构建策略：type 为 'factor' 时是多因子选股，否则为规则组合
   function buildStrategy(config) {
     if (config.type === 'factor') return new FactorStrategy(config.factor || {});
     return new AQ.RuleStrategy(config);
+  }
+
+  // 全部策略类型（含动量轮动、买入持有），供后台线程使用
+  function buildAnyStrategy(config) {
+    if (config.type === 'momentum') return new AQ.MomentumRotation(config.momentum);
+    if (config.type === 'buy_hold') return new AQ.BuyAndHold();
+    return buildStrategy(config);
+  }
+
+  /* 容量曲线与成本压力：同一策略在不同资金规模、不同成本倍数下重跑。
+   * 成本倍数同时放大佣金率、最低佣金、滑点与冲击系数（印花税、过户费是法定的，不放大）。 */
+  function stressTest({ data, engine, config, rf = 0.02, capitals = [1e6, 5e6, 2e7, 1e8, 5e8, 1e9], multipliers = [1, 1.5, 2, 3] }, onProgress = () => {}) {
+    const run = (cash, m) => {
+      const fees = engine.fees || {};
+      const e = { ...engine, initialCash: cash, slippage: (engine.slippage || 0) * m, impact: (engine.impact || 0) * m,
+        fees: { ...fees, commissionRate: (fees.commissionRate ?? 0.00025) * m, minCommission: (fees.minCommission ?? 5) * m } };
+      const res = makeBacktester(data, e).run(buildAnyStrategy(config));
+      const sm = AQ.summarize(res, rf);
+      return { cash, mult: m, cagr: sm.cagr, sharpe: sm.sharpe, maxDD: sm.max_drawdown, turnover: sm.annual_turnover,
+        costShare: (sm.total_fees + sm.total_impact) / cash, impactShare: sm.total_impact / cash };
+    };
+    const total = capitals.length + multipliers.length - 1;
+    let done = 0;
+    const tick = () => onProgress(++done, total);
+    const capacity = capitals.map((c) => { const r = run(c, 1); tick(); return r; });
+    const base = capitals.includes(engine.initialCash) ? engine.initialCash : capitals[0];
+    const cost = multipliers.map((m) => { if (m === 1) return capacity[capitals.indexOf(base)] || run(base, 1); const r = run(base, m); tick(); return r; });
+    return { capacity, cost, base };
+  }
+
+  /* 信号衰减：截面 IC 随预测周期的变化（各周期非重叠抽样）、按年份的截面 IC、因子自身的秩自相关（越低换手越高）。 */
+  function factorDecay(bt, factorId, { horizons = [1, 5, 10, 20, 60], yearH = 5, neutral = 'none' } = {}) {
+    const b = bt.bars();
+    const syms = bt.symbols;
+    const f = FACTOR_BY_ID[factorId];
+    const vals = Object.fromEntries(syms.map((s) => [s, f.f(b, s)]));
+    const member = (s, t) => !b.member || b.member[s][t];
+    const csIC = (t, fwd) => {
+      const x = [], y = [], ss = [];
+      for (const s of syms) {
+        const v = vals[s][t], r = fwd[s][t];
+        if (fin(v) && fin(r) && member(s, t)) { x.push(v); y.push(r); ss.push(s); }
+      }
+      if (x.length < 5) return NaN;
+      return spearman(neutral === 'none' ? x : neutralize(x, ss, neutral, b, t), y);
+    };
+    const byH = horizons.map((h) => {
+      const fwd = Object.fromEntries(syms.map((s) => [s, forwardReturns(b.open[s], h)]));
+      const ics = [];
+      for (let t = WARM; t < bt.dates.length; t += h) { const c = csIC(t, fwd); if (fin(c)) ics.push(c); }
+      const m = ics.length > 2 ? moments(ics) : null;
+      return { h, ic: m ? m.mean : NaN, icir: m && m.std > 0 ? m.mean / m.std : NaN, n: ics.length };
+    });
+    const fwdY = Object.fromEntries(syms.map((s) => [s, forwardReturns(b.open[s], yearH)]));
+    const years = {};
+    for (let t = WARM; t < bt.dates.length; t += yearH) {
+      const c = csIC(t, fwdY);
+      if (!fin(c)) continue;
+      const y = bt.dates[t].slice(0, 4);
+      (years[y] = years[y] || []).push(c);
+    }
+    const autocorr = horizons.map((h) => {
+      const cs = [];
+      for (let t = WARM + h; t < bt.dates.length; t += Math.max(h, 5)) {
+        const x = [], y = [];
+        for (const s of syms) { const a = vals[s][t - h], c = vals[s][t]; if (fin(a) && fin(c) && member(s, t)) { x.push(a); y.push(c); } }
+        if (x.length >= 5) { const r = spearman(x, y); if (fin(r)) cs.push(r); }
+      }
+      return { h, rho: cs.length ? mean(cs) : NaN };
+    });
+    return {
+      id: factorId, label: f.label, byH,
+      years: Object.entries(years).map(([y, a]) => ({ year: y, ic: mean(a), n: a.length })),
+      autocorr,
+    };
   }
 
   // 未来收益：t 日收盘出信号，t+1 日开盘买入，持有 h 日后开盘卖出
@@ -1346,9 +1610,9 @@
 
   const api = {
     moments, normCdf, normInv, ranks, spearman, acf, varianceRatio, segStats, deflatedSharpe,
-    rangeValues, gridSize, gridIter, randomCombos, applyParams, makeBacktester, optimize,
+    rangeValues, gridSize, gridIter, randomCombos, applyParams, makeBacktester, optimize, pbo, spa,
     relativeStats, roundTrips, monthlyReturns, SwitchingStrategy, olsHAC, styleFactors, exposure, neutralize, STYLE_DEFS,
-    FACTORS, availableFactors, factorCorrelation, fundPanel, floatCap, sharesPanel, marketCap, FactorStrategy, buildStrategy, factorIC, factorPortfolios, seriesStats, forwardReturns, blockIndices,
+    FACTORS, availableFactors, factorCorrelation, buildAnyStrategy, stressTest, factorDecay, fundPanel, floatCap, sharesPanel, marketCap, FactorStrategy, buildStrategy, factorIC, factorPortfolios, seriesStats, forwardReturns, blockIndices,
   };
   if (isNode) module.exports = api;
   else AQ.research = api;
