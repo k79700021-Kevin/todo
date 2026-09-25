@@ -63,15 +63,18 @@
       (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
   }
 
+  // 秩（从 1 开始，并列取平均秩）：原生数值排序后二分查找，比按下标排序快得多
   function ranks(a) {
-    const idx = a.map((v, i) => i).sort((i, j) => a[i] - a[j]);
-    const r = new Array(a.length);
-    for (let i = 0; i < idx.length;) {
-      let j = i;
-      while (j + 1 < idx.length && a[idx[j + 1]] === a[idx[i]]) j++;
-      const avg = (i + j) / 2 + 1;
-      for (let k = i; k <= j; k++) r[idx[k]] = avg;
-      i = j + 1;
+    const n = a.length;
+    const sorted = Float64Array.from(a).sort();
+    const r = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const v = a[i];
+      let lo = 0, hi = n;
+      while (lo < hi) { const m = (lo + hi) >> 1; if (sorted[m] < v) lo = m + 1; else hi = m; }
+      let up = lo, top = n;
+      while (up < top) { const m = (up + top) >> 1; if (sorted[m] <= v) up = m + 1; else top = m; }
+      r[i] = (lo + up + 1) / 2;
     }
     return r;
   }
@@ -244,6 +247,8 @@
       fees: new AQ.FeeModel(engine.fees || {}),
       slippage: engine.slippage,
       rebalanceBand: engine.rebalanceBand,
+      meta: engine.meta || null,
+      delistRecovery: engine.delistRecovery || 0,
     });
   }
 
@@ -637,9 +642,9 @@
     for (let i = 1; i < n; i++) {
       let sum = 0, cnt = 0;
       const km = [], kv = [];
-      syms.forEach((_, k) => {
+      syms.forEach((s, k) => {
         const r = ret[k][i];
-        if (!fin(r)) return;
+        if (!fin(r) || (b.member && !b.member[s][i - 1])) return;
         sum += r; cnt++;
         if (fin(mom[k][i - 1])) km.push([k, mom[k][i - 1]]);
         if (fin(vol[k][i - 1])) kv.push([k, vol[k][i - 1]]);
@@ -688,6 +693,79 @@
 
   // ---------- 因子研究 ----------
 
+  function cachedPanel(b, s, key, fn) {
+    const k = s + '|' + key;
+    if (!b.cache.has(k)) b.cache.set(k, fn());
+    return b.cache.get(k);
+  }
+
+  // 滚动 12 个月每股收益：年报即全年；其余 = 本期累计 + 上年年报 − 上年同期累计（只用当时已公告的数据）
+  function epsTTM(r, known) {
+    const md = r.report.slice(5);
+    if (md === '12-31') return r.eps;
+    const y = +r.report.slice(0, 4);
+    const annual = known.get(`${y - 1}-12-31`), same = known.get(`${y - 1}-${md}`);
+    return annual && same && fin(annual.eps) && fin(same.eps) && fin(r.eps) ? r.eps + annual.eps - same.eps : NaN;
+  }
+
+  /* 财务数据按公告日对齐：公告日之后的第一个交易日起才可用（公告可能在盘后发布）。
+   * 同一时点取报告期最新的一期；更正公告按数据源的最新值计，存在轻微前视。 */
+  function fundPanel(b, s) {
+    return cachedPanel(b, s, 'fund', () => {
+      const dates = b.dates, n = dates.length;
+      const recs = (((b.meta || {}).fundamentals || {})[s] || [])
+        .filter((r) => r.notice && r.report)
+        .slice()
+        .sort((x, y) => (x.notice < y.notice ? -1 : x.notice > y.notice ? 1 : x.report < y.report ? -1 : 1));
+      const col = () => new Float64Array(n).fill(NaN);
+      const out = { epsTTM: col(), bps: col(), roe: col(), revYoy: col(), profitYoy: col() };
+      const known = new Map();
+      let latest = null, j = 0, ttm = NaN;
+      for (let i = 0; i < n; i++) {
+        let changed = false;
+        while (j < recs.length && recs[j].notice < dates[i]) {
+          const r = recs[j++];
+          known.set(r.report, r);
+          if (!latest || r.report >= latest.report) latest = r;
+          changed = true;
+        }
+        if (!latest) continue;
+        if (changed) ttm = epsTTM(latest, known);
+        out.epsTTM[i] = ttm;
+        out.bps[i] = latest.bps > 0 ? latest.bps : NaN;
+        out.roe[i] = latest.bps > 0 ? ttm / latest.bps : NaN;
+        out.revYoy[i] = fin(latest.revYoy) ? latest.revYoy : NaN;
+        out.profitYoy[i] = fin(latest.profitYoy) ? latest.profitYoy : NaN;
+      }
+      return out;
+    });
+  }
+
+  // 流通市值 = 不复权价 × 流通股本；流通股本 = 近 20 日成交量（手）× 100 ÷ 换手率，用 20 日合计减小换手率取整误差
+  function floatCap(b, s) {
+    return cachedPanel(b, s, 'floatcap', () => {
+      const n = b.dates.length;
+      const out = new Float64Array(n).fill(NaN);
+      const px = b.raw[s], tv = b.turnover[s], vol = b.volume[s];
+      if (!px || !tv) return out;
+      let sv = 0, st = 0, cnt = 0;
+      const q = [];
+      for (let i = 0; i < n; i++) {
+        const ok = fin(vol[i]) && fin(tv[i]) && tv[i] > 0;
+        q.push(ok ? [vol[i], tv[i]] : null);
+        if (ok) { sv += vol[i]; st += tv[i]; cnt++; }
+        if (q.length > 20) { const x = q.shift(); if (x) { sv -= x[0]; st -= x[1]; cnt--; } }
+        if (cnt >= 10 && st > 0) out[i] = px[i] * ((sv * 100) / (st / 100));
+      }
+      return out;
+    });
+  }
+
+  const byPrice = (b, s, num) => {
+    const px = b.raw[s];
+    return px ? px.map((p, i) => (p > 0 ? num[i] / p : NaN)) : new Float64Array(b.dates.length).fill(NaN);
+  };
+
   const FACTORS = [
     { id: 'roc1', label: '昨日涨跌', f: (b, s) => ind.roc(b.close[s], 1) },
     { id: 'roc5', label: '5 日动量', f: (b, s) => ind.roc(b.close[s], 5) },
@@ -724,6 +802,13 @@
         return ind.sma(Float64Array.from(x, (v) => (Number.isFinite(v) ? v : NaN)), 20);
       },
     },
+    // 以下需要个股数据：财务数据（按公告日对齐）、不复权价与换手率
+    { id: 'ep', label: '盈利收益率 E/P（TTM）', needsFund: true, f: (b, s) => byPrice(b, s, fundPanel(b, s).epsTTM) },
+    { id: 'bp', label: '账面市值比 B/P', needsFund: true, f: (b, s) => byPrice(b, s, fundPanel(b, s).bps) },
+    { id: 'roe', label: 'ROE（TTM）', needsFund: true, f: (b, s) => fundPanel(b, s).roe },
+    { id: 'profit_g', label: '净利润同比增速', needsFund: true, f: (b, s) => fundPanel(b, s).profitYoy },
+    { id: 'rev_g', label: '营业收入同比增速', needsFund: true, f: (b, s) => fundPanel(b, s).revYoy },
+    { id: 'size', label: '流通市值（对数）', needsCap: true, f: (b, s) => floatCap(b, s).map((v) => (v > 0 ? Math.log(v) : NaN)) },
   ];
   const FACTOR_BY_ID = Object.fromEntries(FACTORS.map((f) => [f.id, f]));
   const WARM = 60;
@@ -757,6 +842,7 @@
       };
       const vals = this.factors.map((f) => symbols.map((s) => cache(s, 'fac:' + f.id, () => FACTOR_BY_ID[f.id].f(bars, s))));
       const vol = this.sizing === 'invvol' ? symbols.map((s) => cache(s, 'vol20', () => AQ.annVol(bars.close[s], 20))) : null;
+      const member = bars.member;
 
       // 等权指数：各标的相对自身首个价格的均值
       let riskOn = () => true;
@@ -786,7 +872,10 @@
         wasOn = true;
         lastRebal = i;
         const eligible = [];
-        for (let k = 0; k < N; k++) if (vals.every((v) => fin(v[k][i])) && fin(close[symbols[k]][i])) eligible.push(k);
+        for (let k = 0; k < N; k++) {
+          if (member && !member[symbols[k]][i]) continue;
+          if (vals.every((v) => fin(v[k][i])) && fin(close[symbols[k]][i])) eligible.push(k);
+        }
         const score = new Array(N).fill(0);
         this.factors.forEach((f, j) => {
           const r = ranks(eligible.map((k) => vals[j][k][i]));
@@ -825,15 +914,28 @@
 
   function factorPanel(bt, h, ids) {
     const b = bt.bars();
-    const hasVolume = bt.symbols.every((s) => b.volume[s].some(fin));
-    const factors = FACTORS.filter((f) => (!f.needsVolume || hasVolume) && (!ids || ids.includes(f.id)));
+    const factors = availableFactors(b, bt.symbols).filter((f) => !ids || ids.includes(f.id));
     const fwd = {}, vals = {};
     for (const s of bt.symbols) {
       fwd[s] = forwardReturns(b.open[s], h);
       vals[s] = {};
       for (const f of factors) vals[s][f.id] = f.f(b, s);
+      // 时点股票池：不在池内的日子没有未来收益，自然不参与 IC 与分组
+      if (b.member) {
+        const m = b.member[s], fw = fwd[s];
+        for (let t = 0; t < fw.length; t++) if (!m[t]) fw[t] = NaN;
+      }
     }
     return { factors, fwd, vals };
+  }
+
+  // 当前数据支持的因子：量类需要成交量，财务类需要财务数据，市值需要不复权价与换手率
+  function availableFactors(b, symbols) {
+    const hasVolume = symbols.every((s) => b.volume[s].some(fin));
+    const hasFund = !!(b.meta && b.meta.fundamentals) && symbols.some((s) => (b.meta.fundamentals[s] || []).length);
+    const hasRaw = symbols.some((s) => b.raw[s]);
+    const hasCap = symbols.some((s) => b.raw[s] && b.turnover[s]);
+    return FACTORS.filter((f) => (!f.needsVolume || hasVolume) && (!f.needsFund || (hasFund && hasRaw)) && (!f.needsCap || hasCap));
   }
 
   function lcg(seed) {
@@ -857,25 +959,47 @@
     return i + 1 < sorted.length ? sorted[i] * (1 - f) + sorted[i + 1] * f : sorted[i];
   }
 
-  // 按下标序列 d 取样后的相关系数，缺失值（NaN）跳过
-  function corrAt(x, y, d) {
-    let n = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
-    for (const k of d) {
-      const a = x[k], b = y[k];
-      if (a !== a || b !== b) continue;
-      n++; sx += a; sy += b; sxx += a * a; syy += b * b; sxy += a * b;
+  // 相关系数所需的六个量的前缀和（缺失值跳过），供块自助法按块累加
+  function corrPrefix(x, y) {
+    const T = x.length;
+    const P = new Float64Array(6 * (T + 1));
+    for (let k = 0; k < T; k++) {
+      const a = x[k], b = y[k], o = 6 * k;
+      const ok = a === a && b === b;
+      P[o + 6] = P[o] + (ok ? 1 : 0);
+      P[o + 7] = P[o + 1] + (ok ? a : 0);
+      P[o + 8] = P[o + 2] + (ok ? b : 0);
+      P[o + 9] = P[o + 3] + (ok ? a * a : 0);
+      P[o + 10] = P[o + 4] + (ok ? b * b : 0);
+      P[o + 11] = P[o + 5] + (ok ? a * b : 0);
     }
-    const vx = sxx - (sx * sx) / n, vy = syy - (sy * sy) / n;
-    return n > 2 && vx > 0 && vy > 0 ? (sxy - (sx * sy) / n) / Math.sqrt(vx * vy) : NaN;
+    return P;
   }
 
+  function corrBlocks(P, starts, L, T) {
+    let n = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+    for (let k = 0; k < starts.length; k++) {
+      const len = Math.min(L, T - k * L);
+      const a = 6 * starts[k], b = 6 * (starts[k] + len);
+      n += P[b] - P[a]; sx += P[b + 1] - P[a + 1]; sy += P[b + 2] - P[a + 2];
+      sxx += P[b + 3] - P[a + 3]; syy += P[b + 4] - P[a + 4]; sxy += P[b + 5] - P[a + 5];
+    }
+    const vx = sxx - (sx * sx) / n, vy = syy - (sy * sy) / n;
+    return n > 2 && vx > 1e-9 && vy > 1e-9 ? (sxy - (sx * sy) / n) / Math.sqrt(vx * vy) : NaN;
+  }
+
+  /* stat(starts, L, T)：starts 为各块起点，第 k 块长度 min(L, T − k·L)，与 blockIndices 的取样一致。
+   * 用前缀和按块累加，比逐个下标快约 L 倍。 */
   function bootCI(stat, T, B, seed) {
     if (T < 4) return [NaN, NaN];
     const rnd = lcg(seed);
     const L = Math.max(1, Math.round(Math.cbrt(T)));
+    const K = Math.ceil(T / L);
     const out = [];
+    const starts = new Int32Array(K);
     for (let b = 0; b < B; b++) {
-      const v = stat(blockIndices(T, L, rnd));
+      for (let k = 0; k < K; k++) starts[k] = Math.floor(rnd() * (T - L + 1));
+      const v = stat(starts, L, T);
       if (fin(v)) out.push(v);
     }
     out.sort((p, q) => p - q);
@@ -897,22 +1021,23 @@
       const per = [];
       for (const s of syms) {
         const idx = [], x = [], y = [];
-        ts.forEach((t, k) => {
-          const v = vals[s][f.id][t], r = fwd[s][t];
-          if (fin(v) && fin(r)) { idx.push(k); x.push(v); y.push(r); }
-        });
+        const vf = vals[s][f.id], fw = fwd[s];
+        for (let k = 0; k < T; k++) {
+          const t = ts[k], v = vf[t], r = fw[t];
+          if (v === v && r === r && v !== Infinity && v !== -Infinity) { idx.push(k); x.push(v); y.push(r); }
+        }
         if (x.length < 20) continue;
         const rx = ranks(x), ry = ranks(y);
         const ic = pearson(rx, ry);
         if (!fin(ic)) continue;
         const ax = new Float64Array(T).fill(NaN), ay = new Float64Array(T).fill(NaN);
         idx.forEach((k, j) => { ax[k] = rx[j]; ay[k] = ry[j]; });
-        per.push({ ax, ay, ic });
+        per.push({ P: corrPrefix(ax, ay), ic });
       }
       const tsIC = per.length ? mean(per.map((p) => p.ic)) : NaN;
-      const [tsLo, tsHi] = per.length ? bootCI((d) => {
+      const [tsLo, tsHi] = per.length ? bootCI((starts, L, T2) => {
         let sum = 0, cnt = 0;
-        for (const p of per) { const c = corrAt(p.ax, p.ay, d); if (fin(c)) { sum += c; cnt++; } }
+        for (const p of per) { const c = corrBlocks(p.P, starts, L, T2); if (fin(c)) { sum += c; cnt++; } }
         return cnt ? sum / cnt : NaN;
       }, T, B, seed) : [NaN, NaN];
 
@@ -931,7 +1056,13 @@
         }
       }
       const csm = cs.length > 2 ? moments(cs) : null;
-      const [csLo, csHi] = csm ? bootCI((d) => { let a = 0; for (const k of d) a += cs[k]; return a / d.length; }, cs.length, B, seed) : [NaN, NaN];
+      const csP = new Float64Array(cs.length + 1);
+      cs.forEach((v, k) => (csP[k + 1] = csP[k] + v));
+      const [csLo, csHi] = csm ? bootCI((starts, L, T2) => {
+        let a = 0;
+        for (let k = 0; k < starts.length; k++) a += csP[starts[k] + Math.min(L, T2 - k * L)] - csP[starts[k]];
+        return a / T2;
+      }, cs.length, B, seed) : [NaN, NaN];
       const half = cs.length >> 1;
       return {
         id: f.id,
@@ -1034,7 +1165,7 @@
     moments, normCdf, normInv, ranks, spearman, acf, varianceRatio, segStats, deflatedSharpe,
     rangeValues, gridSize, gridIter, randomCombos, applyParams, makeBacktester, optimize,
     relativeStats, roundTrips, monthlyReturns, SwitchingStrategy, olsHAC, styleFactors, exposure,
-    FACTORS, FactorStrategy, buildStrategy, factorIC, factorPortfolios, seriesStats, forwardReturns, blockIndices,
+    FACTORS, availableFactors, fundPanel, floatCap, FactorStrategy, buildStrategy, factorIC, factorPortfolios, seriesStats, forwardReturns, blockIndices,
   };
   if (isNode) module.exports = api;
   else AQ.research = api;

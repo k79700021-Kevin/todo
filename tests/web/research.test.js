@@ -556,3 +556,91 @@ test('deflated sharpe counts prior trials', () => {
   assert.equal(withPrior.trials, 500);
   assert.ok(withPrior.prob < now.prob && withPrior.sr0 > now.sr0);
 });
+
+// ---------- 个股：时点股票池、退市、财务数据 ----------
+
+test('point-in-time universe: no buys outside the pool, exits on removal, PIT benchmark', () => {
+  const n = 60;
+  const dates = dayList(n);
+  const up = ramp(n, 10, 0.1);
+  const data = {};
+  for (const s of ['600000', '600001', '600002']) data[s] = { dates, open: up, close: up, high: up, low: up, volume: up.map(() => 1e6) };
+  const universe = { '600000': [[dates[0], null]], '600001': [[dates[0], dates[30]]], '600002': [[dates[40], null]] };
+  const bt = new AQ.Backtester(data, { rebalanceBand: 0, meta: { universe } });
+  const res = bt.run(new RuleStrategy({ rules: [{ id: 'price_ma', params: { n: 5 } }] }));
+  const idx = (d) => dates.indexOf(d);
+  const by = (s, side) => res.trades.filter((t) => t.symbol === s && t.side === side).map((t) => idx(t.date));
+  assert.ok(by('600002', 'buy').every((i) => i > 40), '纳入前不买：' + by('600002', 'buy'));
+  assert.ok(by('600002', 'buy').length > 0);
+  assert.deepEqual(by('600001', 'sell'), [31], '剔除当日收盘决定卖出，次日开盘成交');
+  // 基准：当期成分等权，成分变化时调仓
+  const bench = bt.run(new AQ.BuyAndHold());
+  const days = [...new Set(bench.trades.map((t) => idx(t.date)))];
+  assert.deepEqual(days, [1, 31, 41]);
+});
+
+test('delisted positions are written off at the recovery ratio', () => {
+  const dates = dayList(30);
+  const px = ramp(30, 10, 0);
+  const data = {
+    '600000': { dates: dates.slice(0, 20), open: px.slice(0, 20), close: px.slice(0, 20), volume: px.slice(0, 20) },
+    '600001': { dates, open: px, close: px, volume: px },
+  };
+  const run = (rec) => new AQ.Backtester(data, { rebalanceBand: 0, fees: new AQ.FeeModel({ minCommission: 0, commissionRate: 0, transferRate: 0, stampDutyRate: 0 }), slippage: 0, meta: { delisted: { '600000': dates[19] } }, delistRecovery: rec })
+    .run(new AQ.BuyAndHold());
+  const full = run(1), zero = run(0), half = run(0.5);
+  const w = full.trades.find((t) => t.delisted);
+  assert.equal(w.date, dates[20]);
+  close(full.equity[29], 1e6, 1);
+  close(zero.equity[29], 5e5, 1);
+  close(half.equity[29], 7.5e5, 1);
+});
+
+test('fundamentals become visible only after the notice date; TTM EPS uses announced reports', () => {
+  const dates = ['2021-04-28', '2021-04-29', '2021-04-30', '2021-08-30', '2021-08-31'];
+  const px = [20, 20, 20, 20, 20];
+  const fundamentals = { '600000': [
+    { report: '2020-06-30', notice: '2020-08-20', eps: 0.4, bps: 5 },
+    { report: '2020-12-31', notice: '2021-03-30', eps: 1.0, bps: 5.5, profitYoy: 10 },
+    { report: '2021-06-30', notice: '2021-08-30', eps: 0.6, bps: 6, profitYoy: 30 },
+  ] };
+  const bt = new AQ.Backtester({ '600000': { dates, open: px, close: px, raw: px, volume: [1, 1, 1, 1, 1] } }, { meta: { fundamentals } });
+  const F = R.fundPanel(bt.bars(), '600000');
+  close(F.epsTTM[3], 1.0, 1e-12); // 8-30 当天公告，当天还不可用
+  close(F.epsTTM[4], 0.6 + 1.0 - 0.4, 1e-12);
+  close(F.bps[4], 6, 1e-12);
+  close(F.profitYoy[3], 10, 1e-12);
+  const ep = R.FACTORS.find((f) => f.id === 'ep').f(bt.bars(), '600000');
+  close(ep[4], 1.2 / 20, 1e-12);
+  // 未来才公告的数据不影响之前的值
+  const later = JSON.parse(JSON.stringify(fundamentals));
+  later['600000'][2].eps = 99;
+  const bt2 = new AQ.Backtester({ '600000': { dates, open: px, close: px, raw: px, volume: [1, 1, 1, 1, 1] } }, { meta: { fundamentals: later } });
+  const F2 = R.fundPanel(bt2.bars(), '600000');
+  assert.deepEqual(Array.from(F2.epsTTM.slice(0, 4)), Array.from(F.epsTTM.slice(0, 4)));
+  assert.ok(R.availableFactors(bt.bars(), ['600000']).some((f) => f.id === 'ep'));
+  assert.ok(!R.availableFactors(new AQ.Backtester({ '600000': series(100, 1) }, {}).bars(), ['600000']).some((f) => f.id === 'ep'));
+});
+
+test('float market cap from turnover', () => {
+  const n = 40;
+  const dates = dayList(n);
+  const px = ramp(n, 10, 0);
+  // 流通股本 1 亿股：成交 50 万手 = 5000 万股，换手率 50%
+  const bt = new AQ.Backtester({ '600000': { dates, open: px, close: px, raw: px, volume: px.map(() => 5e5), turnover: px.map(() => 50) } }, {});
+  const cap = R.floatCap(bt.bars(), '600000');
+  close(cap[30], 10 * 1e8, 1);
+  assert.ok(!Number.isFinite(cap[5]));
+});
+
+test('factor panel ignores days outside the universe', () => {
+  const data = {};
+  for (let k = 0; k < 4; k++) data['60000' + k] = series(400, 70 + k);
+  const dates = new AQ.Backtester(data, {}).dates;
+  const universe = { '600000': [[dates[0], null]], '600001': [[dates[0], null]], '600002': [[dates[0], null]], '600003': [[dates[200], null]] };
+  const bt = new AQ.Backtester(data, { meta: { universe } });
+  const ic = R.factorIC(bt, 5, { B: 20 });
+  const bt3 = new AQ.Backtester({ '600000': data['600000'], '600001': data['600001'], '600002': data['600002'] }, {});
+  // 前 200 天第 4 只不在池内：截面 IC 的前段与只有 3 只时相同 → 整体不同但有效期数相同
+  assert.equal(ic[0].csN, R.factorIC(bt3, 5, { B: 20 })[0].csN);
+});
