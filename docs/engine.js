@@ -85,9 +85,10 @@
       const open = {}, close = {}, high = {}, low = {}, volume = {}, tradable = {}, prevClose = {}, raw = {}, turnover = {};
       for (const s of symbols) {
         const src = data[s];
-        const o = new Array(n).fill(NaN), c = new Array(n).fill(NaN), t = new Array(n).fill(false);
-        const h = new Array(n).fill(NaN), l = new Array(n).fill(NaN), v = new Array(n).fill(NaN);
-        const rw = src.raw ? new Array(n).fill(NaN) : null, tv = src.turnover ? new Array(n).fill(NaN) : null;
+        // 开盘、收盘（涨跌停判断用）保持双精度；其余用单精度省内存（个股池有几百只标的）
+        const o = new Float64Array(n).fill(NaN), c = new Float64Array(n).fill(NaN), t = new Uint8Array(n);
+        const h = new Float32Array(n).fill(NaN), l = new Float32Array(n).fill(NaN), v = new Float32Array(n).fill(NaN);
+        const rw = src.raw ? new Float64Array(n).fill(NaN) : null, tv = src.turnover ? new Float32Array(n).fill(NaN) : null;
         src.dates.forEach((d, j) => {
           const i = pos.get(d);
           if (rw) rw[i] = src.raw[j];
@@ -99,12 +100,12 @@
           l[i] = src.low ? src.low[j] : Math.min(o[i], c[i]);
           v[i] = src.volume ? src.volume[j] : NaN;
           const vol = src.volume ? src.volume[j] : 1;
-          t[i] = o[i] > 0 && c[i] > 0 && vol > 0; // 价格非正（坏数据）也视为不可交易
+          t[i] = o[i] > 0 && c[i] > 0 && vol > 0 ? 1 : 0; // 价格非正（坏数据）也视为不可交易
         });
         high[s] = h; low[s] = l; volume[s] = v;
         if (rw) raw[s] = rw;
         if (tv) turnover[s] = tv;
-        const p = new Array(n).fill(NaN);
+        const p = new Float64Array(n).fill(NaN);
         let last = NaN;
         for (let i = 0; i < n; i++) {
           p[i] = last;
@@ -145,19 +146,24 @@
       for (const s of this.symbols) {
         if (!panel[s]) continue;
         let last = NaN;
-        out[s] = panel[s].map((v) => (Number.isFinite(v) ? (last = v) : last));
+        out[s] = Array.from(panel[s], (v) => (Number.isFinite(v) ? (last = v) : last));
       }
       return out;
     }
 
-    // 停牌日前向填充后的完整行情，按需构建并缓存，供需要高低价、成交量的策略使用
+    // 停牌日前向填充后的完整行情，各项在第一次用到时才构建并缓存（个股池省内存）
     bars() {
       if (!this._bars) {
-        this._bars = {
-          open: this.ffill(this.open), high: this.ffill(this.high), low: this.ffill(this.low),
-          close: this.closeFfill(), volume: this.volume, cache: new Map(),
-          raw: this.ffill(this.raw), turnover: this.turnover, member: this.member, meta: this.meta, dates: this.dates,
-        };
+        const self = this;
+        const lazy = {};
+        const b = { volume: this.volume, turnover: this.turnover, member: this.member, meta: this.meta, dates: this.dates, cache: new Map() };
+        for (const k of ['open', 'high', 'low', 'close', 'raw']) {
+          Object.defineProperty(b, k, {
+            enumerable: true,
+            get() { return lazy[k] || (lazy[k] = self.ffill(self[k])); },
+          });
+        }
+        this._bars = b;
       }
       return this._bars;
     }

@@ -7,6 +7,8 @@ on:
       - docs/eastmoney.js
       - tools/data_smoke.js
       - tools/py_data_smoke.py
+      - tools/build_hs300.py
+      - tools/hs300_adhoc.json
       - ashare_quant/data.py
       - .github/workflows/data-smoke.yml
   schedule:
@@ -35,6 +37,19 @@ jobs:
             curl -sS -m 20 -A 'Mozilla/5.0' -e 'https://quote.eastmoney.com/' -w '\nHTTP %{http_code}, %{time_total}s\n' "$u" | head -c 400 || true
             echo
           done
+      - name: Rebuild CSI 300 historical constituents
+        id: hs300
+        continue-on-error: true
+        run: |
+          pip install openpyxl xlrd pdfplumber
+          cp docs/data/hs300_members.json /tmp/committed.json
+          python tools/build_hs300.py 2>&1 | tail -5 | tee -a "$GITHUB_STEP_SUMMARY"
+          python - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json
+          a = json.load(open('/tmp/committed.json')); b = json.load(open('docs/data/hs300_members.json'))
+          same = a['members'] == b['members'] and a['delisted'] == b['delisted']
+          print(f"仓库中的成分数据截至 {a['asOf']}，官网最新 {b['asOf']}：" + ('成分区间一致' if same else '有更新，请运行 tools/build_hs300.py 并提交'))
+          PY
       - name: Eastmoney API used by the web page
         id: em
         continue-on-error: true

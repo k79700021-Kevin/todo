@@ -87,6 +87,18 @@ function check(sym, d) {
   const port = R.factorPortfolios(bt, 'roc60', 20);
   if (port.q) lines.push('', `**分组组合** 60 日动量，${port.q} 组：` + port.groups.map((g) => `Q${g.group} ${pct(g.annReturn)}`).join('，') + `；多空 ${pct(port.longShort.annReturn)}`);
 
+  // 财务主要指标（个股池用）：含已退市公司
+  for (const code of ['600519', '601299']) {
+    try {
+      const url = em.financeUrl(code, 'cbf');
+      const text = await (await fetch(url, { headers: { Referer: 'https://data.eastmoney.com/' } })).text();
+      const fin = em.parseFinance(JSON.parse(text.replace(/^\s*cbf\(|\);?\s*$/g, '')));
+      lines.push(`**财务数据** ${code}：${fin.length} 期，${fin.length ? `${fin[0].report} ~ ${fin[fin.length - 1].report}，最近一期公告日 ${fin[fin.length - 1].notice}` : '无'}`);
+    } catch (e) {
+      lines.push(`**财务数据** ${code}：获取失败（${e.message}）`);
+    }
+  }
+
   const report = lines.join('\n');
   console.log(report);
   if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, report + '\n');

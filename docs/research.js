@@ -717,7 +717,7 @@
         .filter((r) => r.notice && r.report)
         .slice()
         .sort((x, y) => (x.notice < y.notice ? -1 : x.notice > y.notice ? 1 : x.report < y.report ? -1 : 1));
-      const col = () => new Float64Array(n).fill(NaN);
+      const col = () => new Float32Array(n).fill(NaN); // 财务指标单精度足够，省内存
       const out = { epsTTM: col(), bps: col(), roe: col(), revYoy: col(), profitYoy: col() };
       const known = new Map();
       let latest = null, j = 0, ttm = NaN;

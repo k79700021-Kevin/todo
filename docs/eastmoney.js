@@ -1,4 +1,4 @@
-/* 东方财富日线接口：拼接请求地址、解析返回的 K 线、等比前复权。网页和 tools/data_smoke.js 共用这一份代码。 */
+/* 东方财富接口：日线（含换手率）、财务主要指标；解析、等比前复权。网页和 tools/data_smoke.js 共用这一份代码。 */
 (function (root) {
   'use strict';
 
@@ -8,21 +8,44 @@
   function klineUrl(sym, start, end, adjust, cb) {
     const fqt = { qfq: 1, hfq: 2, none: 0 }[adjust] ?? 1;
     return `https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=${market(sym)}.${sym}` +
-      `&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=${fqt}` +
+      `&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f61&klt=101&fqt=${fqt}` +
       `&beg=${start.replace(/-/g, '')}&end=${end.replace(/-/g, '')}` + (cb ? `&cb=${cb}` : '');
   }
 
-  // 每行格式：日期,开盘,收盘,最高,最低,成交量
+  // 每行格式：日期,开盘,收盘,最高,最低,成交量(手)[,换手率%]
   function parseKlines(json, sym) {
     const k = json && json.data && json.data.klines;
     if (!k || !k.length) throw new Error(`${sym}：没有数据，检查代码是否正确`);
     const out = { dates: [], open: [], close: [], high: [], low: [], volume: [] };
+    const hasTurnover = k[0].split(',').length > 6;
+    if (hasTurnover) out.turnover = [];
     for (const line of k) {
       const p = line.split(',');
       out.dates.push(p[0]); out.open.push(+p[1]); out.close.push(+p[2]);
       out.high.push(+p[3]); out.low.push(+p[4]); out.volume.push(+p[5]);
+      if (hasTurnover) out.turnover.push(+p[6]);
     }
+    if (json.data.name) out.name = json.data.name;
     return out;
+  }
+
+  /* 财务主要指标（含已退市公司）：报告期、首次公告日、基本每股收益（年初至今）、每股净资产、营收与归母净利润同比。 */
+  function financeUrl(sym, cb) {
+    const secu = `${sym}.${market(sym) === 1 ? 'SH' : /^(4|8|92)/.test(sym) ? 'BJ' : 'SZ'}`;
+    return 'https://datacenter.eastmoney.com/securities/api/data/v1/get?reportName=RPT_F10_FINANCE_MAINFINADATA' +
+      '&columns=REPORT_DATE,NOTICE_DATE,EPSJB,BPS,TOTALOPERATEREVETZ,PARENTNETPROFITTZ' +
+      `&filter=(SECUCODE%3D%22${secu}%22)&pageSize=300&sortColumns=REPORT_DATE&sortTypes=1` + (cb ? `&callback=${cb}` : '');
+  }
+
+  function parseFinance(json) {
+    const rows = (json && json.result && json.result.data) || [];
+    const num = (v) => (v === null || v === undefined || v === '' ? NaN : +v);
+    return rows
+      .filter((r) => r.REPORT_DATE && r.NOTICE_DATE)
+      .map((r) => ({
+        report: r.REPORT_DATE.slice(0, 10), notice: r.NOTICE_DATE.slice(0, 10),
+        eps: num(r.EPSJB), bps: num(r.BPS), revYoy: num(r.TOTALOPERATEREVETZ), profitYoy: num(r.PARENTNETPROFITTZ),
+      }));
   }
 
   /* 等比前复权：后复权价（按比例调整，恒为正）整体乘以"最新不复权价 / 最新后复权价"，
@@ -34,10 +57,17 @@
     if (k < 0 || !(hfq.close[k] > 0)) throw new Error(`${sym}：无法对齐不复权与后复权数据`);
     const f = rawClose.get(hfq.dates[k]) / hfq.close[k];
     const scale = (a) => a.map((v) => v * f);
-    return {
+    const out = {
       dates: hfq.dates.slice(), open: scale(hfq.open), high: scale(hfq.high), low: scale(hfq.low),
       close: scale(hfq.close), volume: hfq.volume.slice(),
     };
+    // 个股研究用：对齐后的不复权收盘价与换手率（市值、估值因子需要）
+    if (raw.turnover) {
+      const rawTv = new Map(raw.dates.map((d, i) => [d, raw.turnover[i]]));
+      out.raw = hfq.dates.map((d) => rawClose.get(d) ?? NaN);
+      out.turnover = hfq.dates.map((d) => rawTv.get(d) ?? NaN);
+    }
+    return out;
   }
 
   // 回测要求开盘、收盘价为正；否则价格为 0 时会买入无穷多股，算出的收益毫无意义
@@ -51,7 +81,7 @@
     return d;
   }
 
-  const api = { market, klineUrl, parseKlines, proportional, checkPositive };
+  const api = { market, klineUrl, parseKlines, proportional, checkPositive, financeUrl, parseFinance };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else (root.AQ = root.AQ || {}).em = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
