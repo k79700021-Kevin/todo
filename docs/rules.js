@@ -22,6 +22,10 @@
     for (let i = warm; i < n; i++) out[i] = f(i);
     return out;
   };
+  // N 日收益率标准差（年化）
+  function annVol(close, n) {
+    return ind.stdev(Float64Array.from(ind.roc(close, 1)), n, 1).map((v) => v * Math.sqrt(244));
+  }
   const cmp = (a, b) => (a > b * (1 + EPS) ? 1 : a < b * (1 - EPS) ? -1 : 0);
   const fin = Number.isFinite;
 
@@ -145,27 +149,128 @@
         return sig(r.length, p.n, (i) => (!fin(r[i]) ? 0 : r[i] > t + EPS ? 1 : r[i] < -t - EPS ? -1 : 0));
       },
     },
+    dmi: {
+      label: 'DMI 趋势强度',
+      desc: 'ADX 高于阈值（有趋势）时，+DI 在上看多、-DI 在上看空；ADX 低于阈值视为无趋势',
+      params: {
+        n: { label: '周期', def: 14, min: 5, max: 60, step: 1, range: [10, 30, 5] },
+        th: { label: 'ADX 阈值', def: 20, min: 5, max: 60, step: 5, range: [15, 35, 5] },
+      },
+      signal(b, s, p) {
+        const d = cached(b, s, 'dmi' + p.n, () => ind.dmi(b.high[s], b.low[s], b.close[s], p.n, 6));
+        return sig(d.adx.length, p.n + 6, (i) => (!(d.adx[i] > p.th) ? 0 : d.pdi[i] > d.mdi[i] ? 1 : d.pdi[i] < d.mdi[i] ? -1 : 0));
+      },
+    },
+    cci: {
+      label: 'CCI 突破',
+      desc: 'CCI 上穿 +阈值看多（强势突破），跌破 -阈值看空',
+      params: {
+        n: { label: '周期', def: 14, min: 5, max: 60, step: 1, range: [10, 40, 10] },
+        th: { label: '阈值', def: 100, min: 20, max: 300, step: 10, range: [50, 200, 50] },
+      },
+      signal(b, s, p) {
+        const c = cached(b, s, 'cci' + p.n, () => ind.cci(b.high[s], b.low[s], b.close[s], p.n));
+        return sig(c.length, p.n - 1, (i) => (!fin(c[i]) ? 0 : c[i] > p.th ? 1 : c[i] < -p.th ? -1 : 0));
+      },
+    },
+    willr: {
+      label: '威廉 %R',
+      desc: '%R 高于超卖线看多，低于超买线看空（0 最强、100 最弱）；均值回归思路',
+      params: {
+        n: { label: '周期', def: 14, min: 3, max: 60, step: 1, range: [7, 28, 7] },
+        low: { label: '超买线', def: 20, min: 5, max: 50, step: 5, range: [10, 30, 10] },
+        high: { label: '超卖线', def: 80, min: 50, max: 95, step: 5, range: [70, 90, 10] },
+      },
+      check: (p) => p.low < p.high || '超买线要小于超卖线',
+      signal(b, s, p) {
+        const w = cached(b, s, 'wr' + p.n, () => ind.willr(b.high[s], b.low[s], b.close[s], p.n));
+        return sig(w.length, p.n - 1, (i) => (!fin(w[i]) ? 0 : w[i] > p.high ? 1 : w[i] < p.low ? -1 : 0));
+      },
+    },
+    vol_surge: {
+      label: '放量上涨',
+      desc: '成交量超过 N 日均量的 k 倍且收阳时看多；只产生看多信号，适合作为入场确认',
+      params: {
+        n: { label: '均量天数', def: 20, min: 5, max: 120, step: 5, range: [10, 60, 10] },
+        k: { label: '放量倍数', def: 2, min: 1, max: 5, step: 0.5, range: [1.5, 3, 0.5] },
+      },
+      signal(b, s, p) {
+        const v = b.volume[s];
+        const mv = cached(b, s, 'vma' + p.n, () => ind.sma(v, p.n));
+        const c = b.close[s], o = b.open[s];
+        return sig(c.length, p.n, (i) => (fin(mv[i - 1]) && v[i] > p.k * mv[i - 1] && c[i] > o[i] ? 1 : 0));
+      },
+    },
+    vol_filter: {
+      label: '波动率过滤',
+      desc: 'N 日年化波动率低于阈值看多（市场平稳），高于阈值看空；常用于在剧烈波动时离场',
+      params: {
+        n: { label: '周期', def: 20, min: 5, max: 120, step: 5, range: [10, 60, 10] },
+        th: { label: '年化波动阈值 %', def: 30, min: 5, max: 100, step: 5, range: [15, 45, 5] },
+      },
+      signal(b, s, p) {
+        const v = cached(b, s, 'vol' + p.n, () => annVol(b.close[s], p.n));
+        return sig(v.length, p.n, (i) => (!fin(v[i]) ? 0 : v[i] * 100 < p.th ? 1 : -1));
+      },
+    },
+    ma_slope: {
+      label: '均线斜率',
+      desc: 'N 日均线比 k 天前高看多、低看空；比价格与均线更平滑',
+      params: {
+        n: { label: '均线天数', def: 20, min: 5, max: 250, step: 5, range: [10, 60, 10] },
+        k: { label: '比较天数', def: 5, min: 1, max: 60, step: 1, range: [3, 10, 1] },
+      },
+      signal(b, s, p) {
+        const m = cached(b, s, 'sma' + p.n, () => ind.sma(b.close[s], p.n));
+        return sig(m.length, p.n - 1 + p.k, (i) => (fin(m[i]) && fin(m[i - p.k]) ? cmp(m[i], m[i - p.k]) : 0));
+      },
+    },
+    obv_trend: {
+      label: 'OBV 能量潮',
+      desc: 'OBV 在其 N 日均线上方看多（资金流入），下方看空',
+      params: { n: { label: '均线天数', def: 20, min: 5, max: 120, step: 5, range: [10, 60, 10] } },
+      signal(b, s, p) {
+        const o = cached(b, s, 'obv', () => ind.obv(b.close[s], b.volume[s]));
+        const m = cached(b, s, 'obvma' + p.n, () => ind.sma(o, p.n));
+        return sig(o.length, p.n, (i) => (!fin(m[i]) ? 0 : o[i] > m[i] ? 1 : o[i] < m[i] ? -1 : 0));
+      },
+    },
   };
 
-  // 风控参数：0 表示关闭。range 为参数优化时的默认搜索范围 [起, 止, 步长]
+  // 风控与持仓参数：0 表示关闭/不限。range 为参数优化时的默认搜索范围 [起, 止, 步长]
   const RISK_PARAMS = {
     stopLoss: { label: '止损 %', def: 0, min: 0, max: 30, step: 1, range: [0, 15, 5] },
     takeProfit: { label: '止盈 %', def: 0, min: 0, max: 100, step: 5, range: [0, 40, 10] },
     trailATR: { label: 'ATR 移动止损倍数', def: 0, min: 0, max: 6, step: 0.5, range: [0, 4, 1] },
+    maxPositions: { label: '最多持有几只', def: 0, min: 0, max: 50, step: 1, range: [1, 5, 1] },
+    minHold: { label: '最短持有天数', def: 0, min: 0, max: 120, step: 1, range: [0, 10, 5] },
+    maxHold: { label: '最长持有天数', def: 0, min: 0, max: 500, step: 5, range: [0, 60, 20] },
+    cooldown: { label: '平仓后冷却天数', def: 0, min: 0, max: 60, step: 1, range: [0, 10, 5] },
   };
 
   function defaultParams(id) {
     return Object.fromEntries(Object.entries(RULES[id].params).map(([k, d]) => [k, d.def]));
   }
 
+  const ROLES = { both: '入场和出场', entry: '只用于入场', exit: '只用于出场' };
+
   class RuleStrategy {
-    /* config: { rules: [{ id, params }], entry: 'all'|'any', exit: 'any'|'all',
-     *           sizing: 'fixed'|'equal', stopLoss, takeProfit, trailATR } */
+    /* config: {
+     *   rules: [{ id, params, role: 'both'|'entry'|'exit' }],
+     *   entry: 'all'|'any'（入场规则全部/任一看多）, exit: 'any'|'all'（出场规则任一/全部看空）,
+     *   sizing: 'fixed'（每只 1/槽位数）|'equal'（持仓等分）|'invvol'（按 20 日波动率倒数加权）,
+     *   stopLoss, takeProfit（%）, trailATR（倍数）, maxPositions, minHold, maxHold, cooldown（交易日）
+     * } */
     constructor(config) {
       const unknown = (config.rules || []).find((r) => !RULES[r.id]);
       if (unknown) throw new Error('未知规则：' + unknown.id);
-      const rules = (config.rules || []).map((r) => ({ id: r.id, params: { ...defaultParams(r.id), ...r.params } }));
+      const rules = (config.rules || []).map((r) => ({
+        id: r.id,
+        role: ROLES[r.role] ? r.role : 'both',
+        params: { ...defaultParams(r.id), ...r.params },
+      }));
       if (!rules.length) throw new Error('至少添加一条规则');
+      if (!rules.some((r) => r.role !== 'exit')) throw new Error('至少要有一条规则用于入场');
       for (const r of rules) {
         const def = RULES[r.id];
         for (const [k, spec] of Object.entries(def.params)) {
@@ -174,70 +279,129 @@
         const msg = def.check ? def.check(r.params) : true;
         if (msg !== true) throw new Error(`${def.label}：${msg}`);
       }
+      for (const [k, spec] of Object.entries(RISK_PARAMS)) {
+        const v = +config[k] || 0;
+        if (v < 0) throw new Error(`"${spec.label}"不能为负`);
+      }
       this.name = 'rules';
       this.rules = rules;
       this.entry = config.entry === 'any' ? 'any' : 'all';
       this.exit = config.exit === 'all' ? 'all' : 'any';
-      this.sizing = config.sizing === 'equal' ? 'equal' : 'fixed';
+      this.sizing = ['equal', 'invvol'].includes(config.sizing) ? config.sizing : 'fixed';
       this.stopLoss = (+config.stopLoss || 0) / 100;
       this.takeProfit = (+config.takeProfit || 0) / 100;
       this.trailATR = +config.trailATR || 0;
+      this.maxPositions = Math.floor(+config.maxPositions || 0);
+      this.minHold = Math.floor(+config.minHold || 0);
+      this.maxHold = Math.floor(+config.maxHold || 0);
+      this.cooldown = Math.floor(+config.cooldown || 0);
     }
 
     params() {
       const out = {};
       this.rules.forEach((r) => Object.entries(r.params).forEach(([k, v]) => (out[`${r.id}.${k}`] = v)));
-      return Object.assign(out, { stopLoss: this.stopLoss * 100, takeProfit: this.takeProfit * 100, trailATR: this.trailATR });
+      return Object.assign(out, {
+        stopLoss: this.stopLoss * 100, takeProfit: this.takeProfit * 100, trailATR: this.trailATR,
+        maxPositions: this.maxPositions, minHold: this.minHold, maxHold: this.maxHold, cooldown: this.cooldown,
+      });
     }
 
     generate(close, dates, symbols, bars) {
       const n = dates.length;
       const N = symbols.length;
+      const slots = this.maxPositions > 0 ? Math.min(this.maxPositions, N) : N;
+      const entryIdx = this.rules.map((r, j) => (r.role !== 'exit' ? j : -1)).filter((j) => j >= 0);
+      const exitIdx = this.rules.map((r, j) => (r.role !== 'entry' ? j : -1)).filter((j) => j >= 0);
       const holding = new Uint8Array(N);
       const state = symbols.map((s) => ({
         sigs: this.rules.map((r) => RULES[r.id].signal(bars, s, r.params)),
         atr: this.trailATR ? cached(bars, s, 'atr14', () => ind.atr(bars.high[s], bars.low[s], bars.close[s], 14)) : null,
-        entryPx: NaN,
-        peak: NaN,
+        // 入选排序（信号多于空余仓位时）用近 20 日涨幅（不足 20 日时用已有天数），波动率加权用 20 日波动率
+        first: close[s].findIndex(fin),
+        vol: this.sizing === 'invvol' ? cached(bars, s, 'vol20', () => annVol(bars.close[s], 20)) : null,
+        entryPx: NaN, peak: NaN, entryDay: -1, exitDay: -Infinity,
       }));
       const out = new Array(n).fill(null);
+      const allOf = (st, idx, i, v) => idx.length > 0 && idx.every((j) => st.sigs[j][i] === v);
+      const anyOf = (st, idx, i, v) => idx.some((j) => st.sigs[j][i] === v);
 
       for (let i = 0; i < n; i++) {
         let changed = i === 0;
+        // 1) 先处理出场，腾出仓位
         for (let k = 0; k < N; k++) {
+          if (!holding[k]) continue;
           const st = state[k];
           const c = close[symbols[k]][i];
           if (!fin(c)) continue;
-          if (!holding[k]) {
-            const enter = this.entry === 'all' ? st.sigs.every((x) => x[i] === 1) : st.sigs.some((x) => x[i] === 1);
-            if (enter) {
-              holding[k] = 1;
-              st.entryPx = c;
-              st.peak = c;
-              changed = true;
-            }
-            continue;
-          }
           st.peak = Math.max(st.peak, c);
-          let exit = this.exit === 'any' ? st.sigs.some((x) => x[i] === -1) : st.sigs.every((x) => x[i] === -1);
+          const held = i - st.entryDay;
+          let exit = false;
+          if (held >= this.minHold) {
+            exit = this.exit === 'any' ? anyOf(st, exitIdx, i, -1) : allOf(st, exitIdx, i, -1);
+            if (this.takeProfit && c >= st.entryPx * (1 + this.takeProfit)) exit = true;
+          }
+          // 止损类不受最短持有期限制
           if (this.stopLoss && c <= st.entryPx * (1 - this.stopLoss)) exit = true;
-          if (this.takeProfit && c >= st.entryPx * (1 + this.takeProfit)) exit = true;
           if (this.trailATR && fin(st.atr[i]) && c < st.peak - this.trailATR * st.atr[i]) exit = true;
+          if (this.maxHold && held >= this.maxHold) exit = true;
           if (exit) {
             holding[k] = 0;
+            st.exitDay = i;
+            changed = true;
+          }
+        }
+        // 2) 再处理入场：候选多于空余仓位时按 20 日动量择优
+        let free = slots - holding.reduce((a, b) => a + b, 0);
+        if (free > 0) {
+          const cands = [];
+          for (let k = 0; k < N; k++) {
+            if (holding[k]) continue;
+            const st = state[k];
+            if (!fin(close[symbols[k]][i]) || i - st.exitDay <= this.cooldown) continue;
+            const enter = this.entry === 'all' ? allOf(st, entryIdx, i, 1) : anyOf(st, entryIdx, i, 1);
+            if (enter) cands.push(k);
+          }
+          if (cands.length > free && this.maxPositions > 0) {
+            const score = (k) => {
+              const c = close[symbols[k]];
+              const r = c[i] / c[Math.max(state[k].first, i - 20)] - 1;
+              return fin(r) ? r : -Infinity;
+            };
+            cands.sort((a, b) => score(b) - score(a));
+          }
+          for (const k of cands.slice(0, free)) {
+            const st = state[k];
+            holding[k] = 1;
+            st.entryPx = close[symbols[k]][i];
+            st.peak = st.entryPx;
+            st.entryDay = i;
             changed = true;
           }
         }
         if (!changed) continue;
-        const count = holding.reduce((a, b) => a + b, 0);
-        const w = this.sizing === 'equal' ? (count ? 1 / count : 0) : 1 / N;
-        out[i] = Array.from(holding, (h) => (h ? w : 0));
+        out[i] = this.weights(holding, state, i, slots);
       }
       return out;
     }
+
+    weights(holding, state, i, slots) {
+      const count = holding.reduce((a, b) => a + b, 0);
+      if (this.sizing === 'invvol' && count) {
+        // 波动率倒数加权；缺波动率数据的按持仓均值处理
+        const inv = Array.from(holding, (h, k) => (h && state[k].vol[i] > 0 ? 1 / state[k].vol[i] : 0));
+        const known = inv.filter((v) => v > 0);
+        const fill = known.length ? known.reduce((a, b) => a + b, 0) / known.length : 1;
+        const raw = Array.from(holding, (h, k) => (h ? inv[k] || fill : 0));
+        const total = raw.reduce((a, b) => a + b, 0);
+        const budget = Math.min(1, count / slots) || 0;
+        return raw.map((v) => (v / total) * budget);
+      }
+      const w = this.sizing === 'equal' ? (count ? 1 / count : 0) : 1 / slots;
+      return Array.from(holding, (h) => (h ? w : 0));
+    }
   }
 
-  const api = { RULES, RISK_PARAMS, RuleStrategy, defaultParams };
+  const api = { RULES, RISK_PARAMS, ROLES, RuleStrategy, defaultParams, annVol };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else Object.assign(root.AQ, api);
 })(typeof globalThis !== 'undefined' ? globalThis : this);

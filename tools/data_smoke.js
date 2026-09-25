@@ -72,8 +72,12 @@ function check(sym, d) {
     method: 'grid', objective: 'sharpe', minTrades: 5,
     wf: { enabled: true, trainYears: 3, testYears: 1 },
   });
-  lines.push(`**优化** ${opt.trials} 组，样本内最优夏普 ${opt.top[0].is.sharpe.toFixed(2)}，样本外 ${opt.top[0].oos.sharpe.toFixed(2)}，` +
-    `真实夏普>0 概率 ${pct(opt.dsr.prob)}；滚动前推 ${opt.wf.windows.length} 个窗口，样本外年化 ${pct(opt.wf.stats.cagr)}`);
+  lines.push(`**优化** ${opt.trials} 组；训练集最优夏普 ${opt.top[0].tr.sharpe.toFixed(2)}；选定参数验证集夏普 ${opt.selected.va.sharpe.toFixed(2)}、` +
+    `测试集夏普 ${opt.test.stats.sharpe.toFixed(2)}（α ${pct(opt.test.rel.alpha)}，β ${opt.test.rel.beta.toFixed(2)}）；` +
+    `真实夏普>0 概率 ${pct(opt.dsr.prob)}；滚动前推 ${opt.wf.windows.length} 个窗口，年化 ${pct(opt.wf.stats.cagr)}`);
+
+  const fac = AQ.summarize(bt.run(new R.FactorStrategy({ factors: [{ id: 'roc60', weight: 1 }, { id: 'vol20', weight: -1 }], topN: 2, rebalance: 20, trendN: 60 })));
+  lines.push(`**多因子** 60 日动量 + 低波动、持有 2 只、趋势过滤：年化 ${pct(fac.cagr)}，夏普 ${fac.sharpe.toFixed(2)}，最大回撤 ${pct(fac.max_drawdown)}`);
 
   const ic = R.factorIC(bt, 5);
   lines.push('', '**因子 IC（未来 5 日）**', '', '| 因子 | 时序 IC | t | 截面 IC | t |', '|---|---|---|---|---|');

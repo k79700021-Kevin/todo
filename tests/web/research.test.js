@@ -5,7 +5,8 @@ const path = require('node:path');
 
 const docs = path.join(__dirname, '..', '..', 'docs');
 const AQ = require(path.join(docs, 'engine.js'));
-const { RuleStrategy } = require(path.join(docs, 'rules.js'));
+const AQ_RULES = require(path.join(docs, 'rules.js'));
+const { RuleStrategy } = AQ_RULES;
 const R = require(path.join(docs, 'research.js'));
 const em = require(path.join(docs, 'eastmoney.js'));
 
@@ -115,8 +116,9 @@ test('equal sizing splits capital among held symbols', () => {
   }
 });
 
-test('optimize: grid enumerates every combination and ranks by in-sample objective', () => {
+test('optimize: train ranks, validation selects, test is computed only for the selection', () => {
   const data = { '510300': series(1500, 3), '510500': series(1500, 4), '159915': series(1500, 5) };
+  const dates = new AQ.Backtester(data, {}).dates;
   const space = [
     { path: 'r0.fast', label: '快线', values: [5, 10, 20] },
     { path: 'r0.slow', label: '慢线', values: [10, 30, 60] },
@@ -129,21 +131,77 @@ test('optimize: grid enumerates every combination and ranks by in-sample objecti
     method: 'grid',
     objective: 'sharpe',
     minTrades: 0,
+    valStart: dates[900],
+    testStart: dates[1200],
     wf: { enabled: true, trainYears: 2, testYears: 1, anchored: false },
   });
-  // fast >= slow 的组合（10/10、20/10）无效
   assert.equal(res.trials + res.invalid, 9);
-  assert.equal(res.invalid, 2);
-  const scores = res.top.map((t) => t.is.sharpe);
-  for (let i = 1; i < scores.length; i++) assert.ok(scores[i - 1] >= scores[i]);
+  assert.equal(res.invalid, 2); // fast >= slow
+  assert.equal(res.splits.valStart, dates[900]);
+  assert.equal(res.splits.testStart, dates[1200]);
+  const trainScores = res.top.map((t) => t.tr.sharpe);
+  for (let i = 1; i < trainScores.length; i++) assert.ok(trainScores[i - 1] >= trainScores[i]);
+  // 选定参数来自训练排名前列里验证集最好的一组
+  const shortlist = res.top.slice(0, res.shortlist);
+  const bestVal = Math.max(...shortlist.map((t) => t.va.sharpe));
+  assert.equal(res.selected.va.sharpe, bestVal);
+  // 测试集只有选定参数一组，且与选定参数一致；训练/验证表中不含测试集数据
+  assert.deepEqual(res.test.combo, res.selected.combo);
+  assert.ok(res.top.every((t) => !('te' in t) && !('test' in t)));
+  assert.equal(res.test.dates[0], dates[1199]);
+  close(res.test.equity[0], 1);
+  // 滚动前推只用到测试集之前的数据
+  const lastWf = res.wf.dates[res.wf.dates.length - 1];
+  assert.ok(lastWf < dates[1200], `前推结束于 ${lastWf}`);
   assert.ok(res.dsr && res.dsr.prob >= 0 && res.dsr.prob <= 1);
+});
 
-  // 滚动前推：测试窗口首尾相接，拼接净值与日期等长
-  const w = res.wf.windows;
-  assert.ok(w.length >= 3);
-  for (let i = 1; i < w.length; i++) assert.equal(w[i].test[0], w[i - 1].test[1]);
-  assert.equal(res.wf.equity.length, res.wf.dates.length);
-  assert.equal(res.wf.dates[res.wf.dates.length - 1], res.dates[1]);
+test('optimize rejects splits that leave a segment too short', () => {
+  const data = { '510300': series(600, 3) };
+  const dates = new AQ.Backtester(data, {}).dates;
+  const base = { data, engine: { fees: {} }, config: { rules: [{ id: 'price_ma' }] }, space: [{ path: 'r0.n', values: [10, 20] }] };
+  assert.throws(() => R.optimize({ ...base, valStart: dates[50], testStart: dates[400] }), /训练集/);
+  assert.throws(() => R.optimize({ ...base, valStart: dates[300], testStart: dates[330] }), /验证集/);
+  assert.throws(() => R.optimize({ ...base, valStart: dates[300], testStart: dates[580] }), /测试集/);
+});
+
+test('relative stats: benchmark against itself has beta 1 and zero alpha', () => {
+  const eq = series(500, 8).close;
+  const rel = R.relativeStats(eq, eq, 0, eq.length - 1, 0.02);
+  close(rel.beta, 1, 1e-9);
+  close(rel.alpha, 0, 1e-9);
+  close(rel.trackingError, 0, 1e-12);
+  const lev = eq.map((v, i) => (i ? null : v));
+  for (let i = 1; i < eq.length; i++) lev[i] = lev[i - 1] * (1 + 2 * (eq[i] / eq[i - 1] - 1));
+  close(R.relativeStats(lev, eq, 0, eq.length - 1, 0).beta, 2, 1e-9);
+});
+
+test('round trips pair entries and exits per symbol', () => {
+  const dates = dayList(10);
+  const trades = [
+    { date: dates[1], symbol: 'A', side: 'buy', shares: 100, amount: 1000, fee: 5 },
+    { date: dates[4], symbol: 'A', side: 'sell', shares: 100, amount: 1200, fee: 5 },
+    { date: dates[2], symbol: 'B', side: 'buy', shares: 100, amount: 1000, fee: 5 },
+    { date: dates[3], symbol: 'B', side: 'buy', shares: 100, amount: 1000, fee: 5 },
+    { date: dates[6], symbol: 'B', side: 'sell', shares: 200, amount: 1800, fee: 5 },
+    { date: dates[7], symbol: 'A', side: 'buy', shares: 100, amount: 1000, fee: 5 },
+  ].sort((a, b) => (a.date < b.date ? -1 : 1));
+  const rt = R.roundTrips(trades, dates);
+  assert.equal(rt.count, 2);
+  assert.equal(rt.open, 1);
+  close(rt.winRate, 0.5);
+  close(rt.list.find((x) => x.symbol === 'A').pnl, 190);
+  close(rt.list.find((x) => x.symbol === 'B').pnl, 1795 - 2010);
+  close(rt.profitFactor, 190 / 215);
+  close(rt.avgDays, (3 + 4) / 2);
+});
+
+test('monthly returns chain to the total return', () => {
+  const d = series(400, 12);
+  const m = R.monthlyReturns(d.dates, d.close);
+  let total = 1;
+  for (const y of m.years) m.rows[y].months.forEach((r) => { if (r !== null) total *= 1 + r; });
+  close(total, d.close[d.close.length - 1] / d.close[0], 1e-9);
 });
 
 test('optimize: random search samples unique combinations', () => {
@@ -194,4 +252,125 @@ test('engine never trades at a non-positive price', () => {
   const res = bt.run(new AQ.BuyAndHold());
   assert.ok(res.trades.every((t) => t.price > 0 && Number.isFinite(t.shares)));
   assert.ok(res.equity.every(Number.isFinite));
+});
+
+// ---------- 规则策略：用途、持仓上限、持有期、冷却、波动率加权 ----------
+
+function frame(pxBySym, dates) {
+  const data = {};
+  for (const [s, px] of Object.entries(pxBySym)) {
+    data[s] = { dates, open: px, close: px, high: px.map((p) => p * 1.01), low: px.map((p) => p * 0.99), volume: px.map(() => 1e6) };
+  }
+  return new AQ.Backtester(data, { rebalanceBand: 0 }).bars();
+}
+const dayList = (n) => Array.from({ length: n }, (_, i) => new Date(Date.UTC(2020, 0, 1) + i * 86400000).toISOString().slice(0, 10));
+const ramp = (n, start, step) => Array.from({ length: n }, (_, i) => start + i * step);
+
+test('rule roles: exit-only rules never trigger entries', () => {
+  const dates = dayList(60);
+  const b = frame({ '510300': ramp(60, 10, 0.1) }, dates);
+  // price_ma 看多但只用于出场、没有入场规则 → 构造时报错
+  assert.throws(() => new RuleStrategy({ rules: [{ id: 'price_ma', params: { n: 10 }, role: 'exit' }] }), /入场/);
+  // 入场用均线；出场只看"放量"（永远不会给出 -1）→ 一直持有
+  const rows = new RuleStrategy({
+    rules: [{ id: 'price_ma', params: { n: 10 }, role: 'entry' }, { id: 'vol_surge', role: 'exit' }],
+  }).generate(b.close, dates, ['510300'], b);
+  const emitted = rows.filter(Boolean);
+  assert.equal(emitted.length, 2);
+  assert.equal(emitted[1][0], 1);
+});
+
+test('maxPositions keeps the strongest momentum candidates', () => {
+  const n = 80;
+  const dates = dayList(n);
+  const px = { A: ramp(n, 10, 0.05), B: ramp(n, 10, 0.2), C: ramp(n, 10, 0.1) };
+  const b = frame(px, dates);
+  const rows = new RuleStrategy({ rules: [{ id: 'price_ma', params: { n: 10 } }], maxPositions: 1 })
+    .generate(b.close, dates, ['A', 'B', 'C'], b);
+  const first = rows.find((r) => r && r.some((w) => w > 0));
+  assert.deepEqual(first, [0, 1, 0], '只买 20 日动量最强的 B');
+});
+
+test('minHold defers signal exits but not stop losses; maxHold forces exits; cooldown blocks re-entry', () => {
+  const n = 60;
+  const dates = dayList(n);
+  // 上涨 25 天后横盘在均线下方 3 天再继续上涨
+  const px = ramp(n, 10, 0.1).map((p, i) => (i >= 25 && i < 28 ? 11.5 : p));
+  const b = frame({ X: px }, dates);
+  const run = (extra) => new RuleStrategy({ rules: [{ id: 'price_ma', params: { n: 5 } }], ...extra }).generate(b.close, dates, ['X'], b);
+  const exitDay = (rows) => rows.findIndex((r, i) => r && r[0] === 0 && i > 5);
+  const entryDays = (rows) => rows.map((r, i) => (r && r[0] > 0 ? i : -1)).filter((i) => i >= 0);
+  assert.equal(exitDay(run({})), 25);
+  assert.ok(exitDay(run({ minHold: 30 })) === -1 || exitDay(run({ minHold: 30 })) > 25, '最短持有期内不因信号离场');
+  assert.equal(exitDay(run({ maxHold: 10 })), entryDays(run({}))[0] + 10, '持有满 10 天强制离场');
+  const plainReentry = entryDays(run({}))[1];
+  const coolReentry = entryDays(run({ cooldown: 10 }))[1];
+  assert.ok(coolReentry >= 25 + 11 && coolReentry > plainReentry, `冷却期内不再入场：${plainReentry} → ${coolReentry}`);
+});
+
+test('inverse-volatility sizing gives the calmer asset more weight', () => {
+  const n = 80;
+  const dates = dayList(n);
+  const calm = ramp(n, 10, 0.05);
+  const wild = ramp(n, 10, 0.05).map((p, i) => p * (1 + (i % 2 ? 0.03 : -0.03)));
+  const b = frame({ calm, wild }, dates);
+  const rows = new RuleStrategy({ rules: [{ id: 'ma_slope', params: { n: 25, k: 2 } }], sizing: 'invvol' })
+    .generate(b.close, dates, ['calm', 'wild'], b);
+  const both = rows.filter((r) => r && r[0] > 0 && r[1] > 0).pop();
+  assert.ok(both && both[0] > both[1], JSON.stringify(both));
+  close(both[0] + both[1], 1, 1e-9);
+});
+
+test('new indicator rules produce signals within range', () => {
+  const d = series(600, 21);
+  const data = { '600000': d };
+  const b = new AQ.Backtester(data, {}).bars();
+  for (const id of ['dmi', 'cci', 'willr', 'vol_surge', 'vol_filter', 'ma_slope', 'obv_trend']) {
+    // 测试数据的成交量波动小，放量倍数取 1
+    const p = { ...AQ_RULES.defaultParams(id), ...(id === 'vol_surge' ? { k: 1 } : {}) };
+    const sig = AQ_RULES.RULES[id].signal(b, '600000', p);
+    const vals = new Set(sig);
+    assert.ok([...vals].every((v) => v === -1 || v === 0 || v === 1), id);
+    assert.ok(vals.has(1), `${id} 至少出现一次看多`);
+  }
+});
+
+// ---------- 多因子选股 ----------
+
+test('factor strategy buys the top-ranked names and respects weight sign', () => {
+  const n = 150;
+  const dates = dayList(n);
+  const px = { A: ramp(n, 10, 0.02), B: ramp(n, 10, 0.08), C: ramp(n, 10, 0.05), D: ramp(n, 10, 0.01) };
+  const b = frame(px, dates);
+  const syms = ['A', 'B', 'C', 'D'];
+  const pick = (cfg) => new R.FactorStrategy(cfg).generate(b.close, dates, syms, b).find(Boolean);
+  // 动量越大越好 → 买 B、C
+  assert.deepEqual(pick({ factors: [{ id: 'roc20', weight: 1 }], topN: 2, rebalance: 20 }), [0, 0.5, 0.5, 0]);
+  // 权重为负 → 买动量最弱的 D、A
+  assert.deepEqual(pick({ factors: [{ id: 'roc20', weight: -1 }], topN: 2, rebalance: 20 }), [0.5, 0, 0, 0.5]);
+  assert.throws(() => new R.FactorStrategy({ factors: [{ id: 'roc20', weight: 0 }] }), /权重不为 0/);
+});
+
+test('factor strategy trend filter moves to cash in a falling market', () => {
+  const n = 150;
+  const dates = dayList(n);
+  const down = (start) => Array.from({ length: n }, (_, i) => start * Math.pow(0.995, i));
+  const b = frame({ A: down(10), B: down(20), C: down(15) }, dates);
+  const rows = new R.FactorStrategy({ factors: [{ id: 'roc20', weight: 1 }], topN: 1, rebalance: 5, trendN: 20 })
+    .generate(b.close, dates, ['A', 'B', 'C'], b).filter(Boolean);
+  assert.ok(rows.length >= 1 && rows.every((r) => r.every((w) => w === 0)), '一路下跌时始终空仓');
+});
+
+test('applyParams keeps rule roles and handles factor weights', () => {
+  const cfg = { rules: [{ id: 'price_ma', role: 'exit', params: { n: 20 } }, { id: 'macd', role: 'entry', params: {} }],
+    type: 'rules', factor: { factors: [{ id: 'roc20', weight: 1 }], topN: 2 } };
+  const out = R.applyParams(cfg, [{ path: 'r0.n' }, { path: 'f0.weight' }, { path: 'fs.topN' }, { path: 'risk.maxPositions' }], [60, -1, 3, 2]);
+  assert.equal(out.rules[0].role, 'exit');
+  assert.equal(out.rules[0].params.n, 60);
+  assert.equal(out.factor.factors[0].weight, -1);
+  assert.equal(out.factor.topN, 3);
+  assert.equal(out.maxPositions, 2);
+  assert.equal(cfg.rules[0].params.n, 20, '不修改原配置');
+  // 规则未写 params 时也能套用参数
+  assert.equal(R.applyParams({ rules: [{ id: 'macd' }] }, [{ path: 'r0.fast' }], [8]).rules[0].params.fast, 8);
 });

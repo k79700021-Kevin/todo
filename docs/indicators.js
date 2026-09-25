@@ -152,7 +152,71 @@
     return sma(tr, n);
   }
 
-  const api = { sma, ema, smooth, stdev, highest, lowest, shift, roc, macd, rsi, boll, kdj, atr };
+  function rollingSum(x, n) {
+    const out = nan(x.length);
+    for (let i = n - 1; i < x.length; i++) {
+      let s = 0;
+      let valid = true;
+      for (let j = i - n + 1; j <= i; j++) {
+        if (!ok(x[j])) { valid = false; break; }
+        s += x[j];
+      }
+      if (valid) out[i] = s;
+    }
+    return out;
+  }
+
+  // DMI（通达信口径）：TR、+DM、-DM 取 N 日累加，ADX 为 DX 的 M 日均值
+  function dmi(high, low, close, n = 14, m = 6) {
+    const len = close.length;
+    const tr = nan(len), dp = nan(len), dm = nan(len);
+    for (let i = 1; i < len; i++) {
+      tr[i] = Math.max(high[i] - low[i], Math.abs(high[i] - close[i - 1]), Math.abs(close[i - 1] - low[i]));
+      const hd = high[i] - high[i - 1];
+      const ld = low[i - 1] - low[i];
+      dp[i] = hd > 0 && hd > ld ? hd : 0;
+      dm[i] = ld > 0 && ld > hd ? ld : 0;
+    }
+    const str = rollingSum(tr, n), sdp = rollingSum(dp, n), sdm = rollingSum(dm, n);
+    const pdi = str.map((t, i) => (t > 0 ? (sdp[i] * 100) / t : NaN));
+    const mdi = str.map((t, i) => (t > 0 ? (sdm[i] * 100) / t : NaN));
+    const dx = pdi.map((p, i) => (p + mdi[i] > 0 ? (Math.abs(mdi[i] - p) / (mdi[i] + p)) * 100 : ok(p) ? 0 : NaN));
+    return { pdi, mdi, adx: sma(dx, m) };
+  }
+
+  // CCI = (TP - MA(TP,N)) / (0.015 × 平均绝对偏差)，TP = (H+L+C)/3
+  function cci(high, low, close, n = 14) {
+    const tp = close.map((c, i) => (high[i] + low[i] + c) / 3);
+    const ma = sma(tp, n);
+    const out = nan(close.length);
+    for (let i = n - 1; i < close.length; i++) {
+      if (!ok(ma[i])) continue;
+      let md = 0;
+      for (let j = i - n + 1; j <= i; j++) md += Math.abs(tp[j] - ma[i]);
+      md /= n;
+      out[i] = md > 0 ? (tp[i] - ma[i]) / (0.015 * md) : 0;
+    }
+    return out;
+  }
+
+  // 威廉指标（通达信口径）：100 × (N 日最高 - 收盘) / (N 日最高 - N 日最低)，0 为最强、100 为最弱
+  function willr(high, low, close, n = 14) {
+    const hh = highest(high, n), ll = lowest(low, n);
+    return close.map((c, i) => (!ok(hh[i]) || !ok(ll[i]) ? NaN : hh[i] > ll[i] ? (100 * (hh[i] - c)) / (hh[i] - ll[i]) : 50));
+  }
+
+  // 能量潮：收盘上涨累加成交量、下跌累减
+  function obv(close, volume) {
+    const out = nan(close.length);
+    let acc = 0;
+    for (let i = 0; i < close.length; i++) {
+      if (i && ok(close[i]) && ok(close[i - 1]) && ok(volume[i])) acc += Math.sign(close[i] - close[i - 1]) * volume[i];
+      out[i] = acc;
+    }
+    return out;
+  }
+
+  const api = { sma, ema, smooth, stdev, highest, lowest, shift, roc, macd, rsi, boll, kdj, atr, rollingSum, dmi, cci, willr, obv };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else (root.AQ = root.AQ || {}).ind = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
