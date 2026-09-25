@@ -167,12 +167,13 @@
   /* 通缩夏普比率（Bailey & López de Prado, 2014）。
    * srs：所有试验的日频夏普；best：选中者的日频夏普；T：样本天数；skew/kurt：选中者日收益的偏度与（非超额）峰度。
    * 返回在"试了这么多次"的前提下，真实夏普 > 0 的概率。 */
-  function deflatedSharpe(srs, best, T, skew, kurt) {
-    const N = srs.length;
+  function deflatedSharpe(srs, best, T, skew, kurt, trials) {
+    // trials：累计试验次数（含以前在同一份数据上做过的），不小于本次的试验数；方差仍按本次试验估计
+    const N = Math.max(srs.length, trials || 0);
     let sr0 = 0;
-    if (N >= 2) {
+    if (N >= 2 && srs.length >= 2) {
       const m = mean(srs);
-      const v = srs.reduce((a, x) => a + (x - m) ** 2, 0) / (N - 1);
+      const v = srs.reduce((a, x) => a + (x - m) ** 2, 0) / (srs.length - 1);
       const g = 0.5772156649015329;
       sr0 = Math.sqrt(v) * ((1 - g) * normInv(1 - 1 / N) + g * normInv(1 - 1 / (N * Math.E)));
     }
@@ -321,7 +322,11 @@
       const srs = eligible.map((e) => e.tr.srDaily).filter(fin);
       const bestEq = best.eq || Float64Array.from(bt.run(buildStrategy(applyParams(config, space, best.combo))).equity);
       const mom = moments(returnsOf(Array.from(bestEq.subarray(0, v))));
-      dsr = deflatedSharpe(srs, best.tr.srDaily, trEnd, mom.skew, mom.kurt);
+      const prior = Math.max(0, Math.floor(input.priorTrials || 0));
+      dsr = deflatedSharpe(srs, best.tr.srDaily, trEnd, mom.skew, mom.kurt, srs.length + prior);
+      dsr.thisRun = srs.length;
+      dsr.prior = prior;
+      dsr.probThisRun = deflatedSharpe(srs, best.tr.srDaily, trEnd, mom.skew, mom.kurt).prob;
       dsr.sr0Annual = dsr.sr0 * Math.sqrt(TD);
       dsr.bestAnnual = best.tr.srDaily * Math.sqrt(TD);
     }
@@ -336,15 +341,16 @@
         combo: selected.combo,
         stats: segStats(eq, vaEnd, last, rf),
         rel: relativeStats(eq, bench.equity, vaEnd, last, rf),
+        exposure: exposure(eq, styleFactors(bt, rf), vaEnd, last, rf),
         bench: segStats(bench.equity, vaEnd, last, rf),
-        trades: roundTrips(res.trades.filter((tr) => tr.date >= dates[t]), dates),
+        trades: roundTrips(res.trades, dates, dates[t]),
         dates: dates.slice(vaEnd),
         equity: seg(eq),
         benchEquity: seg(bench.equity),
       };
     }
 
-    const wf = keepEquity ? walkForward(entries, bench.equity, dates.slice(0, t), input.wf, objective, minTrades, rf) : null;
+    const wf = keepEquity ? walkForward(entries, bt, bench.equity, dates.slice(0, t), input.wf, objective, minTrades, rf, config, space) : null;
     const slim = (e) => ({ combo: e.combo, tr: e.tr, va: e.va, trTrades: e.trTrades, vaTrades: e.vaTrades, trainRank: e.trainRank });
     return {
       dates: [dates[0], dates[last]],
@@ -389,28 +395,35 @@
     };
   }
 
-  /* 按笔统计：同一标的从空仓到建仓再回到空仓算一笔。收益 = (卖出所得 - 买入花费) / 买入花费，均含费用 */
-  function roundTrips(trades, dates) {
+  /* 按笔统计：同一标的从空仓到建仓再回到空仓算一笔，收益 = (卖出所得 - 买入花费) / 买入花费，均含费用。
+   * 始终在完整成交记录上配对；给出 from/to 时只统计在该区间内平仓的交易，
+   * 其中建仓早于 from 的记为"跨区间"，区间结束时仍未平仓的记为"持仓中"。 */
+  function roundTrips(trades, dates, from, to) {
     const idx = new Map(dates.map((d, i) => [d, i]));
+    const lo = from || '0000', hi = to || '9999';
     const open = {}, done = [];
     for (const tr of trades) {
+      if (tr.date > hi) break;
       let p = open[tr.symbol];
       if (!p) p = open[tr.symbol] = { symbol: tr.symbol, start: tr.date, shares: 0, cost: 0, proceeds: 0 };
       if (tr.side === 'buy') { p.shares += tr.shares; p.cost += tr.amount + tr.fee; }
       else { p.shares -= tr.shares; p.proceeds += tr.amount - tr.fee; }
       if (p.shares <= 0) {
-        done.push({ symbol: p.symbol, start: p.start, end: tr.date, pnl: p.proceeds - p.cost, ret: p.cost > 0 ? p.proceeds / p.cost - 1 : NaN,
-          days: (idx.get(tr.date) ?? 0) - (idx.get(p.start) ?? 0) });
+        if (tr.date >= lo) {
+          done.push({ symbol: p.symbol, start: p.start, end: tr.date, pnl: p.proceeds - p.cost, ret: p.cost > 0 ? p.proceeds / p.cost - 1 : NaN,
+            days: (idx.get(tr.date) ?? 0) - (idx.get(p.start) ?? 0), spanning: p.start < lo });
+        }
         delete open[tr.symbol];
       }
     }
     const wins = done.filter((x) => x.pnl > 0), losses = done.filter((x) => x.pnl <= 0);
-    const avg = (a, f) => (a.length ? a.reduce((s, x) => s + f(x), 0) / a.length : NaN);
+    const avg = (a, f) => (a.length ? a.reduce((acc, x) => acc + f(x), 0) / a.length : NaN);
     const grossWin = wins.reduce((a, x) => a + x.pnl, 0), grossLoss = -losses.reduce((a, x) => a + x.pnl, 0);
     const avgWin = avg(wins, (x) => x.ret), avgLoss = avg(losses, (x) => x.ret);
     return {
       count: done.length,
       open: Object.keys(open).length,
+      spanning: done.filter((x) => x.spanning).length,
       winRate: done.length ? wins.length / done.length : NaN,
       avgWin, avgLoss,
       payoff: avgLoss < 0 ? avgWin / -avgLoss : NaN,
@@ -439,13 +452,60 @@
     return { years: Object.keys(rows), rows };
   }
 
-  function walkForward(entries, benchEq, dates, opts, objective, minTrades, rf) {
+  /* 连续账户上的多段策略：每段由当时选出的参数驱动，同一个账户跨段运行。
+   * 切换时新参数接手现有持仓（按新参数的出场规则决定去留），其余通过引擎实际调仓，含费用与涨跌停限制。
+   * segments: [{ from, to, strategy }]，from/to 为做决策的交易日序号（闭区间），段外空仓不交易。 */
+  class SwitchingStrategy {
+    constructor(segments) {
+      this.name = 'walkforward';
+      this.segments = segments;
+    }
+
+    params() {
+      return { windows: this.segments.length };
+    }
+
+    prepare(close, dates, symbols, bars) {
+      this.symbols = symbols;
+      for (const seg of this.segments) {
+        if (typeof seg.strategy.decide === 'function') seg.strategy.prepare(close, dates, symbols, bars);
+        else seg.rows = seg.strategy.generate(close, dates, symbols, bars);
+      }
+    }
+
+    decide(i, ctx) {
+      const seg = this.segments.find((x) => i >= x.from && i <= x.to);
+      if (!seg) return null;
+      const st = seg.strategy;
+      if (typeof st.decide === 'function') {
+        if (i === seg.from) {
+          // 接手现有持仓与尚未成交的订单（如跌停没卖出的仍视为要卖）
+          this.symbols.forEach((s, k) => {
+            const want = ctx.pending && ctx.pending.has(s) ? ctx.pending.get(s) > 0 : ctx.shares[s] > 0;
+            st.ctx.desired[k] = want ? 1 : 0;
+          });
+          st.ctx.emitted = false;
+        }
+        return st.decide(i, ctx);
+      }
+      if (i === seg.from) {
+        // 切换到按信号序列运行的策略：立即调整到该参数当前应持有的组合
+        for (let j = i; j >= 0; j--) if (seg.rows[j]) return seg.rows[j];
+        return this.symbols.map(() => 0);
+      }
+      return seg.rows[i];
+    }
+  }
+
+  /* 滚动前推（连续账户）：每个窗口只用此前的数据（训练窗口内的净值）选参，
+   * 然后由一个账户按选出的参数连续交易，窗口切换产生真实的调仓与成本。
+   * dates 只含训练+验证段，不触碰测试集。 */
+  function walkForward(entries, bt, benchEq, dates, opts, objective, minTrades, rf, config, space) {
     const n = dates.length;
     const train = Math.round((opts.trainYears || 3) * TD);
     const test = Math.round((opts.testYears || 1) * TD);
     if (train + 20 >= n) throw new Error('训练+验证段太短，放不下一个滚动前推的训练窗口，请缩短训练窗口年数');
     const windows = [];
-    const eqS = [1], bS = [1], dS = [dates[train]];
     for (let t0 = train; t0 < n - 1; t0 += test) {
       const a = opts.anchored ? 0 : t0 - train;
       const b = Math.min(t0 + test, n - 1);
@@ -456,29 +516,173 @@
         if (sc > bestScore) { bestScore = sc; best = e; }
       }
       if (!best) best = entries[0];
-      for (let j = t0 + 1; j <= b; j++) {
-        eqS.push(eqS[eqS.length - 1] * (best.eq[j] / best.eq[j - 1]));
-        bS.push(bS[bS.length - 1] * (benchEq[j] / benchEq[j - 1]));
-        dS.push(dates[j]);
-      }
-      const ts = segStats(best.eq, t0, b, rf);
-      windows.push({
-        train: [dates[a], dates[t0]],
-        test: [dates[t0], dates[b]],
-        combo: best.combo,
-        trainScore: bestScore,
-        testReturn: ts ? ts.total_return : NaN,
-        testSharpe: ts ? ts.sharpe : NaN,
-        benchReturn: benchEq[b] / benchEq[t0] - 1,
-      });
+      windows.push({ a, t0, b, combo: best.combo, trainScore: bestScore });
     }
+    // 决策日 t0..b-1 属于该窗口（在 t0 收盘用 t0 及以前的数据决策，t0+1 开盘成交）
+    const segments = windows.map((w, k) => ({
+      from: w.t0,
+      to: k < windows.length - 1 ? windows[k + 1].t0 - 1 : w.b - 1,
+      strategy: buildStrategy(applyParams(config, space, w.combo)),
+    }));
+    const res = bt.run(new SwitchingStrategy(segments));
+    const first = windows[0].t0, last = windows[windows.length - 1].b;
+    const eqS = res.equity.slice(first, last + 1).map((v) => v / res.equity[first]);
+    const bS = benchEq.slice(first, last + 1).map((v) => v / benchEq[first]);
+    const trades = res.trades.filter((tr) => tr.date > dates[first] && tr.date <= dates[last]);
+    const traded = trades.reduce((acc, tr) => acc + tr.amount, 0);
+    const years = (last - first) / TD;
+    const meanEq = res.equity.slice(first, last + 1).reduce((acc, v) => acc + v, 0) / (last - first + 1);
     return {
-      windows,
-      dates: dS,
+      windows: windows.map((w) => ({
+        train: [dates[w.a], dates[w.t0]],
+        test: [dates[w.t0], dates[w.b]],
+        combo: w.combo,
+        trainScore: w.trainScore,
+        testReturn: res.equity[w.b] / res.equity[w.t0] - 1,
+        benchReturn: benchEq[w.b] / benchEq[w.t0] - 1,
+      })),
+      dates: dates.slice(first, last + 1),
       equity: eqS,
       bench: bS,
       stats: segStats(eqS, 0, eqS.length - 1, rf),
       benchStats: segStats(bS, 0, bS.length - 1, rf),
+      trades: roundTrips(res.trades, bt.dates, dates[first], dates[last]),
+      fees: trades.reduce((acc, tr) => acc + tr.fee, 0) / res.equity[first],
+      turnover: years > 0 ? traded / meanEq / years : NaN,
+    };
+  }
+
+  // ---------- 暴露归因 ----------
+
+  // 解线性方程组 A x = B 的逆矩阵（高斯-约当，k 很小）
+  function invert(A) {
+    const k = A.length;
+    const M = A.map((row, i) => row.concat(Array.from({ length: k }, (_, j) => (i === j ? 1 : 0))));
+    for (let c = 0; c < k; c++) {
+      let p = c;
+      for (let r = c + 1; r < k; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+      if (Math.abs(M[p][c]) < 1e-14) return null;
+      [M[c], M[p]] = [M[p], M[c]];
+      const d = M[c][c];
+      for (let j = 0; j < 2 * k; j++) M[c][j] /= d;
+      for (let r = 0; r < k; r++) {
+        if (r === c) continue;
+        const f = M[r][c];
+        if (f) for (let j = 0; j < 2 * k; j++) M[r][j] -= f * M[c][j];
+      }
+    }
+    return M.map((row) => row.slice(k));
+  }
+
+  /* 最小二乘 + Newey–West HAC 标准误。X 每行不含常数项（自动加截距）。
+   * lag 默认 floor(4·(T/100)^(2/9))。返回 { coef, se, t, r2, n, lag }，coef[0] 为截距。 */
+  function olsHAC(y, X, lag) {
+    const T = y.length;
+    const Z = X.map((row) => [1].concat(row));
+    const k = Z[0].length;
+    const XtX = Array.from({ length: k }, () => new Array(k).fill(0));
+    const Xty = new Array(k).fill(0);
+    for (let t = 0; t < T; t++) {
+      for (let i = 0; i < k; i++) {
+        Xty[i] += Z[t][i] * y[t];
+        for (let j = 0; j < k; j++) XtX[i][j] += Z[t][i] * Z[t][j];
+      }
+    }
+    const inv = invert(XtX);
+    if (!inv) return null;
+    const coef = inv.map((row) => row.reduce((acc, v, j) => acc + v * Xty[j], 0));
+    const u = y.map((v, t) => v - Z[t].reduce((acc, x, j) => acc + x * coef[j], 0));
+    const L = lag ?? Math.floor(4 * Math.pow(T / 100, 2 / 9));
+    const S = Array.from({ length: k }, () => new Array(k).fill(0));
+    for (let l = 0; l <= L; l++) {
+      const w = l === 0 ? 1 : 1 - l / (L + 1);
+      for (let t = l; t < T; t++) {
+        const uu = u[t] * u[t - l] * w;
+        for (let i = 0; i < k; i++) {
+          for (let j = 0; j < k; j++) {
+            S[i][j] += l === 0 ? uu * Z[t][i] * Z[t][j] : uu * (Z[t][i] * Z[t - l][j] + Z[t - l][i] * Z[t][j]);
+          }
+        }
+      }
+    }
+    const V = inv.map((row) => S[0].map((_, j) => row.reduce((acc, v, m) => acc + v * S[m].reduce((a2, s2, q) => a2 + s2 * inv[q][j], 0), 0)));
+    const se = V.map((row, i) => Math.sqrt(Math.max(row[i], 0)));
+    const my = mean(y);
+    const sst = y.reduce((acc, v) => acc + (v - my) ** 2, 0);
+    const sse = u.reduce((acc, v) => acc + v * v, 0);
+    return { coef, se, t: coef.map((c, i) => (se[i] > 0 ? c / se[i] : NaN)), r2: sst > 0 ? 1 - sse / sst : NaN, n: T, lag: L };
+  }
+
+  /* 股票池内的风格因子日收益（第 i 个元素为 i-1 收盘到 i 收盘）：
+   * MKT：全部标的等权收益 − 无风险利率；
+   * MOM：按前一日的 60 日涨幅分三组，强势组 − 弱势组；
+   * LOWVOL：按前一日的 20 日波动率分三组，低波组 − 高波组。
+   * 当日有效标的不足 6 只时，MOM 与 LOWVOL 记为 NaN。 */
+  function styleFactors(bt, rf = 0.02) {
+    const b = bt.bars();
+    const syms = bt.symbols;
+    const n = bt.dates.length;
+    const rfd = rf / TD;
+    const ret = syms.map((s) => b.close[s].map((c, i) => (i ? c / b.close[s][i - 1] - 1 : NaN)));
+    const mom = syms.map((s) => ind.roc(b.close[s], 60));
+    const vol = syms.map((_, k) => ind.stdev(Float64Array.from(ret[k], (v) => (fin(v) ? v : NaN)), 20, 1));
+    const MKT = new Float64Array(n).fill(NaN), MOM = new Float64Array(n).fill(NaN), LOWVOL = new Float64Array(n).fill(NaN);
+    const spread = (keys, i, sign) => {
+      if (keys.length < 6) return NaN;
+      keys.sort((p, q) => p[1] - q[1]);
+      const m = Math.floor(keys.length / 3);
+      const avg = (arr) => arr.reduce((acc, [k]) => acc + ret[k][i], 0) / arr.length;
+      return sign * (avg(keys.slice(-m)) - avg(keys.slice(0, m)));
+    };
+    for (let i = 1; i < n; i++) {
+      let sum = 0, cnt = 0;
+      const km = [], kv = [];
+      syms.forEach((_, k) => {
+        const r = ret[k][i];
+        if (!fin(r)) return;
+        sum += r; cnt++;
+        if (fin(mom[k][i - 1])) km.push([k, mom[k][i - 1]]);
+        if (fin(vol[k][i - 1])) kv.push([k, vol[k][i - 1]]);
+      });
+      if (!cnt) continue;
+      MKT[i] = sum / cnt - rfd;
+      MOM[i] = spread(km, i, 1);
+      LOWVOL[i] = spread(kv, i, -1);
+    }
+    return { MKT, MOM, LOWVOL };
+  }
+
+  const STYLE_LABELS = { MKT: '市场（等权）', MOM: '动量', LOWVOL: '低波动' };
+
+  /* 暴露回归：策略日超额收益 = α + Σ β·因子 + ε，区间 (a, b]。
+   * 某个因子在区间内缺失超过一半就不纳入。α 为年化，t 值用 HAC 标准误。 */
+  function exposure(eq, sf, a, b, rf = 0.02) {
+    const rfd = rf / TD;
+    const names = ['MKT', 'MOM', 'LOWVOL'].filter((k) => {
+      let ok = 0;
+      for (let i = a + 1; i <= b; i++) if (fin(sf[k][i])) ok++;
+      return ok >= (b - a) / 2 && ok >= 60;
+    });
+    if (!names.includes('MKT')) return null;
+    const y = [], X = [];
+    for (let i = a + 1; i <= b; i++) {
+      const r = eq[i] / eq[i - 1] - 1;
+      const row = names.map((k) => sf[k][i]);
+      if (!fin(r) || !row.every(fin)) continue;
+      y.push(r - rfd);
+      X.push(row);
+    }
+    if (y.length < 60) return null;
+    const fit = olsHAC(y, X);
+    if (!fit) return null;
+    return {
+      alpha: fit.coef[0] * TD,
+      alphaT: fit.t[0],
+      loadings: names.map((k, j) => ({ id: k, label: STYLE_LABELS[k], beta: fit.coef[j + 1], t: fit.t[j + 1] })),
+      r2: fit.r2,
+      n: fit.n,
+      lag: fit.lag,
+      missing: ['MOM', 'LOWVOL'].filter((k) => !names.includes(k)),
     };
   }
 
@@ -619,10 +823,10 @@
     return out;
   }
 
-  function factorPanel(bt, h) {
+  function factorPanel(bt, h, ids) {
     const b = bt.bars();
     const hasVolume = bt.symbols.every((s) => b.volume[s].some(fin));
-    const factors = FACTORS.filter((f) => !f.needsVolume || hasVolume);
+    const factors = FACTORS.filter((f) => (!f.needsVolume || hasVolume) && (!ids || ids.includes(f.id)));
     const fwd = {}, vals = {};
     for (const s of bt.symbols) {
       fwd[s] = forwardReturns(b.open[s], h);
@@ -632,30 +836,89 @@
     return { factors, fwd, vals };
   }
 
-  /* 因子 IC：非重叠抽样（每 h 天取一次），避免重叠收益虚增显著性。
-   * 时序 IC：每只标的上"因子值 vs 未来收益"的秩相关，按样本数加权合并，z = Σ n·IC / √Σn。
-   * 截面 IC：每个抽样日在标的之间做秩相关（至少 3 只），t = 均值 / 标准差 × √期数。 */
-  function factorIC(bt, h) {
+  function lcg(seed) {
+    let x = seed >>> 0 || 1;
+    return () => ((x = (x * 1664525 + 1013904223) >>> 0) / 4294967296);
+  }
+
+  // 移动块自助法：随机取长度为 L 的连续块拼成长度 T 的下标序列，保留序列相关
+  function blockIndices(T, L, rnd) {
+    const out = new Int32Array(T);
+    for (let k = 0; k < T;) {
+      const s0 = Math.floor(rnd() * (T - L + 1));
+      for (let j = 0; j < L && k < T; j++) out[k++] = s0 + j;
+    }
+    return out;
+  }
+
+  function percentile(sorted, p) {
+    if (!sorted.length) return NaN;
+    const x = p * (sorted.length - 1), i = Math.floor(x), f = x - i;
+    return i + 1 < sorted.length ? sorted[i] * (1 - f) + sorted[i + 1] * f : sorted[i];
+  }
+
+  // 按下标序列 d 取样后的相关系数，缺失值（NaN）跳过
+  function corrAt(x, y, d) {
+    let n = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+    for (const k of d) {
+      const a = x[k], b = y[k];
+      if (a !== a || b !== b) continue;
+      n++; sx += a; sy += b; sxx += a * a; syy += b * b; sxy += a * b;
+    }
+    const vx = sxx - (sx * sx) / n, vy = syy - (sy * sy) / n;
+    return n > 2 && vx > 0 && vy > 0 ? (sxy - (sx * sy) / n) / Math.sqrt(vx * vy) : NaN;
+  }
+
+  function bootCI(stat, T, B, seed) {
+    if (T < 4) return [NaN, NaN];
+    const rnd = lcg(seed);
+    const L = Math.max(1, Math.round(Math.cbrt(T)));
+    const out = [];
+    for (let b = 0; b < B; b++) {
+      const v = stat(blockIndices(T, L, rnd));
+      if (fin(v)) out.push(v);
+    }
+    out.sort((p, q) => p - q);
+    return [percentile(out, 0.025), percentile(out, 0.975)];
+  }
+
+  /* 因子 IC：每 h 天抽样一次（非重叠），置信区间用按日期的移动块自助法（B 次、固定种子）。
+   * 时序 IC：每只标的"因子值 vs 未来收益"的秩相关，再在标的之间等权平均；自助法对所有标的同时重抽相同的日期块，
+   *   因此高度相关或重复的标的不会虚增显著性（9 只一样的标的与 1 只结果相同）。
+   * 截面 IC：每个抽样日在标的之间做秩相关（至少 3 只），对这条日度序列做块自助法。
+   * 以 95% 置信区间是否跨过 0 判断显著。 */
+  function factorIC(bt, h, { B = 200, seed = 7 } = {}) {
     const { factors, fwd, vals } = factorPanel(bt, h);
     const syms = bt.symbols;
-    const n = bt.dates.length;
+    const ts = [];
+    for (let t = WARM; t < bt.dates.length; t += h) ts.push(t);
+    const T = ts.length;
     return factors.map((f) => {
-      let wsum = 0, nsum = 0;
+      const per = [];
       for (const s of syms) {
-        const x = [], y = [];
-        for (let t = WARM; t < n; t += h) {
+        const idx = [], x = [], y = [];
+        ts.forEach((t, k) => {
           const v = vals[s][f.id][t], r = fwd[s][t];
-          if (fin(v) && fin(r)) { x.push(v); y.push(r); }
-        }
+          if (fin(v) && fin(r)) { idx.push(k); x.push(v); y.push(r); }
+        });
         if (x.length < 20) continue;
-        const ic = spearman(x, y);
+        const rx = ranks(x), ry = ranks(y);
+        const ic = pearson(rx, ry);
         if (!fin(ic)) continue;
-        wsum += ic * x.length;
-        nsum += x.length;
+        const ax = new Float64Array(T).fill(NaN), ay = new Float64Array(T).fill(NaN);
+        idx.forEach((k, j) => { ax[k] = rx[j]; ay[k] = ry[j]; });
+        per.push({ ax, ay, ic });
       }
+      const tsIC = per.length ? mean(per.map((p) => p.ic)) : NaN;
+      const [tsLo, tsHi] = per.length ? bootCI((d) => {
+        let sum = 0, cnt = 0;
+        for (const p of per) { const c = corrAt(p.ax, p.ay, d); if (fin(c)) { sum += c; cnt++; } }
+        return cnt ? sum / cnt : NaN;
+      }, T, B, seed) : [NaN, NaN];
+
       const cs = [];
       if (syms.length >= 3) {
-        for (let t = WARM; t < n; t += h) {
+        for (const t of ts) {
           const x = [], y = [];
           for (const s of syms) {
             const v = vals[s][f.id][t], r = fwd[s][t];
@@ -668,39 +931,86 @@
         }
       }
       const csm = cs.length > 2 ? moments(cs) : null;
+      const [csLo, csHi] = csm ? bootCI((d) => { let a = 0; for (const k of d) a += cs[k]; return a / d.length; }, cs.length, B, seed) : [NaN, NaN];
+      const half = cs.length >> 1;
       return {
         id: f.id,
         label: f.label,
-        tsIC: nsum ? wsum / nsum : NaN,
-        tsT: nsum ? wsum / Math.sqrt(nsum) : NaN,
-        tsN: nsum,
+        tsIC, tsLo, tsHi,
+        tsSyms: per.length,
+        tsN: T,
         csIC: csm ? csm.mean : NaN,
+        csLo, csHi,
         csIR: csm && csm.std > 0 ? csm.mean / csm.std : NaN,
-        csT: csm && csm.std > 0 ? (csm.mean / csm.std) * Math.sqrt(cs.length) : NaN,
         csN: cs.length,
+        csFirst: half > 2 ? mean(cs.slice(0, half)) : NaN,
+        csSecond: half > 2 ? mean(cs.slice(half)) : NaN,
       };
     });
   }
 
-  // 分组收益：每只标的按自身历史分位数分 q 组，汇总各组的平均未来收益
-  function factorQuantiles(bt, factorId, h, q = 5) {
-    const { fwd, vals } = factorPanel(bt, h);
-    const sums = new Array(q).fill(0), counts = new Array(q).fill(0);
-    for (const s of bt.symbols) {
-      const pairs = [];
-      for (let t = WARM; t < bt.dates.length; t += h) {
-        const v = vals[s][factorId][t], r = fwd[s][t];
-        if (fin(v) && fin(r)) pairs.push([v, r]);
-      }
-      if (pairs.length < q * 4) continue;
-      pairs.sort((a, b) => a[0] - b[0]);
-      pairs.forEach(([, r], i) => {
-        const g = Math.min(q - 1, Math.floor((i * q) / pairs.length));
-        sums[g] += r;
-        counts[g]++;
+  function periodStats(r, ppy) {
+    if (r.length < 3) return null;
+    const m = moments(r);
+    const growth = r.reduce((acc, x) => acc * (1 + x), 1);
+    const ann = (a) => (a.length ? Math.pow(Math.max(a.reduce((acc, x) => acc * (1 + x), 1), 0), ppy / a.length) - 1 : NaN);
+    const half = r.length >> 1;
+    return {
+      annReturn: Math.pow(Math.max(growth, 0), ppy / r.length) - 1,
+      annVol: m.std * Math.sqrt(ppy),
+      sharpe: m.std > 0 ? (m.mean / m.std) * Math.sqrt(ppy) : NaN,
+      first: ann(r.slice(0, half)),
+      second: ann(r.slice(half)),
+    };
+  }
+
+  /* 可交易的分组组合：每 h 天在 t 日收盘按因子值把标的从低到高分 q 组，各组等权，
+   * t+1 日开盘买入、持有 h 日后开盘卖出；每次调仓按权重变化扣成本（cost 为单边费率，含佣金、印花税、滑点）。
+   * 多空 = 最高组 - 最低组（A 股融券受限，仅作因子强弱的参考）。
+   * 组数按标的数量：≥10 只分 5 组，6~9 只分 3 组，更少不分组。 */
+  function factorPortfolios(bt, factorId, h, { q, cost = 0.0015 } = {}) {
+    const syms = bt.symbols;
+    const N = syms.length;
+    q = q || (N >= 10 ? 5 : N >= 6 ? 3 : 0);
+    if (!q) return { q: 0, error: '分组组合至少需要 6 只标的' };
+    const { fwd, vals } = factorPanel(bt, h, [factorId]);
+    const ppy = TD / h;
+    const groups = Array.from({ length: q }, () => ({ rets: [], gross: [], turn: [], w: new Map() }));
+    const dates = [], ls = [];
+    for (let t = WARM; t < bt.dates.length; t += h) {
+      const elig = syms.filter((s) => fin(vals[s][factorId][t]) && fin(fwd[s][t]));
+      if (elig.length < q) continue;
+      elig.sort((a, b) => vals[a][factorId][t] - vals[b][factorId][t]);
+      const m = elig.length;
+      groups.forEach((g, k) => {
+        const members = elig.slice(Math.floor((k * m) / q), Math.floor(((k + 1) * m) / q));
+        const w = new Map(members.map((s) => [s, 1 / members.length]));
+        let dw = 0;
+        for (const [s, v] of w) dw += Math.abs(v - (g.w.get(s) || 0));
+        for (const [s, v] of g.w) if (!w.has(s)) dw += v;
+        const gross = members.reduce((acc, s) => acc + fwd[s][t], 0) / members.length;
+        g.gross.push(gross);
+        g.rets.push(gross - dw * cost);
+        g.turn.push(dw / 2);
+        g.w = w;
       });
+      ls.push(groups[q - 1].rets[groups[q - 1].rets.length - 1] - groups[0].rets[groups[0].rets.length - 1]);
+      dates.push(bt.dates[t]);
     }
-    return sums.map((s, g) => ({ group: g + 1, mean: counts[g] ? s / counts[g] : NaN, count: counts[g] }));
+    const curve = (r) => { let v = 1; return [1].concat(r.map((x) => (v *= 1 + x))); };
+    return {
+      q, h, cost,
+      periods: dates.length,
+      dates,
+      groups: groups.map((g, k) => ({
+        group: k + 1,
+        ...periodStats(g.rets, ppy),
+        grossReturn: periodStats(g.gross, ppy)?.annReturn,
+        turnover: g.turn.length ? mean(g.turn.slice(1)) : NaN,
+        equity: curve(g.rets),
+      })),
+      longShort: { ...periodStats(ls, ppy), equity: curve(ls) },
+    };
   }
 
   function seriesStats(bt, symbol) {
@@ -723,8 +1033,8 @@
   const api = {
     moments, normCdf, normInv, ranks, spearman, acf, varianceRatio, segStats, deflatedSharpe,
     rangeValues, gridSize, gridIter, randomCombos, applyParams, makeBacktester, optimize,
-    relativeStats, roundTrips, monthlyReturns,
-    FACTORS, FactorStrategy, buildStrategy, factorIC, factorQuantiles, seriesStats, forwardReturns,
+    relativeStats, roundTrips, monthlyReturns, SwitchingStrategy, olsHAC, styleFactors, exposure,
+    FACTORS, FactorStrategy, buildStrategy, factorIC, factorPortfolios, seriesStats, forwardReturns, blockIndices,
   };
   if (isNode) module.exports = api;
   else AQ.research = api;

@@ -129,20 +129,31 @@
       return this._bars;
     }
 
+    /* 两种策略接口：
+     * - generate(close, dates, symbols, bars)：一次性给出整段目标权重（不依赖实际成交的策略，如轮动、多因子）
+     * - prepare(...) + decide(i, ctx)：每天收盘后根据"实际成交状态"决定目标权重（止损、持有期等依赖成本价和成交日的策略）
+     *   ctx.shares 为实际持股，ctx.pending 为尚未成交、次日继续执行的目标（Map 或 null），ctx.book[s] = { cost: 含费用的平均成本价, entry: 建仓成交日序号, exit: 最近清仓成交日序号 } */
     run(strategy) {
       const { symbols, dates } = this;
       const bars = this.bars();
-      const signals = strategy.generate(bars.close, dates, symbols, bars);
-      validateSignals(signals);
+      const live = typeof strategy.decide === 'function';
+      let signals = null;
+      if (live) strategy.prepare(bars.close, dates, symbols, bars);
+      else {
+        signals = strategy.generate(bars.close, dates, symbols, bars);
+        validateSignals(signals);
+      }
 
       let cash = this.initialCash;
       const shares = Object.fromEntries(symbols.map((s) => [s, 0]));
+      const book = Object.fromEntries(symbols.map((s) => [s, { cost: NaN, entry: -1, exit: -Infinity }]));
       const lastClose = Object.fromEntries(symbols.map((s) => [s, NaN]));
       let pending = null;
       const equity = [], trades = [];
+      const ctx = { shares, book };
 
       dates.forEach((d, i) => {
-        if (pending) [cash, pending] = this.rebalance(i, pending, cash, shares, lastClose, trades);
+        if (pending) [cash, pending] = this.rebalance(i, pending, cash, shares, lastClose, trades, book);
         let value = 0;
         for (const s of symbols) {
           const c = this.close[s][i];
@@ -150,8 +161,12 @@
           if (shares[s]) value += shares[s] * lastClose[s];
         }
         equity.push(cash + value);
-        const row = signals[i];
-        if (row) pending = new Map(symbols.map((s, k) => [s, Number.isFinite(row[k]) ? row[k] : 0]));
+        ctx.pending = pending;
+        const row = live ? strategy.decide(i, ctx) : signals[i];
+        if (row) {
+          if (live) validateSignals([row]);
+          pending = new Map(symbols.map((s, k) => [s, Number.isFinite(row[k]) ? row[k] : 0]));
+        }
       });
 
       return {
@@ -167,7 +182,7 @@
       };
     }
 
-    rebalance(i, targets, cash, shares, lastClose, trades) {
+    rebalance(i, targets, cash, shares, lastClose, trades, book) {
       const d = this.dates[i];
       const mark = (s) => (this.tradable[s][i] ? this.open[s][i] : lastClose[s]);
       let held = 0;
@@ -197,6 +212,7 @@
         cash += amount - fee;
         shares[s] -= qty;
         trades.push({ date: d, symbol: s, side: 'sell', shares: qty, price: fill, amount, fee });
+        if (book && shares[s] === 0) book[s] = { cost: NaN, entry: -1, exit: i };
       }
 
       buys.sort((a, b) => b[1] * b[2] - a[1] * a[2]);
@@ -208,6 +224,12 @@
         const amount = qty * fill;
         const fee = this.fees.cost(s, d, 'buy', amount);
         cash -= amount + fee;
+        if (book) {
+          const bk = book[s];
+          // 成本价含费用；从空仓买入时记录建仓成交日
+          bk.cost = shares[s] > 0 ? (bk.cost * shares[s] + amount + fee) / (shares[s] + qty) : (amount + fee) / qty;
+          if (shares[s] === 0) bk.entry = i;
+        }
         shares[s] += qty;
         trades.push({ date: d, symbol: s, side: 'buy', shares: qty, price: fill, amount, fee });
       }
