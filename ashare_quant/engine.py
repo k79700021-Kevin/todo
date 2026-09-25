@@ -130,7 +130,7 @@ class Backtester:
                 continue
             fill = price * (1 - self.slippage)
             amount = qty * fill
-            fee = self.fees.cost(s, d, "sell", amount)
+            fee = self.fees.cost(s, d, "sell", amount, qty)
             cash += amount - fee
             shares[s] -= qty
             trades.append((d, s, "sell", qty, fill, amount, fee))
@@ -144,7 +144,7 @@ class Backtester:
             if qty <= 0:
                 continue
             amount = qty * fill
-            fee = self.fees.cost(s, d, "buy", amount)
+            fee = self.fees.cost(s, d, "buy", amount, qty)
             cash -= amount + fee
             shares[s] += qty
             trades.append((d, s, "buy", qty, fill, amount, fee))
@@ -153,7 +153,7 @@ class Backtester:
 
     def _affordable(self, s, d, qty, price, cash) -> int:
         qty = min(qty, int(cash / price // LOT_SIZE) * LOT_SIZE)
-        while qty > 0 and qty * price + self.fees.cost(s, d, "buy", qty * price) > cash + 1e-9:
+        while qty > 0 and qty * price + self.fees.cost(s, d, "buy", qty * price, qty) > cash + 1e-9:
             qty -= LOT_SIZE
         return max(qty, 0)
 
