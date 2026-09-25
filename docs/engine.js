@@ -218,6 +218,50 @@
         const first = dates.findIndex((x) => x >= ld);
         if (first >= 0) this.noLimitUntil[s] = first + k - 1;
       }
+      /* 公司行为事件：caEvents[s] = Map(交易日序号 → { cash: 每股现金, bonus: 每股送转股数, source })。
+       * 优先用明细数据 meta.corporateActions[s] = [{ date: 除权除息日, cash: 每股派现（税前）, bonus: 每股送转 }]：
+       *   事件落在除权除息日及以后第一个有真实价格的交易日（停牌时顺延到复牌，估值在同一天切换）。
+       * 复权因子跳变却没有明细对应（没有明细数据、配股等）时，只能从因子推断：仅凭复权因子无法区分派现与送转
+       *   （10% 派现与 10 送 1 的因子完全相同），因此一律按"价值不变、差额折成现金"处理（source = 'inferred'），
+       *   不凭空增加股数与市场暴露；推断次数在结果里报告。 */
+      this.caEvents = {};
+      this.caMismatch = []; // 明细与复权因子对不上的事件（数据源之一有误），供页面提示
+      const explicit = this.meta.corporateActions || {};
+      for (const s of symbols) {
+        const ev = new Map();
+        const list = explicit[s];
+        const px = xclose[s];
+        if (Array.isArray(list)) {
+          for (const e of list) {
+            if (!e || !e.date || !((+e.cash || 0) > 0 || (+e.bonus || 0) > 0)) continue;
+            let i = dates.findIndex((x) => x >= e.date);
+            while (i >= 0 && i < n && !(px[i] > 0)) i++;
+            if (i <= 0 || i >= n) continue;
+            const cur = ev.get(i) || { cash: 0, bonus: 0, source: 'explicit' };
+            cur.cash += +e.cash || 0;
+            cur.bonus = (1 + cur.bonus) * (1 + (+e.bonus || 0)) - 1;
+            ev.set(i, cur);
+          }
+        }
+        const ca = caf[s];
+        if (ca) {
+          for (let i = 0; i < n; i++) {
+            if (ca[i] === 1 || ev.has(i)) continue;
+            ev.set(i, { factor: ca[i], source: 'inferred' });
+          }
+          // 对账：明细事件隐含的复权因子跳变 = 前收 / 除权参考价，应与观察到的跳变一致（容差含分位舍入）
+          for (const [i, e] of ev) {
+            if (e.source !== 'explicit') continue;
+            let k = i - 1;
+            while (k >= 0 && !(px[k] > 0)) k--;
+            if (k < 0) continue;
+            const prev = px[k], expect = (prev * (1 + e.bonus)) / (prev - e.cash);
+            const tol = 0.01 / px[i] + 0.01 / prev + 0.002;
+            if (Math.abs(ca[i] / expect - 1) > tol) this.caMismatch.push({ symbol: s, date: dates[i], expected: expect, observed: ca[i] });
+          }
+        }
+        if (ev.size) this.caEvents[s] = ev;
+      }
       // 退市：第一个晚于退市日的交易日序号
       this.delistAt = {};
       for (const [s, d] of Object.entries(this.meta.delisted || {})) {
@@ -318,7 +362,10 @@
      * - generate(close, dates, symbols, bars)：一次性给出整段目标权重（不依赖实际成交的策略，如轮动、多因子）
      * - prepare(...) + decide(i, ctx)：每天收盘后根据"实际成交状态"决定目标权重（止损、持有期等依赖成本价和成交日的策略）
      *   ctx.shares 为实际持股，ctx.pending 为尚未成交、次日继续执行的目标（Map 或 null），ctx.book[s] = { cost: 含费用的平均成本价, entry: 建仓成交日序号, exit: 最近清仓成交日序号 } */
-    run(strategy) {
+    /* opts.start / opts.state：从第 start 个交易日开盘前接着一个已有账户运行（影子账户按段结算用）：
+     * state = { cash, shares: { 代码: 股数 }, pending: { 代码: 目标权重 } | null }。start 之前的日子只更新价格，净值记为 NaN；
+     * opts.end：只运行到第 end 个交易日收盘（含），之后净值记为 NaN，返回的持仓、现金、待成交目标都是 end 日收盘后的。 */
+    run(strategy, { start = 0, end = Infinity, state = null } = {}) {
       const { symbols, dates } = this;
       const bars = this.bars();
       const live = typeof strategy.decide === 'function';
@@ -329,29 +376,49 @@
         validateSignals(signals);
       }
 
-      let cash = this.initialCash;
-      const shares = Object.fromEntries(symbols.map((s) => [s, 0]));
+      let cash = state ? +state.cash : this.initialCash;
+      const shares = Object.fromEntries(symbols.map((s) => [s, state && state.shares && state.shares[s] > 0 ? +state.shares[s] : 0]));
       const book = Object.fromEntries(symbols.map((s) => [s, { cost: NaN, entry: -1, exit: -Infinity }]));
       const lastClose = Object.fromEntries(symbols.map((s) => [s, NaN]));
-      let pending = null;
+      let pending = state && state.pending ? new Map(symbols.map((s) => [s, +state.pending[s] || 0])) : null;
       const equity = [], trades = [];
+      let inferred = 0;
       const ctx = { shares, book, equity: this.initialCash, value: (s) => (shares[s] ? shares[s] * lastClose[s] : 0) };
 
       dates.forEach((d, i) => {
-        // 公司行为（除权除息日开盘前）：复权因子上跳 ≥ 5% 视为送转，按比例增加股数；否则视为现金分红
-        for (const s of symbols) {
-          const ca = this.caf[s];
-          if (!ca || ca[i] === 1 || !shares[s]) continue;
-          const m = ca[i], prev = lastClose[s];
-          if (m >= 1.05 || m <= 0.95) {
-            const exact = shares[s] * m, whole = Math.floor(exact + 1e-9);
-            cash += (exact - whole) * (prev / m); // 零碎股按除权参考价折现
-            shares[s] = whole;
-            trades.push({ date: d, symbol: s, side: 'corporate', shares: whole, price: prev / m, amount: 0, fee: 0, factor: m, cash: (exact - whole) * (prev / m) });
-          } else if (m > 1) {
-            const div = shares[s] * prev * (1 - 1 / m);
+        if (i > end) { equity.push(NaN); return; }
+        if (i < start) {
+          for (const s of symbols) { const c = this.xclose[s][i]; if (Number.isFinite(c)) lastClose[s] = c; }
+          equity.push(NaN);
+          return;
+        }
+        // 公司行为（除权除息日开盘前，见构造函数里的 caEvents）
+        for (const s in this.caEvents) {
+          const e = this.caEvents[s].get(i);
+          if (!e || !shares[s]) continue;
+          const prev = lastClose[s];
+          if (e.source === 'explicit') {
+            if (e.cash > 0) {
+              const div = shares[s] * e.cash;
+              cash += div;
+              trades.push({ date: d, symbol: s, side: 'dividend', shares: shares[s], price: e.cash, amount: div, fee: 0, source: 'explicit' });
+            }
+            if (e.bonus > 0) {
+              const exRef = (prev - e.cash) / (1 + e.bonus);
+              const exact = shares[s] * (1 + e.bonus), whole = Math.floor(exact + 1e-9);
+              const inLieu = (exact - whole) * exRef; // 零碎股按除权参考价折现
+              cash += inLieu;
+              shares[s] = whole;
+              trades.push({ date: d, symbol: s, side: 'corporate', shares: whole, price: exRef, amount: 0, fee: 0, factor: 1 + e.bonus, cash: inLieu, source: 'explicit' });
+            }
+          } else if (e.factor > 1) {
+            // 没有明细：价值不变，差额（前收 − 除权参考价）按现金计
+            const div = shares[s] * prev * (1 - 1 / e.factor);
             cash += div;
-            trades.push({ date: d, symbol: s, side: 'dividend', shares: shares[s], price: prev * (1 - 1 / m), amount: div, fee: 0 });
+            inferred++;
+            trades.push({ date: d, symbol: s, side: 'dividend', shares: shares[s], price: prev * (1 - 1 / e.factor), amount: div, fee: 0, source: 'inferred', factor: e.factor });
+          } else {
+            inferred++; // 复权因子下跳（数据异常）：不调整持仓，只计数
           }
         }
         // 退市：仍持有的股份按最后价格 × 回收比例注销，记为一笔卖出
@@ -393,6 +460,9 @@
         finalShares: { ...shares },
         // 最后一个交易日收盘后尚未执行的目标仓位（即下一交易日开盘要做的调整）
         nextTargets: pending ? Object.fromEntries(pending) : null,
+        // 从复权因子推断（没有明细数据）的公司行为次数：这些按价值不变折现处理
+        inferredActions: inferred,
+        finalCash: cash,
         initialCash: this.initialCash,
       };
     }

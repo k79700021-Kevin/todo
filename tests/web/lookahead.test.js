@@ -49,9 +49,14 @@ function build(mutate) {
     fundamentals[s] = recs;
     shares[s] = [{ date: dates[0], total: 1e9 * (k + 1), float: 6e8 * (k + 1) }, { date: dates[300], total: 1.5e9 * (k + 1), float: 9e8 * (k + 1) }];
     if (mutate) shares[s].push({ date: dates[CUT + 10], total: 1, float: 1 });
+    // 双时态：生效日在截断日之前、但截断日之后才公告的股本（如年报披露的期末股本），截断日及以前不可见
+    if (mutate) shares[s].push({ date: dates[CUT - 30], known: dates[CUT + 2], total: 3, float: 3 });
+    shares[s].sort((x, y) => (x.date < y.date ? -1 : x.date > y.date ? 1 : 0)); // 与数据源解析后一致：按生效日排序
     universe[s] = k === 9 ? [[dates[100], mutate ? dates[CUT + 20] : null]] : [[dates[0], null]];
   });
-  const meta = { universe, fundamentals, shares, industry: INDUSTRY, industryPIT: true, delisted: mutate ? { '600008': dates[CUT + 30] } : {} };
+  // 分红送配明细：截断日前后各一条；截断日之后的（以及篡改后才出现的）不能影响之前
+  const corporateActions = Object.fromEntries(SYMS.map((s) => [s, [{ date: dates[200], cash: 0.1, bonus: 0 }].concat(mutate ? [{ date: dates[CUT + 1], cash: 3, bonus: 1 }] : [])]));
+  const meta = { universe, fundamentals, shares, corporateActions, industry: INDUSTRY, industryPIT: true, delisted: mutate ? { '600008': dates[CUT + 30] } : {} };
   return { data, meta };
 }
 

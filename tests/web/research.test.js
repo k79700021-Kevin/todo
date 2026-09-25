@@ -826,7 +826,9 @@ test('factor strategy with portfolio optimization: weights obey cap and budget',
   assert.ok(rows.length > 5);
   for (const r of rows) {
     const sum = r.reduce((a, x) => a + x, 0);
-    assert.ok(Math.abs(sum - 1) < 1e-6, `权重和 ${sum}`);
+    // 持有 2 只 × 单票上限 35% = 70%，其余为现金（上限是硬约束，持仓数是上限）
+    assert.ok(Math.abs(sum - 0.7) < 1e-6, `权重和 ${sum}`);
+    assert.ok(r.filter((x) => x > 0).length <= 2);
     assert.ok(r.every((x) => x >= 0 && x <= 0.35 + 1e-6), JSON.stringify(r));
   }
   assert.throws(() => new R.FactorStrategy({ factors: [{ id: 'roc60', weight: 1 }], sizing: 'optimize', ic: 0 }), /组合优化/);

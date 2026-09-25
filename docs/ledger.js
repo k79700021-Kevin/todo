@@ -139,8 +139,20 @@
       return this.queue;
     }
 
-    // 校验：每条的哈希与内容一致、prev 指向上一条、序号连续
-    static async verifyEntries(entries) {
+    /* 锚点：每条链最后一条的 { device, seq, hash }。哈希链只能发现链内的改动与中间删除；
+     * 删掉末尾几条后剩下的链仍然自洽，必须和保存在链外（例如提交到 GitHub、发邮件给自己）的锚点对比才能发现。 */
+    static anchorOf(entries) {
+      const last = new Map();
+      for (const e of entries) if (!last.has(e.device) || e.seq > last.get(e.device).seq) last.set(e.device, e);
+      return [...last.values()].map((e) => ({ device: e.device, seq: e.seq, hash: e.hash })).sort((a, b) => (a.device < b.device ? -1 : 1));
+    }
+
+    anchor() {
+      return Ledger.anchorOf(this.entries);
+    }
+
+    // 校验：每条的哈希与内容一致、prev 指向上一条、序号连续；给了锚点时，锚定的那条必须仍在且哈希一致
+    static async verifyEntries(entries, { anchors = [] } = {}) {
       const byDevice = new Map();
       for (const e of entries) {
         if (!byDevice.has(e.device)) byDevice.set(e.device, []);
@@ -158,11 +170,17 @@
           prev = hash;
         }
       }
-      return { ok: broken.length === 0, chains: byDevice.size, entries: entries.length, broken };
+      for (const a of anchors) {
+        const list = byDevice.get(a.device) || [];
+        const e = list.find((x) => x.seq === a.seq);
+        if (!e) broken.push({ device: a.device, seq: a.seq, reason: `锚点处的记录不见了（链只到第 ${list.length - 1} 条，末尾有记录被删除）` });
+        else if (e.hash !== a.hash) broken.push({ device: a.device, seq: a.seq, reason: '锚点处的记录与锚点哈希不一致' });
+      }
+      return { ok: broken.length === 0, chains: byDevice.size, entries: entries.length, broken, anchored: anchors.length };
     }
 
-    verify() {
-      return Ledger.verifyEntries(this.entries);
+    verify(opts) {
+      return Ledger.verifyEntries(this.entries, opts);
     }
 
     exportJSON() {
@@ -193,11 +211,14 @@
       return { added, ...merged };
     }
 
-    /* 统计：某份数据（dataKey；不传则全部）上的试验次数 = 不同回测配置数 + 优化的参数组合数（全部设备合计） */
+    /* 统计：某份数据（dataKey；不传则全部）上的试验次数 = 不同回测实验清单数 + 优化的参数组合数 + 因子研究查看过的不同视图数
+     * （因子 × 预测周期 × 中性化 × 分析类型；每看一个视图都是一次"挑选"的机会），全部设备合计。 */
     stats(dataKey) {
       const es = this.entries.filter((e) => !dataKey || e.dataKey === dataKey);
       const configs = new Set(es.filter((e) => e.kind === 'backtest').map((e) => e.configHash));
       const optTrials = es.filter((e) => e.kind === 'optimize').reduce((a, e) => a + (e.trials || 0), 0);
+      const views = new Set();
+      for (const e of es) if (e.kind === 'research') for (const v of e.views || []) views.add(v);
       // 旧版（账本之前）本机累计的计数，迁移时作为一条 legacy 记录保存
       let legacyTrials = 0, legacyUnlocks = 0;
       for (const e of this.entries) {
@@ -215,7 +236,8 @@
         uniqueConfigs: configs.size,
         optimizations: es.filter((e) => e.kind === 'optimize').length,
         optTrials,
-        trials: configs.size + optTrials + legacyTrials,
+        researchViews: views.size,
+        trials: configs.size + optTrials + views.size + legacyTrials,
         testReveals: es.filter((e) => e.kind === 'reveal_test').length,
         holdoutUnlocks: es.filter((e) => e.kind === 'unlock_holdout').length + legacyUnlocks,
         devices: new Set(es.map((e) => e.device)).size,
