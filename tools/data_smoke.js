@@ -73,15 +73,19 @@ function check(sym, d) {
     wf: { enabled: true, trainYears: 3, testYears: 1 },
   });
   lines.push(`**优化** ${opt.trials} 组；训练集最优夏普 ${opt.top[0].tr.sharpe.toFixed(2)}；选定参数验证集夏普 ${opt.selected.va.sharpe.toFixed(2)}、` +
-    `测试集夏普 ${opt.test.stats.sharpe.toFixed(2)}（α ${pct(opt.test.rel.alpha)}，β ${opt.test.rel.beta.toFixed(2)}）；` +
-    `真实夏普>0 概率 ${pct(opt.dsr.prob)}；滚动前推 ${opt.wf.windows.length} 个窗口，年化 ${pct(opt.wf.stats.cagr)}`);
+    `测试集夏普 ${opt.test.stats.sharpe.toFixed(2)}（相对等权基准 α ${pct(opt.test.rel.alpha)}，β ${opt.test.rel.beta.toFixed(2)}` +
+    (opt.test.exposure ? `；剔除风格暴露后 α ${pct(opt.test.exposure.alpha)}，t ${opt.test.exposure.alphaT.toFixed(2)}` : '') + '）；' +
+    `真实夏普>0 概率 ${pct(opt.dsr.prob)}；滚动前推（连续账户）${opt.wf.windows.length} 个窗口，年化 ${pct(opt.wf.stats.cagr)}，费用 ${pct(opt.wf.fees)}，${opt.wf.trades.count} 笔平仓`);
 
   const fac = AQ.summarize(bt.run(new R.FactorStrategy({ factors: [{ id: 'roc60', weight: 1 }, { id: 'vol20', weight: -1 }], topN: 2, rebalance: 20, trendN: 60 })));
   lines.push(`**多因子** 60 日动量 + 低波动、持有 2 只、趋势过滤：年化 ${pct(fac.cagr)}，夏普 ${fac.sharpe.toFixed(2)}，最大回撤 ${pct(fac.max_drawdown)}`);
 
   const ic = R.factorIC(bt, 5);
-  lines.push('', '**因子 IC（未来 5 日）**', '', '| 因子 | 时序 IC | t | 截面 IC | t |', '|---|---|---|---|---|');
-  for (const f of ic) lines.push(`| ${f.label} | ${f.tsIC.toFixed(3)} | ${f.tsT.toFixed(2)} | ${f.csIC.toFixed(3)} | ${f.csT.toFixed(2)} |`);
+  const r3 = (v) => (Number.isFinite(v) ? v.toFixed(3) : '—');
+  lines.push('', '**因子 IC（未来 5 日，95% 区间为块自助法）**', '', '| 因子 | 时序 IC | 95% 区间 | 截面 IC | 95% 区间 |', '|---|---|---|---|---|');
+  for (const f of ic) lines.push(`| ${f.label} | ${r3(f.tsIC)} | ${r3(f.tsLo)} ~ ${r3(f.tsHi)} | ${r3(f.csIC)} | ${r3(f.csLo)} ~ ${r3(f.csHi)} |`);
+  const port = R.factorPortfolios(bt, 'roc60', 20);
+  if (port.q) lines.push('', `**分组组合** 60 日动量，${port.q} 组：` + port.groups.map((g) => `Q${g.group} ${pct(g.annReturn)}`).join('，') + `；多空 ${pct(port.longShort.annReturn)}`);
 
   const report = lines.join('\n');
   console.log(report);

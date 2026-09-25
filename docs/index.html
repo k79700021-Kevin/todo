@@ -240,6 +240,11 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
           <button type="button" class="chip-btn" data-years="0">全部</button>
         </div>
         <p class="note">回测、参数优化、因子研究都只使用这个区间内的数据。</p>
+        <div class="fields">
+          <label for="holdout" class="wide">最终留出期起始（留空 = 不设）<input type="date" id="holdout"></label>
+        </div>
+        <p class="note" id="holdoutNote">设置后，这一天及以后的数据对回测、优化、因子研究全部不可见，等策略完全定型后再解锁检验一次。</p>
+        <button type="button" class="btn btn-secondary block" id="holdoutBtn" hidden>解锁最终留出期</button>
       </section>
 
       <section>
@@ -330,7 +335,12 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
         <div class="card">
           <div class="card-head"><h3>相对基准</h3><span class="note">基准为全部标的等权买入持有</span></div>
           <div class="kpis" id="relKpis"></div>
-          <p class="note">α 为 CAPM 年化超额收益（剔除 β 带来的部分），信息比率 = 年化超额收益 / 跟踪误差，通常 &gt; 0.5 才算有价值。</p>
+          <p class="note">这里的 α 只剔除了对等权基准的 β，没有剔除动量、低波动等风格暴露，见下方暴露归因。信息比率 = 年化超额收益 / 跟踪误差。</p>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>暴露归因</h3><span class="note" id="expoNote"></span></div>
+          <div class="table-wrap"><table id="expoTable"></table></div>
+          <p class="note">策略日超额收益对股票池内的风格因子做回归：市场（等权）、动量（60 日涨幅强 − 弱三分之一）、低波动（20 日波动率低 − 高三分之一），t 值用 Newey–West 标准误。剔除这些暴露后剩下的截距才更接近真正的 α；它仍可能来自这里没覆盖的行业、市值等暴露。</p>
         </div>
         <div class="card">
           <div class="card-head"><h3>按笔统计</h3><span class="note" id="rtNote"></span></div>
@@ -416,6 +426,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
               <div class="callout" id="testWarn"></div>
               <div class="kpis" id="testKpis"></div>
               <div class="kpis" id="testRel"></div>
+              <p class="note" id="testExpo"></p>
               <div class="readout" id="testReadout"></div>
               <div class="chart" id="testChart"></div>
               <div class="legend">
@@ -425,7 +436,8 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
             </div>
           </div>
           <div class="card" id="wfCard">
-            <div class="card-head"><h3>滚动前推：拼接的样本外净值</h3><span class="note" id="wfMeta"></span></div>
+            <div class="card-head"><h3>滚动前推：连续账户</h3><span class="note" id="wfMeta"></span></div>
+            <p class="note">每个窗口只用此前的数据选参，同一个账户按选出的参数连续交易；换参数时的调仓按真实规则成交并计费用，跨窗口的持仓按新参数的出场规则处理。</p>
             <div class="kpis" id="wfKpis"></div>
             <div class="readout" id="wfReadout"></div>
             <div class="chart" id="wfChart"></div>
@@ -464,13 +476,16 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
               <select id="icH" aria-label="预测周期"><option value="1">预测未来 1 日</option><option value="5" selected>预测未来 5 日</option><option value="20">预测未来 20 日</option></select>
             </label>
           </div>
-          <p class="note">IC 是因子值与未来收益（次日开盘买入、持有 N 日）的秩相关，非重叠抽样。时序 IC 看单只标的自身的择时能力，截面 IC 看在标的之间挑强弱的能力。点一行看分组收益。</p>
+          <p class="note">IC 是因子值与未来收益（次日开盘买入、持有 N 日）的秩相关，非重叠抽样。时序 IC 看单只标的自身的择时能力（各标的等权平均），截面 IC 看在标的之间挑强弱的能力。区间为 95% 置信区间：按日期整块重抽样（块自助法），所有标的同时重抽，相关或重复的标的不会虚增显著性。点一行看分组组合。</p>
           <div class="table-wrap"><table id="icTable"></table></div>
           <p class="note" id="icNote"></p>
         </div>
         <div class="card">
-          <div class="card-head"><h3 id="qTitle">分组收益</h3><span class="note">按因子值从低到高分 5 组的平均未来收益</span></div>
+          <div class="card-head"><h3 id="qTitle">分组组合</h3><span class="note" id="qMeta"></span></div>
+          <p class="note">每期收盘按因子值把标的从低到高分组，各组等权，次日开盘调仓、持有到下一期；调仓按权重变化扣单边 0.15% 成本（含佣金、印花税、滑点的近似）。多空 = 最高组 − 最低组，A 股融券受限，只作强弱参考。前后半段差别大说明不稳定。</p>
+          <div class="readout" id="qReadout"></div>
           <div class="chart" id="qChart"></div>
+          <div class="table-wrap"><table id="qTable"></table></div>
         </div>
       </div>
     </main>
@@ -516,7 +531,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   const state = {
     tab: 'backtest', source: 'sample', csv: {}, online: {},
     config: JSON.parse(JSON.stringify(DEFAULT_CONFIG)),
-    last: null, showAllTrades: false, opt: null, optSel: {}, worker: null, researchDirty: true, icSel: 'roc20',
+    last: null, showAllTrades: false, opt: null, optSel: {}, worker: null, researchDirty: true, icSel: 'roc20', holdoutOpen: false,
   };
 
   // ---------- 格式化 ----------
@@ -536,7 +551,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   // ---------- 持久化（失败时静默，页面照常工作） ----------
   function store(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) { /* 存储不可用 */ } }
   function load(key) { try { return JSON.parse(localStorage.getItem(key)); } catch (e) { return null; } }
-  const TX_IDS = ['start', 'end', 'cash', 'commission', 'minCommission', 'slippage', 'band', 'rf'];
+  const TX_IDS = ['start', 'end', 'holdout', 'cash', 'commission', 'minCommission', 'slippage', 'band', 'rf'];
   function saveSettings() {
     const s = { config: state.config, source: state.source, onSymbols: $('#onSymbols').value, onAdjust: $('#onAdjust').value, autoRun: $('#autoRun').checked };
     TX_IDS.forEach((id) => (s[id] = $('#' + id).value));
@@ -645,24 +660,64 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     return state.source === 'sample' ? window.AQ_SAMPLE : state.source === 'csv' ? state.csv : state.online;
   }
 
+  // 回测区间，且在最终留出期锁定时截掉留出期
+  function dateFilter() {
+    const start = $('#start').value || '0000-00-00';
+    const end = $('#end').value || '9999-99-99';
+    const cap = holdoutCap();
+    return (d) => d >= start && d <= end && (!cap || d < cap);
+  }
+  function holdoutCap() {
+    const h = $('#holdout').value;
+    return h && !state.holdoutOpen ? h : null;
+  }
+
+  // ---------- 试验登记：同一份数据上试过多少种配置，计入通缩夏普的试验次数 ----------
+  const EXP_KEY = 'aq-experiments-v1';
+  function expKey() { return JSON.stringify([state.source, Object.keys(rawData() || {}).sort()]); }
+  function expLog() {
+    const all = load(EXP_KEY) || {};
+    return { configs: [], backtests: 0, optTrials: 0, optRuns: 0, unlocks: 0, ...(all[expKey()] || {}) };
+  }
+  function expSave(rec) {
+    const all = load(EXP_KEY) || {};
+    all[expKey()] = rec;
+    store(EXP_KEY, all);
+  }
+  const expTrials = (rec = expLog()) => rec.backtests + rec.optTrials;
+  function hashStr(str) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) h = Math.imul(h ^ str.charCodeAt(i), 16777619);
+    return (h >>> 0).toString(36);
+  }
+  function logBacktest(config) {
+    if (config.type === 'buy_hold') return;
+    const rec = expLog();
+    const h = hashStr(JSON.stringify([config, $('#start').value, $('#end').value]));
+    if (rec.configs.includes(h)) return;
+    rec.configs.push(h);
+    if (rec.configs.length > 3000) rec.configs.shift();
+    rec.backtests++;
+    expSave(rec);
+  }
+
   function activeData() {
     const raw = rawData();
     const syms = Object.keys(raw || {});
     if (!syms.length) {
       throw new Error(state.source === 'csv' ? '还没有上传 CSV 文件' : state.source === 'online' ? '还没有获取行情，先点"获取行情"' : '示例数据加载失败');
     }
-    const start = $('#start').value || '0000-00-00';
-    const end = $('#end').value || '9999-99-99';
+    const keep = dateFilter();
     const out = {};
     for (const s of syms) {
       const src = raw[s];
       const idx = [];
-      src.dates.forEach((d, i) => { if (d >= start && d <= end) idx.push(i); });
+      src.dates.forEach((d, i) => { if (keep(d)) idx.push(i); });
       if (!idx.length) continue;
       const pick = (arr) => (arr ? idx.map((i) => arr[i]) : undefined);
       out[s] = { dates: pick(src.dates), open: pick(src.open), high: pick(src.high), low: pick(src.low), close: pick(src.close), volume: pick(src.volume) };
     }
-    if (!Object.keys(out).length) throw new Error('所选日期区间内没有行情');
+    if (!Object.keys(out).length) throw new Error(holdoutCap() ? '所选区间都落在最终留出期内，请调整回测区间或留出期起始' : '所选日期区间内没有行情');
     for (const s of Object.keys(out)) AQ.em.checkPositive(out[s], s);
     return out;
   }
@@ -787,8 +842,30 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     el.className = isErr ? 'error' : 'note';
   }
 
+  function rangeChanged() {
+    state.researchDirty = true;
+    setDefaultSplit(true);
+    saveSettings();
+    runBacktest();
+    if (state.tab === 'research') runResearch();
+  }
+
+  function updateHoldoutUI() {
+    const h = $('#holdout').value;
+    const btn = $('#holdoutBtn');
+    btn.hidden = !h;
+    btn.textContent = state.holdoutOpen ? '重新锁定最终留出期' : '解锁最终留出期';
+    const n = h ? expLog().unlocks : 0;
+    $('#holdoutNote').innerHTML = !h
+      ? '设置后，这一天及以后的数据对回测、优化、因子研究全部不可见，等策略完全定型后再解锁检验一次。'
+      : state.holdoutOpen
+        ? `<b class="warn">最终留出期已解锁</b>：现在看到的包含 ${h} 之后的数据。${n > 1 ? `这份数据已解锁过 ${n} 次。` : ''}`
+        : `已锁定：${h} 及以后的数据不可见。${n ? `这份数据此前解锁过 ${n} 次。` : ''}`;
+  }
+
   function dataChanged() {
     updateDataInfo();
+    updateHoldoutUI();
     state.researchDirty = true;
     state.opt = null;
     $('#optResults').hidden = true;
@@ -815,6 +892,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       state.last = { bt, res, bench, m: AQ.summarize(res, rf()), bm: AQ.summarize(bench, rf()), config: JSON.parse(JSON.stringify(state.config)) };
       state.showAllTrades = false;
       saveSettings();
+      logBacktest(state.last.config);
       renderBacktest();
     } catch (e) {
       showError(e.message);
@@ -850,10 +928,11 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       }).join('') + '</tbody>';
     const rel = R.relativeStats(res.equity, state.last.bench.equity, 0, n - 1, rf());
     $('#relKpis').innerHTML = rel
-      ? kpi('年化 α', rel.alpha, 'CAPM 超额', fmt.pct) + kpi('β', rel.beta, '对基准的敏感度', fmt.num, false) +
+      ? kpi('相对等权基准的 α', rel.alpha, '年化，未剔除风格暴露', fmt.pct) + kpi('β', rel.beta, '对基准的敏感度', fmt.num, false) +
         kpi('信息比率', rel.infoRatio, `跟踪误差 ${fmt.pctPlain(rel.trackingError)}`, fmt.num, false) +
         kpi('超额收益', rel.excessReturn, '区间累计', fmt.pct)
       : '';
+    renderExposure(R.exposure(res.equity, R.styleFactors(bt, rf()), 0, n - 1, rf()), bt.symbols.length);
     const rt = R.roundTrips(res.trades, res.dates);
     $('#rtNote').textContent = `${rt.count} 笔已平仓${rt.open ? `，${rt.open} 笔持仓中` : ''}；含全部费用`;
     $('#rtKpis').innerHTML =
@@ -868,6 +947,19 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       { values: res.equity.map((v) => v / res.initialCash), color: 'var(--accent)', width: 1.8, label: '策略' },
       { values: state.last.bench.equity.map((v) => v / res.initialCash), color: 'var(--bench)', width: 1.3, label: '基准' },
     ], m._drawdown);
+  }
+
+  function renderExposure(ex, nSym) {
+    if (!ex) {
+      $('#expoNote').textContent = '';
+      $('#expoTable').innerHTML = '<tbody><tr><td>样本太短（至少 60 个交易日）</td></tr></tbody>';
+      return;
+    }
+    const tcell = (t) => `<td class="num ${Math.abs(t) > 2 ? 'warn' : ''}">${fmt.num(t)}</td>`;
+    $('#expoNote').textContent = `${ex.n} 个交易日 · R² ${fmt.num(ex.r2)}` + (ex.missing.length ? ` · 标的不足 6 只（当前 ${nSym}），只做市场因子` : '');
+    $('#expoTable').innerHTML = '<thead><tr><th>项目</th><th>系数</th><th>t 值（HAC）</th></tr></thead><tbody>' +
+      `<tr><td><b>剔除暴露后的 α（年化）</b></td><td class="num ${tone(ex.alpha)}">${fmt.pct(ex.alpha)}</td>${tcell(ex.alphaT)}</tr>` +
+      ex.loadings.map((l) => `<tr><td>${esc(l.label)} 暴露</td><td class="num">${fmt.num(l.beta)}</td>${tcell(l.t)}</tr>`).join('') + '</tbody>';
   }
 
   function renderMonthly(m) {
@@ -1107,9 +1199,9 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
 
   function rangeDates() {
     const raw = rawData() || {};
-    const lo = $('#start').value || '0', hi = $('#end').value || '9';
+    const keep = dateFilter();
     const set = new Set();
-    Object.values(raw).forEach((d) => d.dates.forEach((x) => { if (x >= lo && x <= hi) set.add(x); }));
+    Object.values(raw).forEach((d) => d.dates.forEach((x) => { if (keep(x)) set.add(x); }));
     return [...set].sort();
   }
 
@@ -1150,6 +1242,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
         samples: Math.min(+$('#optSamples').value || 200, MAX_RUNS), objective: $('#optObjective').value,
         minTrades: +$('#optMinTrades').value || 0, valStart: $('#valStart').value, testStart: $('#testStart').value, rf: rf(),
         wf: { enabled: $('#wfOn').checked, trainYears: +$('#wfTrain').value || 3, testYears: +$('#wfTest').value || 1, anchored: $('#wfAnchored').checked },
+        priorTrials: expTrials(),
       };
     } catch (e) {
       err.textContent = e.message;
@@ -1157,7 +1250,15 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       return;
     }
     setOptRunning(true);
-    const onDone = (result) => { setOptRunning(false); state.opt = { result, config: payload.config }; renderOptResults(); };
+    const onDone = (result) => {
+      setOptRunning(false);
+      const rec = expLog();
+      rec.optTrials += result.trials;
+      rec.optRuns++;
+      expSave(rec);
+      state.opt = { result, config: payload.config };
+      renderOptResults();
+    };
     const onFail = (msg) => { setOptRunning(false); err.textContent = msg; err.hidden = false; };
     let worker = null;
     try { worker = new Worker('worker.js'); } catch (e) { worker = null; }
@@ -1220,7 +1321,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       kpi('回测次数', r.trials, `合格 ${r.eligible} · 无效 ${r.invalid}`, fmt.int, false) +
       kpi(`训练集最优${OBJ_LABEL[o]}`, best ? best.tr[o] : NaN, `基准 ${objFmt(o, r.bench.tr[o])}`, (v) => objFmt(o, v), o === 'cagr') +
       kpi(`选定参数验证集${OBJ_LABEL[o]}`, sel ? sel.va[o] : NaN, `基准 ${objFmt(o, r.bench.va[o])}`, (v) => objFmt(o, v), o === 'cagr') +
-      kpi('训练集第一名真实夏普 > 0 的概率', dsr ? dsr.prob : NaN, dsr ? `噪声期望最优夏普 ${fmt.num(dsr.sr0Annual)}` : '—', fmt.pctPlain, false);
+      kpi('训练集第一名真实夏普 > 0 的概率', dsr ? dsr.prob : NaN, dsr ? `按累计 ${dsr.trials} 次试验折算` : '—', fmt.pctPlain, false);
 
     let verdict = '';
     if (!sel) verdict = '没有满足"最少成交"要求的参数组合，调低门槛或换一组规则。';
@@ -1229,11 +1330,12 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       const level = p >= 0.95 ? '<b class="up">统计上显著</b>' : p >= 0.8 ? '<b class="warn">证据偏弱</b>' : '<b class="down">很可能是运气</b>';
       const deg = fin(sel.tr.sharpe) && sel.tr.sharpe > 0 ? sel.va.sharpe / sel.tr.sharpe : NaN;
       verdict = `训练集 ${r.splits.trainDays} 天、验证集 ${r.splits.valDays} 天、测试集 ${r.splits.testDays} 天（锁定）。` +
-        `试了 ${dsr ? dsr.trials : r.trials} 组参数，纯噪声下也能期望挑出年化夏普约 ${fmt.num(dsr && dsr.sr0Annual)} 的"最优"；` +
-        `训练集第一名夏普 ${fmt.num(best.tr.sharpe)}，真实夏普大于 0 的概率 ${fmt.pctPlain(p)}：${level}。` +
+        `这份数据上本机累计记录了 ${dsr ? dsr.trials : r.trials} 次试验（本次 ${dsr ? dsr.thisRun : r.trials}，此前的回测配置与优化 ${dsr ? dsr.prior : 0}），纯噪声下也能期望挑出年化夏普约 ${fmt.num(dsr && dsr.sr0Annual)} 的"最优"；` +
+        `训练集第一名夏普 ${fmt.num(best.tr.sharpe)}，按累计试验次数折算后真实夏普大于 0 的概率 ${fmt.pctPlain(p)}（只按本次计为 ${fmt.pctPlain(dsr && dsr.probThisRun)}）：${level}。` +
+        '你在别的设备、别的工具或脑子里做过的尝试没有计入，所以这个概率仍然偏乐观。' +
         ` 在训练排名前 ${r.shortlist} 组中，验证集最好的是第 ${sel.trainRank} 名（★），其验证集夏普 ${fmt.num(sel.va.sharpe)}` +
         (fin(deg) ? `，是训练集的 ${(deg * 100).toFixed(0)}%${deg < 0.5 ? '，衰减明显，警惕过拟合' : ''}` : '') + '。' +
-        (r.wf ? ` 训练+验证段内的滚动前推：年化 ${fmt.pct(r.wf.stats.cagr)}，基准 ${fmt.pct(r.wf.benchStats.cagr)}。` : '');
+        (r.wf ? ` 训练+验证段内的滚动前推（连续账户）：年化 ${fmt.pct(r.wf.stats.cagr)}，基准 ${fmt.pct(r.wf.benchStats.cagr)}。` : '');
     }
     $('#optVerdict').innerHTML = verdict;
 
@@ -1287,9 +1389,14 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       kpi('测试集最大回撤', t.stats.max_drawdown, '基准 ' + fmt.pct(t.bench.max_drawdown), fmt.pct) +
       kpi('选定参数', NaN, comboText(r.space, t.combo), () => '', false);
     $('#testRel').innerHTML = t.rel
-      ? kpi('年化 α', t.rel.alpha, 'CAPM 超额', fmt.pct) + kpi('β', t.rel.beta, '', fmt.num, false) +
+      ? kpi('相对等权基准的 α', t.rel.alpha, '年化，未剔除风格暴露', fmt.pct) + kpi('β', t.rel.beta, '', fmt.num, false) +
         kpi('信息比率', t.rel.infoRatio, `跟踪误差 ${fmt.pctPlain(t.rel.trackingError)}`, fmt.num, false) +
-        kpi('按笔胜率', t.trades.winRate, `${t.trades.count} 笔 · 盈亏比 ${fmt.num(t.trades.payoff)}`, fmt.pctPlain, false)
+        kpi('按笔胜率', t.trades.winRate, `${t.trades.count} 笔平仓${t.trades.spanning ? `（${t.trades.spanning} 笔建仓早于测试集）` : ''} · 盈亏比 ${fmt.num(t.trades.payoff)}`, fmt.pctPlain, false)
+      : '';
+    const ex = t.exposure;
+    $('#testExpo').innerHTML = ex
+      ? `暴露归因：剔除风格暴露后的 α <b class="${tone(ex.alpha)}">${fmt.pct(ex.alpha)}</b>（t = ${fmt.num(ex.alphaT)}）；` +
+        ex.loadings.map((l) => `${esc(l.label)} ${fmt.num(l.beta)}（t = ${fmt.num(l.t)}）`).join('，') + '。'
       : '';
     drawNav('#testChart', '#testReadout', t.dates, [
       { values: t.equity, color: 'var(--accent)', width: 1.8, label: '选定' },
@@ -1337,7 +1444,9 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       kpi('样本外年化', wf.stats.cagr, '基准 ' + fmt.pct(wf.benchStats.cagr), fmt.pct) +
       kpi('样本外夏普', wf.stats.sharpe, '基准 ' + fmt.num(wf.benchStats.sharpe), fmt.num, false) +
       kpi('样本外最大回撤', wf.stats.max_drawdown, '基准 ' + fmt.pct(wf.benchStats.max_drawdown), fmt.pct) +
-      kpi('跑赢基准的窗口', wf.windows.filter((w) => w.testReturn > w.benchReturn).length / wf.windows.length, `${wf.windows.length} 个窗口`, fmt.pctPlain, false);
+      kpi('跑赢基准的窗口', wf.windows.filter((w) => w.testReturn > w.benchReturn).length / wf.windows.length, `${wf.windows.length} 个窗口`, fmt.pctPlain, false) +
+      kpi('费用（占期初资金）', wf.fees, `年化换手 ${fmt.num(wf.turnover)} 倍`, fmt.pctPlain, false) +
+      kpi('按笔胜率', wf.trades.winRate, `${wf.trades.count} 笔平仓 · 盈亏比 ${fmt.num(wf.trades.payoff)}`, fmt.pctPlain, false);
     drawNav('#wfChart', '#wfReadout', wf.dates, [
       { values: wf.equity, color: 'var(--accent)', width: 1.8, label: '前推' },
       { values: wf.bench, color: 'var(--bench)', width: 1.3, label: '基准' },
@@ -1396,31 +1505,75 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     ], { band: s.band, yFmt: (v) => v.toFixed(2) });
   }
 
+  // 因子 IC 的自助法较慢，放到后台线程；无法创建后台线程时在主线程计算
+  function computeIC(h, done) {
+    const bt = state.research.bt;
+    const token = (state.icToken = (state.icToken || 0) + 1);
+    const finish = (ic) => { if (token === state.icToken) done(ic); };
+    const local = () => setTimeout(() => finish(R.factorIC(bt, h)), 30);
+    let w = null;
+    try { w = new Worker('worker.js'); } catch (e) { w = null; }
+    if (!w) return local();
+    if (state.icWorker) state.icWorker.terminate();
+    state.icWorker = w;
+    const stop = () => { w.terminate(); if (state.icWorker === w) state.icWorker = null; };
+    w.onmessage = (e) => { stop(); if (e.data.type === 'result') finish(e.data.result); else local(); };
+    w.onerror = (e) => { stop(); e.preventDefault(); local(); };
+    w.postMessage({ type: 'ic', payload: { data: activeData(), engine: engineOpts(), h } });
+  }
+
   function renderIC() {
     if (!state.research) return;
     const h = +$('#icH').value;
-    const ic = R.factorIC(state.research.bt, h);
-    state.research.ic = ic;
-    const sig = (t) => (Math.abs(t) > 2 ? (t > 0 ? 'up' : 'down') : '');
-    $('#icTable').innerHTML = '<thead><tr><th>因子</th><th>时序 IC</th><th>t 值</th><th>截面 IC</th><th>ICIR</th><th>t 值</th></tr></thead><tbody>' +
-      ic.map((f) => `<tr class="clickable ${f.id === state.icSel ? 'sel' : ''}" data-factor="${f.id}"><td>${esc(f.label)}</td>` +
-        `<td class="num">${fmt.num3(f.tsIC)}</td><td class="num ${sig(f.tsT)}">${fmt.num(f.tsT)}</td>` +
-        `<td class="num">${fmt.num3(f.csIC)}</td><td class="num">${fmt.num(f.csIR)}</td><td class="num ${sig(f.csT)}">${fmt.num(f.csT)}</td></tr>`).join('') + '</tbody>';
-    const nSig = ic.filter((f) => Math.abs(f.tsT) > 2).length + ic.filter((f) => Math.abs(f.csT) > 2).length;
-    const tests = ic.length * 2;
-    $('#icNote').innerHTML = `|t| &gt; 2 标红绿。这里同时做了 ${tests} 次检验，即使全是噪声，也会有约 ${(tests * 0.046).toFixed(1)} 个偶然"显著"；本次 ${nSig} 个。` +
-      `换一个预测周期或时间段仍然显著的因子才值得深挖。${state.research.bt.symbols.length < 3 ? '截面 IC 需要至少 3 只标的。' : ''}`;
-    renderQuantiles();
+    $('#icTable').innerHTML = '<tbody><tr><td>计算中（块自助法 200 次）…</td></tr></tbody>';
+    $('#icNote').textContent = '';
+    computeIC(h, (ic) => {
+      state.research.ic = ic;
+      const ci = (lo, hi) => {
+        if (!fin(lo)) return '<td class="num">—</td>';
+        const cls = lo > 0 ? 'up' : hi < 0 ? 'down' : 'note';
+        return `<td class="num ${cls}">${fmt.num3(lo)} ~ ${fmt.num3(hi)}</td>`;
+      };
+      $('#icTable').innerHTML = '<thead><tr><th>因子</th><th>时序 IC</th><th>95% 区间</th><th>截面 IC</th><th>95% 区间</th><th>ICIR</th><th>前半 / 后半</th></tr></thead><tbody>' +
+        ic.map((f) => `<tr class="clickable ${f.id === state.icSel ? 'sel' : ''}" data-factor="${f.id}"><td>${esc(f.label)}</td>` +
+          `<td class="num">${fmt.num3(f.tsIC)}</td>${ci(f.tsLo, f.tsHi)}` +
+          `<td class="num">${fmt.num3(f.csIC)}</td>${ci(f.csLo, f.csHi)}<td class="num">${fmt.num(f.csIR)}</td>` +
+          `<td class="num">${fin(f.csFirst) ? fmt.num3(f.csFirst) + ' / ' + fmt.num3(f.csSecond) : '—'}</td></tr>`).join('') + '</tbody>';
+      const sig = (lo, hi) => fin(lo) && (lo > 0 || hi < 0);
+      const nSig = ic.filter((f) => sig(f.tsLo, f.tsHi)).length + ic.filter((f) => sig(f.csLo, f.csHi)).length;
+      const tests = ic.filter((f) => fin(f.tsLo)).length + ic.filter((f) => fin(f.csLo)).length;
+      const nSym = state.research.bt.symbols.length;
+      $('#icNote').innerHTML = `区间不含 0 的标红绿。这里同时做了 ${tests} 次检验，即使全是噪声，也会有约 ${(tests * 0.05).toFixed(1)} 个偶然"显著"；本次 ${nSig} 个。` +
+        `换一个预测周期、时间段（看前半 / 后半）仍然显著的因子才值得深挖。` +
+        (nSym < 3 ? '截面 IC 需要至少 3 只标的。' : nSym < 10 ? `当前只有 ${nSym} 只标的，截面结论很不稳定。` : '');
+      renderQuantiles();
+    });
   }
 
   function renderQuantiles() {
+    if (!state.research || !state.research.ic) return;
     const h = +$('#icH').value;
     const f = state.research.ic.find((x) => x.id === state.icSel) || state.research.ic[0];
     state.icSel = f.id;
-    const q = R.factorQuantiles(state.research.bt, f.id, h, 5);
-    $('#qTitle').textContent = `分组收益：${f.label}，未来 ${h} 日`;
-    drawBars('#qChart', q.map((g) => `Q${g.group}`), [{ values: q.map((g) => g.mean), color: (v) => (v >= 0 ? 'var(--up)' : 'var(--down)') }],
-      { yFmt: (v) => (v * 100).toFixed(2) + '%' });
+    const p = R.factorPortfolios(state.research.bt, f.id, h);
+    $('#qTitle').textContent = `分组组合：${f.label}，每 ${h} 日调仓`;
+    if (!p.q) {
+      $('#qMeta').textContent = '';
+      $('#qChart').innerHTML = '';
+      $('#qReadout').innerHTML = '';
+      $('#qTable').innerHTML = `<tbody><tr><td>${esc(p.error)}（当前 ${state.research.bt.symbols.length} 只）。时序择时能力看上面的时序 IC。</td></tr></tbody>`;
+      return;
+    }
+    $('#qMeta').textContent = `${p.q} 组 · ${p.periods} 期 · ${p.dates[0]} ~ ${p.dates[p.dates.length - 1]}`;
+    const color = (k) => (k === p.q - 1 ? 'var(--up)' : k === 0 ? 'var(--down)' : 'var(--muted)');
+    const dates = [p.dates[0]].concat(p.dates);
+    drawNav('#qChart', '#qReadout', dates, p.groups.map((g, k) => ({ values: g.equity, color: color(k), width: k === 0 || k === p.q - 1 ? 1.6 : 1, label: 'Q' + g.group }))
+      .concat([{ values: p.longShort.equity, color: 'var(--accent)', width: 1.8, label: '多空' }]), null);
+    const row = (name, g, extra) => `<tr><td>${name}</td><td class="num ${tone(g.annReturn)}">${fmt.pct(g.annReturn)}</td><td class="num">${fmt.pctPlain(g.annVol)}</td>` +
+      `<td class="num">${fmt.num(g.sharpe)}</td>${extra}<td class="num ${tone(g.first)}">${fmt.pct(g.first)}</td><td class="num ${tone(g.second)}">${fmt.pct(g.second)}</td></tr>`;
+    $('#qTable').innerHTML = '<thead><tr><th>组（低→高）</th><th>年化（扣成本）</th><th>波动</th><th>夏普</th><th>毛年化</th><th>每期换手</th><th>前半段</th><th>后半段</th></tr></thead><tbody>' +
+      p.groups.map((g) => row('Q' + g.group, g, `<td class="num">${fmt.pct(g.grossReturn)}</td><td class="num">${fmt.pctPlain(g.turnover)}</td>`)).join('') +
+      row('<b>多空 Q' + p.q + '−Q1</b>', p.longShort, '<td></td><td></td>') + '</tbody>';
   }
 
   // ---------- 标签页 ----------
@@ -1453,6 +1606,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   setSource(src);
   renderCsvList();
   updateDataInfo();
+  updateHoldoutUI();
   $('#addRule').innerHTML = Object.entries(AQ.RULES).map(([id, r]) => `<option value="${id}">${esc(r.label)}</option>`).join('');
   renderBuilder();
 
@@ -1475,7 +1629,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   $('#controls').addEventListener('input', (e) => { if (onConfigInput(e)) autoRun(); });
   $('#controls').addEventListener('change', (e) => {
     if (e.target.tagName === 'SELECT' && onConfigInput(e)) autoRun();
-    if (TX_IDS.includes(e.target.id)) { state.researchDirty = true; if (e.target.id === 'start' || e.target.id === 'end') setDefaultSplit(true); autoRun(); if (state.tab === 'research') runResearch(); }
+    if (TX_IDS.includes(e.target.id) && e.target.id !== 'holdout') { state.researchDirty = true; if (e.target.id === 'start' || e.target.id === 'end') setDefaultSplit(true); autoRun(); if (state.tab === 'research') runResearch(); }
   });
   $('#stratType').addEventListener('change', (e) => { state.config.type = e.target.value; state.optSel = {}; renderBuilder(); autoRun(); });
   $('#addFactorBtn').addEventListener('click', () => {
@@ -1506,12 +1660,25 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       $('#start').value = '';
     }
     $('#end').value = '';
-    state.researchDirty = true;
-    setDefaultSplit(true);
-    autoRun();
-    if (state.tab === 'research') runResearch();
+    rangeChanged();
   });
   $('#onPreset').addEventListener('change', (e) => { if (e.target.value) $('#onSymbols').value = e.target.value; });
+  $('#holdout').addEventListener('change', () => { state.holdoutOpen = false; updateHoldoutUI(); rangeChanged(); });
+  $('#holdoutBtn').addEventListener('click', () => {
+    if (state.holdoutOpen) state.holdoutOpen = false;
+    else {
+      const rec = expLog();
+      const msg = rec.unlocks
+        ? `这份数据的最终留出期已经解锁过 ${rec.unlocks} 次。再看一次、再回头改策略，它就不再是样本外了。确定解锁？`
+        : '最终留出期应当只在策略完全定型后看一次。解锁后会记录次数。确定解锁？';
+      if (!window.confirm(msg)) return;
+      rec.unlocks++;
+      expSave(rec);
+      state.holdoutOpen = true;
+    }
+    updateHoldoutUI();
+    rangeChanged();
+  });
   $('#splitPreset').addEventListener('change', (e) => {
     if (e.target.value) setDefaultSplit(true, e.target.value.split(',').map(Number));
     e.target.value = '';

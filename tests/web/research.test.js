@@ -226,10 +226,52 @@ test('factor IC detects a planted predictive signal', () => {
   const bt = new AQ.Backtester(data, {});
   const ic = R.factorIC(bt, 1);
   const roc1 = ic.find((f) => f.id === 'roc1');
-  assert.ok(roc1.tsIC > 0.2 && roc1.tsT > 5, JSON.stringify(roc1));
-  const q = R.factorQuantiles(bt, 'roc1', 1, 5);
-  assert.equal(q.length, 5);
-  assert.ok(q[4].mean > q[0].mean);
+  assert.ok(roc1.tsIC > 0.2 && roc1.tsLo > 0.1 && roc1.tsHi > roc1.tsIC, JSON.stringify(roc1));
+});
+
+test('factor IC: duplicated symbols do not inflate the confidence interval', () => {
+  const one = series(1200, 41, 0, 0.012);
+  const single = R.factorIC(new AQ.Backtester({ '510300': one }, {}), 5);
+  const copies = {};
+  for (let k = 0; k < 9; k++) copies['51030' + k] = one;
+  const dup = R.factorIC(new AQ.Backtester(copies, {}), 5);
+  // 纯随机游走：绝大多数因子的 95% 置信区间应包含 0
+  const cover = single.filter((f) => f.tsLo <= 0 && f.tsHi >= 0).length;
+  assert.ok(cover >= single.length - 3, `${cover}/${single.length}`);
+  single.forEach((f, j) => {
+    close(dup[j].tsIC, f.tsIC, 1e-12);
+    close(dup[j].tsLo, f.tsLo, 1e-12);
+    close(dup[j].tsHi, f.tsHi, 1e-12);
+  });
+});
+
+test('block bootstrap indices stay in range and keep blocks contiguous', () => {
+  let x = 3;
+  const rnd = () => ((x = (x * 1664525 + 1013904223) >>> 0) / 4294967296);
+  const d = R.blockIndices(100, 5, rnd);
+  assert.equal(d.length, 100);
+  assert.ok(d.every((k) => k >= 0 && k < 100));
+  for (let k = 0; k < 100; k += 5) for (let j = 1; j < 5; j++) assert.equal(d[k + j], d[k] + j);
+});
+
+test('factor portfolios: tradable quintiles with turnover and cost', () => {
+  // 10 只标的，漂移与编号成正比；60 日动量越高的组收益越高
+  const data = {};
+  for (let k = 0; k < 10; k++) data['6000' + String(k).padStart(2, '0')] = series(1000, 50 + k, 0.0002 * (k - 4.5), 0.01);
+  const bt = new AQ.Backtester(data, {});
+  const p = R.factorPortfolios(bt, 'roc60', 20);
+  assert.equal(p.q, 5);
+  assert.equal(p.groups.length, 5);
+  assert.ok(p.groups[4].annReturn > p.groups[0].annReturn, JSON.stringify(p.groups.map((g) => g.annReturn)));
+  assert.ok(p.longShort.annReturn > 0);
+  p.groups.forEach((g) => {
+    assert.ok(g.turnover >= 0 && g.turnover <= 1);
+    assert.ok(g.grossReturn >= g.annReturn, '扣成本后不高于毛收益');
+    assert.equal(g.equity.length, p.periods + 1);
+  });
+  const free = R.factorPortfolios(bt, 'roc60', 20, { cost: 0 });
+  close(free.groups[2].annReturn, free.groups[2].grossReturn, 1e-12);
+  assert.equal(R.factorPortfolios(new AQ.Backtester({ a: series(300, 1), b: series(300, 2) }, {}), 'roc20', 5).q, 0);
 });
 
 test('eastmoney: proportional forward adjustment stays positive and matches hfq returns', () => {
@@ -373,4 +415,144 @@ test('applyParams keeps rule roles and handles factor weights', () => {
   assert.equal(cfg.rules[0].params.n, 20, '不修改原配置');
   // 规则未写 params 时也能套用参数
   assert.equal(R.applyParams({ rules: [{ id: 'macd' }] }, [{ path: 'r0.fast' }], [8]).rules[0].params.fast, 8);
+});
+
+// ---------- 风控与实际成交闭环 ----------
+
+function bookData(open, close, sym = '600000') {
+  const dates = dayList(close.length);
+  return { [sym]: { dates, open, close, high: close.map((c, i) => Math.max(c, open[i])), low: close.map((c, i) => Math.min(c, open[i])), volume: close.map(() => 1e6) } };
+}
+
+test('stop loss is measured from the actual fill price, not the signal price', () => {
+  // 第 4 天收盘 10 元出现入场信号；第 5 天开盘 10.8 元成交，收盘 10.2 元（按成交价已亏 5.56%）
+  const px = [9.6, 9.7, 9.8, 9.9, 10.0, 10.2, 10.2, 10.3, 10.4, 10.5];
+  const open = [9.6, 9.7, 9.8, 9.9, 10.0, 10.8, 10.2, 10.2, 10.3, 10.4];
+  const data = bookData(open, px);
+  const cfg = { rules: [{ id: 'price_ma', params: { n: 5 } }], stopLoss: 5 };
+  const bt = new AQ.Backtester(data, { rebalanceBand: 0 });
+  const res = bt.run(new RuleStrategy(cfg));
+  const buy = res.trades.find((t) => t.side === 'buy');
+  const sell = res.trades.find((t) => t.side === 'sell');
+  assert.equal(buy.date, bt.dates[5]);
+  close(buy.price, 10.8 * 1.0005, 1e-9);
+  assert.ok(sell, '按实际成本价计算已触发 5% 止损');
+  assert.equal(sell.date, bt.dates[6], '第 5 天收盘触发，第 6 天开盘卖出');
+  // 对照：理想化预览按信号价 10 元计算，不会止损
+  const b = bt.bars();
+  const preview = new RuleStrategy(cfg).generate(b.close, bt.dates, ['600000'], b);
+  assert.ok(!preview.slice(5).some((r) => r && r[0] === 0), '信号价口径下看不到这次止损');
+});
+
+test('a buy blocked at limit-up is not treated as a position', () => {
+  // 第 4 天信号；第 5 天开盘一字涨停买不进；第 6 天可以买入
+  const px = [9.6, 9.7, 9.8, 9.9, 10.0, 11.0, 11.1, 11.2, 11.3, 11.4];
+  const open = [9.6, 9.7, 9.8, 9.9, 10.0, 11.0, 11.05, 11.15, 11.25, 11.35];
+  const data = bookData(open, px);
+  const bt = new AQ.Backtester(data, { rebalanceBand: 0 });
+  const res = bt.run(new RuleStrategy({ rules: [{ id: 'price_ma', params: { n: 5 } }], maxHold: 2 }));
+  const buys = res.trades.filter((t) => t.side === 'buy');
+  const sells = res.trades.filter((t) => t.side === 'sell');
+  assert.equal(buys[0].date, bt.dates[6], '涨停当天没成交，次日才买入');
+  // 最长持有 2 天从实际成交日（第 6 天）算起：第 8 天收盘触发，第 9 天开盘卖出
+  assert.equal(sells[0].date, bt.dates[9]);
+});
+
+test('cooldown starts from the actual exit fill', () => {
+  const n = 40;
+  const px = ramp(n, 10, 0.1).map((p, i) => (i >= 12 && i < 14 ? 10.5 : p));
+  const data = bookData(px.slice(), px);
+  const bt = new AQ.Backtester(data, { rebalanceBand: 0 });
+  const trades = bt.run(new RuleStrategy({ rules: [{ id: 'price_ma', params: { n: 5 } }], cooldown: 5 })).trades;
+  const firstSell = trades.find((t) => t.side === 'sell');
+  const reBuy = trades.filter((t) => t.side === 'buy')[1];
+  const idx = (d) => bt.dates.indexOf(d);
+  assert.ok(reBuy && idx(reBuy.date) - idx(firstSell.date) > 5, `清仓 ${firstSell.date} 后 ${reBuy && reBuy.date} 才再买入`);
+});
+
+// ---------- 连续账户滚动前推 ----------
+
+test('switching to identical parameters mid-run leaves the account unchanged', () => {
+  const data = { '510300': series(800, 31), '510500': series(800, 32), '159915': series(800, 33) };
+  const bt = new AQ.Backtester(data, { rebalanceBand: 1 });
+  const cfg = { rules: [{ id: 'price_ma', params: { n: 20 } }], stopLoss: 8, trailATR: 3, maxPositions: 2 };
+  const whole = bt.run(new RuleStrategy(cfg));
+  const cuts = [0, 250, 400, 555, 799];
+  const segs = cuts.slice(0, -1).map((a, k) => ({ from: a, to: cuts[k + 1] - (k < cuts.length - 2 ? 1 : 0), strategy: new RuleStrategy(cfg) }));
+  const pieced = bt.run(new R.SwitchingStrategy(segs));
+  assert.ok(whole.trades.length > 10);
+  assert.deepEqual(pieced.trades, whole.trades);
+  assert.deepEqual(pieced.equity, whole.equity);
+});
+
+test('walk-forward runs one continuous account and never looks past the test start', () => {
+  const mk = () => ({ '510300': series(1500, 3), '510500': series(1500, 4), '159915': series(1500, 5) });
+  const data = mk();
+  const dates = new AQ.Backtester(data, {}).dates;
+  const input = (d) => ({
+    data: d,
+    engine: { initialCash: 1e6, fees: {}, slippage: 0.0005, rebalanceBand: 0.01 },
+    config: { rules: [{ id: 'ma_cross', params: { fast: 10, slow: 30 } }] },
+    space: [{ path: 'r0.fast', values: [5, 10, 20] }, { path: 'r0.slow', values: [30, 60] }],
+    method: 'grid', objective: 'sharpe', minTrades: 0,
+    valStart: dates[900], testStart: dates[1200],
+    wf: { enabled: true, trainYears: 1.5, testYears: 0.5, anchored: false },
+  });
+  const wf = R.optimize(input(data)).wf;
+  assert.ok(wf.windows.length >= 3);
+  // 各窗口收益连乘 = 连续账户的总收益（同一个账户，不是拼接）
+  const chained = wf.windows.reduce((acc, w) => acc * (1 + w.testReturn), 1);
+  close(chained, wf.equity[wf.equity.length - 1], 1e-9);
+  assert.ok(wf.fees > 0 && wf.turnover > 0);
+  assert.ok(wf.trades.count > 0);
+  // 篡改测试集的行情，前推结果不变
+  const d2 = mk();
+  for (const s of Object.keys(d2)) for (let i = 1200; i < 1500; i++) d2[s].close[i] *= 1.5, d2[s].open[i] *= 1.5, d2[s].high[i] *= 1.5, d2[s].low[i] *= 1.5;
+  const wf2 = R.optimize(input(d2)).wf;
+  assert.deepEqual(wf2.equity, wf.equity);
+  assert.deepEqual(wf2.windows, wf.windows);
+});
+
+// ---------- 暴露归因 ----------
+
+test('OLS with HAC recovers planted loadings and alpha', () => {
+  let x = 5;
+  const rnd = () => ((x = (x * 1664525 + 1013904223) >>> 0) / 4294967296) - 0.5;
+  const X = [], y = [];
+  for (let t = 0; t < 3000; t++) {
+    const f = [rnd() * 0.02, rnd() * 0.01];
+    X.push(f);
+    y.push(0.001 + 0.8 * f[0] - 0.5 * f[1] + rnd() * 0.002);
+  }
+  const fit = R.olsHAC(y, X);
+  close(fit.coef[0], 0.001, 1e-4);
+  close(fit.coef[1], 0.8, 0.02);
+  close(fit.coef[2], -0.5, 0.03);
+  assert.ok(fit.t[0] > 10 && fit.r2 > 0.9);
+});
+
+test('exposure: the equal-weight market itself has beta 1 and no alpha', () => {
+  const data = {};
+  for (let k = 0; k < 8; k++) data['6000' + k] = series(600, 60 + k, 0.0003 * (k - 3), 0.012);
+  const bt = new AQ.Backtester(data, {});
+  const sf = R.styleFactors(bt, 0.02);
+  const eq = [1];
+  for (let i = 1; i < bt.dates.length; i++) eq.push(eq[i - 1] * (1 + (Number.isFinite(sf.MKT[i]) ? sf.MKT[i] + 0.02 / 244 : 0)));
+  const ex = R.exposure(eq, sf, 0, bt.dates.length - 1, 0.02);
+  const mkt = ex.loadings.find((l) => l.id === 'MKT');
+  close(mkt.beta, 1, 1e-9);
+  close(ex.alpha, 0, 1e-9);
+  assert.deepEqual(ex.loadings.map((l) => l.id), ['MKT', 'MOM', 'LOWVOL']);
+  // 标的不足 6 只时只做市场因子
+  const few = new AQ.Backtester({ a: series(600, 1), b: series(600, 2), c: series(600, 3) }, {});
+  const ex2 = R.exposure(few.bars().close.a, R.styleFactors(few), 0, 599);
+  assert.deepEqual(ex2.missing, ['MOM', 'LOWVOL']);
+});
+
+test('deflated sharpe counts prior trials', () => {
+  const noise = Array.from({ length: 50 }, (_, i) => 0.05 * Math.sin(i * 1.7));
+  const now = R.deflatedSharpe(noise, 0.08, 1000, 0, 3);
+  const withPrior = R.deflatedSharpe(noise, 0.08, 1000, 0, 3, 500);
+  assert.equal(withPrior.trials, 500);
+  assert.ok(withPrior.prob < now.prob && withPrior.sr0 > now.sr0);
 });

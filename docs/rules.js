@@ -306,82 +306,112 @@
       });
     }
 
-    generate(close, dates, symbols, bars) {
-      const n = dates.length;
+    // 回测引擎调用：预先计算各规则的信号序列
+    prepare(close, dates, symbols, bars) {
       const N = symbols.length;
-      const slots = this.maxPositions > 0 ? Math.min(this.maxPositions, N) : N;
-      const entryIdx = this.rules.map((r, j) => (r.role !== 'exit' ? j : -1)).filter((j) => j >= 0);
-      const exitIdx = this.rules.map((r, j) => (r.role !== 'entry' ? j : -1)).filter((j) => j >= 0);
-      const holding = new Uint8Array(N);
-      const state = symbols.map((s) => ({
-        sigs: this.rules.map((r) => RULES[r.id].signal(bars, s, r.params)),
-        atr: this.trailATR ? cached(bars, s, 'atr14', () => ind.atr(bars.high[s], bars.low[s], bars.close[s], 14)) : null,
-        // 入选排序（信号多于空余仓位时）用近 20 日涨幅（不足 20 日时用已有天数），波动率加权用 20 日波动率
-        first: close[s].findIndex(fin),
-        vol: this.sizing === 'invvol' ? cached(bars, s, 'vol20', () => annVol(bars.close[s], 20)) : null,
-        entryPx: NaN, peak: NaN, entryDay: -1, exitDay: -Infinity,
-      }));
-      const out = new Array(n).fill(null);
-      const allOf = (st, idx, i, v) => idx.length > 0 && idx.every((j) => st.sigs[j][i] === v);
-      const anyOf = (st, idx, i, v) => idx.some((j) => st.sigs[j][i] === v);
+      this.ctx = {
+        close, symbols, N,
+        slots: this.maxPositions > 0 ? Math.min(this.maxPositions, N) : N,
+        entryIdx: this.rules.map((r, j) => (r.role !== 'exit' ? j : -1)).filter((j) => j >= 0),
+        exitIdx: this.rules.map((r, j) => (r.role !== 'entry' ? j : -1)).filter((j) => j >= 0),
+        state: symbols.map((s) => ({
+          sigs: this.rules.map((r) => RULES[r.id].signal(bars, s, r.params)),
+          atr: this.trailATR ? cached(bars, s, 'atr14', () => ind.atr(bars.high[s], bars.low[s], bars.close[s], 14)) : null,
+          vol: this.sizing === 'invvol' ? cached(bars, s, 'vol20', () => annVol(bars.close[s], 20)) : null,
+          // 入选排序（信号多于空余仓位时）用近 20 日涨幅（不足 20 日时用已有天数）
+          first: close[s].findIndex(fin),
+          peakEntry: -1, peak: NaN,
+        })),
+        desired: new Uint8Array(N),
+        emitted: false,
+      };
+    }
 
-      for (let i = 0; i < n; i++) {
-        let changed = i === 0;
-        // 1) 先处理出场，腾出仓位
-        for (let k = 0; k < N; k++) {
-          if (!holding[k]) continue;
-          const st = state[k];
-          const c = close[symbols[k]][i];
-          if (!fin(c)) continue;
-          st.peak = Math.max(st.peak, c);
-          const held = i - st.entryDay;
-          let exit = false;
-          if (held >= this.minHold) {
-            exit = this.exit === 'any' ? anyOf(st, exitIdx, i, -1) : allOf(st, exitIdx, i, -1);
-            if (this.takeProfit && c >= st.entryPx * (1 + this.takeProfit)) exit = true;
-          }
-          // 止损类不受最短持有期限制
-          if (this.stopLoss && c <= st.entryPx * (1 - this.stopLoss)) exit = true;
-          if (this.trailATR && fin(st.atr[i]) && c < st.peak - this.trailATR * st.atr[i]) exit = true;
-          if (this.maxHold && held >= this.maxHold) exit = true;
-          if (exit) {
-            holding[k] = 0;
-            st.exitDay = i;
-            changed = true;
-          }
+    /* 每天收盘后调用。ctx.shares 为实际持股，ctx.book[s] 为实际成交状态：
+     * cost 含费用的平均成本价、entry 建仓成交日、exit 最近清仓成交日。
+     * 止损、止盈、移动止损、最短/最长持有、冷却期全部以实际成交为准。 */
+    decide(i, { shares, book }) {
+      const c0 = this.ctx;
+      const { close, symbols, N, slots, entryIdx, exitIdx, state, desired } = c0;
+      const allOf = (st, idx, v) => idx.length > 0 && idx.every((j) => st.sigs[j][i] === v);
+      const anyOf = (st, idx, v) => idx.some((j) => st.sigs[j][i] === v);
+      const entrySignal = (st) => (this.entry === 'all' ? allOf(st, entryIdx, 1) : anyOf(st, entryIdx, 1));
+      let changed = !c0.emitted;
+
+      // 1) 已持有的：按实际成本价与成交日判断出场；未成交的买入意图：信号消失就撤销
+      for (let k = 0; k < N; k++) {
+        if (!desired[k]) continue;
+        const s = symbols[k];
+        const st = state[k];
+        const c = close[s][i];
+        if (!fin(c)) continue;
+        const bk = book[s];
+        if (!(shares[s] > 0)) {
+          if (!entrySignal(st)) { desired[k] = 0; changed = true; }
+          continue;
         }
-        // 2) 再处理入场：候选多于空余仓位时按 20 日动量择优
-        let free = slots - holding.reduce((a, b) => a + b, 0);
-        if (free > 0) {
-          const cands = [];
-          for (let k = 0; k < N; k++) {
-            if (holding[k]) continue;
-            const st = state[k];
-            if (!fin(close[symbols[k]][i]) || i - st.exitDay <= this.cooldown) continue;
-            const enter = this.entry === 'all' ? allOf(st, entryIdx, i, 1) : anyOf(st, entryIdx, i, 1);
-            if (enter) cands.push(k);
-          }
-          if (cands.length > free && this.maxPositions > 0) {
-            const score = (k) => {
-              const c = close[symbols[k]];
-              const r = c[i] / c[Math.max(state[k].first, i - 20)] - 1;
-              return fin(r) ? r : -Infinity;
-            };
-            cands.sort((a, b) => score(b) - score(a));
-          }
-          for (const k of cands.slice(0, free)) {
-            const st = state[k];
-            holding[k] = 1;
-            st.entryPx = close[symbols[k]][i];
-            st.peak = st.entryPx;
-            st.entryDay = i;
-            changed = true;
-          }
+        if (st.peakEntry !== bk.entry) {
+          // 新仓位（或切换参数后接手的仓位）：峰值从建仓成交日算起
+          st.peakEntry = bk.entry;
+          st.peak = bk.cost;
+          for (let j = Math.max(bk.entry, 0); j < i; j++) if (close[s][j] > st.peak) st.peak = close[s][j];
         }
-        if (!changed) continue;
-        out[i] = this.weights(holding, state, i, slots);
+        st.peak = Math.max(st.peak, c);
+        const held = i - bk.entry;
+        let exit = false;
+        if (held >= this.minHold) {
+          exit = this.exit === 'any' ? anyOf(st, exitIdx, -1) : allOf(st, exitIdx, -1);
+          if (this.takeProfit && c >= bk.cost * (1 + this.takeProfit)) exit = true;
+        }
+        // 止损类不受最短持有期限制
+        if (this.stopLoss && c <= bk.cost * (1 - this.stopLoss)) exit = true;
+        if (this.trailATR && fin(st.atr[i]) && c < st.peak - this.trailATR * st.atr[i]) exit = true;
+        if (this.maxHold && held >= this.maxHold) exit = true;
+        if (exit) { desired[k] = 0; changed = true; }
       }
-      return out;
+
+      // 2) 入场：候选多于空余仓位时按近 20 日涨幅择优；冷却期按实际清仓成交日计算
+      const free = slots - desired.reduce((a, b) => a + b, 0);
+      if (free > 0) {
+        const cands = [];
+        for (let k = 0; k < N; k++) {
+          if (desired[k]) continue;
+          const s = symbols[k];
+          if (!fin(close[s][i]) || shares[s] > 0 || i - book[s].exit <= this.cooldown) continue;
+          if (entrySignal(state[k])) cands.push(k);
+        }
+        if (cands.length > free && this.maxPositions > 0) {
+          const score = (k) => {
+            const c = close[symbols[k]];
+            const r = c[i] / c[Math.max(state[k].first, i - 20)] - 1;
+            return fin(r) ? r : -Infinity;
+          };
+          cands.sort((a, b) => score(b) - score(a));
+        }
+        for (const k of cands.slice(0, free)) { desired[k] = 1; changed = true; }
+      }
+
+      if (!changed) return null;
+      c0.emitted = true;
+      return this.weights(desired, state, i, slots);
+    }
+
+    /* 理想化预览：假设信号当天按收盘价全部成交，用于检查信号逻辑本身。
+     * 回测一律走引擎的 decide 路径，以实际成交为准。 */
+    generate(close, dates, symbols, bars) {
+      this.prepare(close, dates, symbols, bars);
+      const shares = Object.fromEntries(symbols.map((s) => [s, 0]));
+      const book = Object.fromEntries(symbols.map((s) => [s, { cost: NaN, entry: -1, exit: -Infinity }]));
+      return dates.map((_, i) => {
+        const row = this.decide(i, { shares, book });
+        if (row) {
+          symbols.forEach((s, k) => {
+            if (row[k] > 0 && !shares[s]) { shares[s] = 1; book[s] = { cost: close[s][i], entry: i, exit: book[s].exit }; }
+            else if (!(row[k] > 0) && shares[s]) { shares[s] = 0; book[s] = { cost: NaN, entry: -1, exit: i }; }
+          });
+        }
+        return row;
+      });
     }
 
     weights(holding, state, i, slots) {

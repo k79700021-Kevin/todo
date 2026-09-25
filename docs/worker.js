@@ -1,9 +1,18 @@
-/* 后台线程：运行参数优化，不阻塞页面。 */
+/* 后台线程：运行参数优化与因子 IC，不阻塞页面。 */
 /* global importScripts */
 importScripts('indicators.js', 'engine.js', 'rules.js', 'research.js');
 
 self.onmessage = (e) => {
   const { type, payload } = e.data;
+  const R = self.AQ.research;
+  if (type === 'ic') {
+    try {
+      self.postMessage({ type: 'result', result: R.factorIC(R.makeBacktester(payload.data, payload.engine), payload.h) });
+    } catch (err) {
+      self.postMessage({ type: 'error', message: err.message || String(err) });
+    }
+    return;
+  }
   if (type !== 'optimize') return;
   try {
     let last = 0;
