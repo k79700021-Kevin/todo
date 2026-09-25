@@ -149,6 +149,13 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
 .heat { display: grid; gap: 2px; font: 11px var(--mono); }
 .heat .cell { padding: 6px 2px; text-align: center; border-radius: 3px; font-variant-numeric: tabular-nums; }
 .heat .hd { color: var(--muted); text-align: center; padding: 4px 2px; }
+.chips-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip-btn { font: 13px var(--sans); color: var(--ink); background: var(--surface-2); border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; cursor: pointer; }
+.chip-btn:hover { border-color: var(--accent); }
+.splitbar { display: flex; height: 22px; border-radius: 6px; overflow: hidden; font: 11px/22px var(--sans); color: #fff; text-align: center; }
+.splitbar div { overflow: hidden; white-space: nowrap; }
+.monthly td, .monthly th { padding: 5px 6px; font-size: 12px; }
+.factor-row { display: grid; grid-template-columns: 1fr 90px auto; gap: 8px; align-items: end; }
 .callout { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 10px 12px; border-radius: 0 8px 8px 0; font-size: 14px; }
 .foot { margin-top: 24px; font-size: 12px; color: var(--muted); display: grid; gap: 4px; }
 .foot a { color: var(--accent); }
@@ -201,14 +208,38 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
           <ul class="filelist" id="csvList"></ul>
         </div>
         <div data-pane="online" hidden>
+          <label for="onPreset">常用股票池
+            <select id="onPreset">
+              <option value="">自定义</option>
+              <option value="510300,510500,159915,518880,511260">大类资产 ETF：沪深300、中证500、创业板、黄金、国债</option>
+              <option value="512880,512800,512010,512690,515030,512480,512660,159928,512400,515790,512170,515880">行业 ETF（12 只，用于截面选股）</option>
+              <option value="600519,000858,000333,600036,601318,000651,600276,601166,600900,000001">大盘蓝筹（10 只）</option>
+            </select>
+          </label>
           <label for="onSymbols">代码（逗号分隔）<input id="onSymbols" value="510300,510500,159915,518880,511260" autocomplete="off"></label>
           <label for="onAdjust">复权
             <select id="onAdjust"><option value="qfq">等比前复权（推荐）</option><option value="hfq">后复权</option><option value="none">不复权</option></select>
           </label>
           <button type="button" class="btn btn-secondary block" id="fetchBtn">获取行情</button>
-          <p class="note" id="onStatus">从东方财富获取日线，区间取"交易设置"里的起止日期。在 Claude 里打开时外部接口会被拦截，请用 GitHub Pages 地址。</p>
+          <p class="note" id="onStatus">从东方财富获取日线（下面的回测区间为空时取 2010 年至今）。个别代码失败会跳过并提示。在 Claude 里打开时外部接口会被拦截，请用 GitHub Pages 地址。</p>
         </div>
         <p class="note" id="dataInfo"></p>
+      </section>
+
+      <section>
+        <h2>回测区间</h2>
+        <div class="fields">
+          <label for="start">开始日期<input type="date" id="start"></label>
+          <label for="end">结束日期<input type="date" id="end"></label>
+        </div>
+        <div class="chips-row" id="rangePresets">
+          <button type="button" class="chip-btn" data-years="1">近 1 年</button>
+          <button type="button" class="chip-btn" data-years="3">近 3 年</button>
+          <button type="button" class="chip-btn" data-years="5">近 5 年</button>
+          <button type="button" class="chip-btn" data-years="10">近 10 年</button>
+          <button type="button" class="chip-btn" data-years="0">全部</button>
+        </div>
+        <p class="note">回测、参数优化、因子研究都只使用这个区间内的数据。</p>
       </section>
 
       <section>
@@ -216,6 +247,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
         <label for="stratType">类型
           <select id="stratType">
             <option value="rules">规则组合（指标积木）</option>
+            <option value="factor">多因子选股</option>
             <option value="momentum">动量轮动</option>
             <option value="buy_hold">买入持有</option>
           </select>
@@ -234,10 +266,20 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
               <select id="cfg_exit" data-path="cfg.exit"><option value="any">任一规则看空</option><option value="all">所有规则都看空</option></select>
             </label>
             <label for="cfg_sizing" class="wide">仓位
-              <select id="cfg_sizing" data-path="cfg.sizing"><option value="fixed">每只固定 1/N（N = 标的数）</option><option value="equal">资金在持有的标的间等分</option></select>
+              <select id="cfg_sizing" data-path="cfg.sizing"><option value="fixed">每只固定 1/N（N = 标的数或持仓上限）</option><option value="equal">资金在持有的标的间等分</option><option value="invvol">按波动率倒数分配（低波动多配）</option></select>
             </label>
           </div>
-          <div class="fields three" id="riskFields"></div>
+          <h2>风控与持仓（0 = 不启用）</h2>
+          <div class="fields" id="riskFields"></div>
+        </div>
+        <div id="factorBox" class="logic" hidden>
+          <p class="note">每个调仓日按各因子在标的之间的排名打分，按权重相加，买入综合分最高的几只。权重为负表示因子值越小越好（如反转、低波动）。标的越多，截面选股越有意义。</p>
+          <div id="factorList" class="logic"></div>
+          <div class="addrow">
+            <select id="addFactor" aria-label="选择要添加的因子"></select>
+            <button type="button" class="btn btn-secondary" id="addFactorBtn">添加</button>
+          </div>
+          <div class="fields" id="factorFields"></div>
         </div>
         <div id="momBox" class="fields" hidden></div>
         <p class="note" id="bhBox" hidden>所有标的都有行情后等权买入并一直持有，与基准相同。</p>
@@ -246,8 +288,6 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       <details class="costs">
         <summary>交易设置</summary>
         <div class="fields">
-          <label for="start">开始日期<input type="date" id="start"></label>
-          <label for="end">结束日期<input type="date" id="end"></label>
           <label for="cash">初始资金（元）<input type="number" id="cash" value="1000000" min="10000" step="10000"></label>
           <label for="commission">佣金（万分之）<input type="number" id="commission" value="2.5" min="0" step="0.1"></label>
           <label for="minCommission">最低佣金（元）<input type="number" id="minCommission" value="5" min="0" step="1"></label>
@@ -288,6 +328,19 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
           <div class="table-wrap"><table id="metrics"></table></div>
         </div>
         <div class="card">
+          <div class="card-head"><h3>相对基准</h3><span class="note">基准为全部标的等权买入持有</span></div>
+          <div class="kpis" id="relKpis"></div>
+          <p class="note">α 为 CAPM 年化超额收益（剔除 β 带来的部分），信息比率 = 年化超额收益 / 跟踪误差，通常 &gt; 0.5 才算有价值。</p>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>按笔统计</h3><span class="note" id="rtNote"></span></div>
+          <div class="kpis" id="rtKpis"></div>
+        </div>
+        <div class="card">
+          <h3>月度收益</h3>
+          <div class="table-wrap"><table id="monthly" class="monthly"></table></div>
+        </div>
+        <div class="card">
           <div class="card-head"><h3>成交记录</h3><span class="note" id="tradeCount"></span></div>
           <div class="table-wrap"><table id="trades"></table></div>
           <button type="button" class="linkbtn" id="moreTrades" hidden>显示全部</button>
@@ -311,10 +364,19 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
                 <option value="calmar">卡玛比率</option><option value="cagr">年化收益</option>
               </select>
             </label>
-            <label for="optMinTrades">样本内最少成交<input type="number" id="optMinTrades" value="10" min="0" step="1"></label>
-            <label for="optSplit">样本外起始<input type="date" id="optSplit"></label>
+            <label for="optMinTrades">训练集最少成交<input type="number" id="optMinTrades" value="10" min="0" step="1"></label>
           </div>
-          <label class="check"><input type="checkbox" id="wfOn" checked>滚动前推检验（walk-forward）</label>
+          <h2>数据划分</h2>
+          <div class="fields three">
+            <label for="valStart">验证集起始<input type="date" id="valStart"></label>
+            <label for="testStart">测试集起始<input type="date" id="testStart"></label>
+            <label for="splitPreset">快速设置
+              <select id="splitPreset"><option value="">—</option><option value="60,80">60 / 20 / 20</option><option value="50,75">50 / 25 / 25</option><option value="70,85">70 / 15 / 15</option></select>
+            </label>
+          </div>
+          <div class="splitbar" id="splitBar"></div>
+          <p class="note">训练集给参数排序，验证集在训练排名前 10% 中选出最终参数，测试集锁定到最后一次性检验。滚动前推只在训练+验证段内进行。</p>
+          <label class="check"><input type="checkbox" id="wfOn" checked>滚动前推检验（walk-forward，训练+验证段内）</label>
           <div class="fields three" id="wfFields">
             <label for="wfTrain">训练窗口（年）<input type="number" id="wfTrain" value="3" min="0.5" step="0.5"></label>
             <label for="wfTest">检验窗口（年）<input type="number" id="wfTest" value="1" min="0.25" step="0.25"></label>
@@ -332,7 +394,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
           <div class="kpis" id="optKpis"></div>
           <div class="callout" id="optVerdict"></div>
           <div class="card">
-            <div class="card-head"><h3>最优参数组合</h3><span class="note">按样本内目标排序；点"应用"送回左侧并回测</span></div>
+            <div class="card-head"><h3>训练集排名</h3><span class="note">★ 为验证集选出的参数；点"应用"送回左侧并回测</span></div>
             <div class="table-wrap"><table id="optTop"></table></div>
           </div>
           <div class="card" id="heatCard">
@@ -340,9 +402,27 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
             <div class="fields three">
               <label for="heatX">横轴<select id="heatX"></select></label>
               <label for="heatY">纵轴<select id="heatY"></select></label>
-              <label for="heatM">数值<select id="heatM"><option value="is">样本内</option><option value="oos">样本外</option></select></label>
+              <label for="heatM">数值<select id="heatM"><option value="tr">训练集</option><option value="va">验证集</option></select></label>
             </div>
             <div style="overflow-x:auto"><div class="heat" id="heat"></div></div>
+          </div>
+          <div class="card" id="testCard">
+            <div class="card-head"><h3>测试集</h3><span class="note" id="testMeta"></span></div>
+            <div id="testLocked">
+              <p class="note">测试集只应在参数定下来之后看一次。看过之后再回头调参，测试集就被"污染"了，不再是样本外。</p>
+              <button type="button" class="btn btn-secondary" id="revealTest">揭晓选定参数的测试集结果</button>
+            </div>
+            <div id="testBody" hidden>
+              <div class="callout" id="testWarn"></div>
+              <div class="kpis" id="testKpis"></div>
+              <div class="kpis" id="testRel"></div>
+              <div class="readout" id="testReadout"></div>
+              <div class="chart" id="testChart"></div>
+              <div class="legend">
+                <span><i style="background:var(--accent)"></i>选定参数</span>
+                <span><i style="background:var(--bench)"></i>基准</span>
+              </div>
+            </div>
           </div>
           <div class="card" id="wfCard">
             <div class="card-head"><h3>滚动前推：拼接的样本外净值</h3><span class="note" id="wfMeta"></span></div>
@@ -421,10 +501,18 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   // ---------- 状态 ----------
   const DEFAULT_CONFIG = {
     type: 'rules',
-    rules: [{ id: 'macd', params: AQ.defaultParams('macd') }, { id: 'price_ma', params: { n: 60 } }],
-    entry: 'all', exit: 'any', sizing: 'fixed', stopLoss: 0, takeProfit: 0, trailATR: 0,
+    rules: [{ id: 'macd', role: 'both', params: AQ.defaultParams('macd') }, { id: 'price_ma', role: 'both', params: { n: 60 } }],
+    entry: 'all', exit: 'any', sizing: 'fixed',
+    stopLoss: 0, takeProfit: 0, trailATR: 0, maxPositions: 0, minHold: 0, maxHold: 0, cooldown: 0,
     momentum: { lookback: 60, topN: 2, rebalance: 20, absFilter: true },
+    factor: { factors: [{ id: 'roc60', weight: 1 }, { id: 'vol20', weight: -1 }], topN: 2, rebalance: 20, trendN: 60, sizing: 'equal' },
   };
+  const FACTOR_PARAMS = {
+    topN: { label: '持有几只', def: 2, min: 1, step: 1, range: [1, 4, 1] },
+    rebalance: { label: '调仓间隔（交易日）', def: 20, min: 1, step: 1, range: [5, 40, 5] },
+    trendN: { label: '大盘趋势均线（0 = 不过滤）', def: 60, min: 0, step: 10, range: [0, 120, 60] },
+  };
+  const WEIGHT_SPEC = { label: '权重', min: -5, step: 0.5, range: [-1, 1, 1] };
   const state = {
     tab: 'backtest', source: 'sample', csv: {}, online: {},
     config: JSON.parse(JSON.stringify(DEFAULT_CONFIG)),
@@ -468,19 +556,32 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     const c = state.config;
     $('#stratType').value = c.type;
     $('#rulesBox').hidden = c.type !== 'rules';
+    $('#factorBox').hidden = c.type !== 'factor';
     $('#momBox').hidden = c.type !== 'momentum';
     $('#bhBox').hidden = c.type !== 'buy_hold';
     $('#ruleList').innerHTML = c.rules.map((r, i) => {
       const def = AQ.RULES[r.id];
       const inputs = Object.entries(def.params).map(([k, spec]) => paramInput(`r${i}.${k}`, spec, r.params[k] ?? spec.def)).join('');
+      const role = `<label for="in_r${i}_role" class="wide">用途<select id="in_r${i}_role" data-path="r${i}.role">` +
+        Object.entries(AQ.ROLES).map(([v, label]) => `<option value="${v}" ${(r.role || 'both') === v ? 'selected' : ''}>${label}</option>`).join('') +
+        '</select></label>';
       return `<div class="rule"><div class="rule-head"><strong>${esc(def.label)}</strong>` +
         `<button type="button" class="linkbtn" data-remove-rule="${i}">移除</button></div>` +
-        `<p class="note">${esc(def.desc)}</p><div class="fields">${inputs}</div></div>`;
+        `<p class="note">${esc(def.desc)}</p><div class="fields">${inputs}${role}</div></div>`;
     }).join('') || '<p class="note">还没有规则，从下面添加。</p>';
     $('#cfg_entry').value = c.entry;
     $('#cfg_exit').value = c.exit;
     $('#cfg_sizing').value = c.sizing;
     $('#riskFields').innerHTML = Object.entries(AQ.RISK_PARAMS).map(([k, spec]) => paramInput('risk.' + k, spec, c[k])).join('');
+    const f = c.factor;
+    const facOpts = (sel) => R.FACTORS.map((x) => `<option value="${x.id}" ${x.id === sel ? 'selected' : ''}>${esc(x.label)}</option>`).join('');
+    $('#factorList').innerHTML = f.factors.map((x, i) =>
+      `<div class="factor-row"><label for="in_f${i}_id">因子<select id="in_f${i}_id" data-path="f${i}.id">${facOpts(x.id)}</select></label>` +
+      paramInput(`f${i}.weight`, WEIGHT_SPEC, x.weight) +
+      `<button type="button" class="linkbtn" data-remove-factor="${i}">移除</button></div>`).join('') || '<p class="note">还没有因子，从下面添加。</p>';
+    $('#addFactor').innerHTML = facOpts('');
+    $('#factorFields').innerHTML = Object.entries(FACTOR_PARAMS).map(([k, spec]) => paramInput('fs.' + k, spec, f[k])).join('') +
+      `<label for="in_fs_sizing">仓位<select id="in_fs_sizing" data-path="fs.sizing"><option value="equal" ${f.sizing !== 'invvol' ? 'selected' : ''}>等权</option><option value="invvol" ${f.sizing === 'invvol' ? 'selected' : ''}>按波动率倒数</option></select></label>`;
     const m = c.momentum;
     $('#momBox').innerHTML =
       paramInput('mom.lookback', { label: '回看天数', min: 5, step: 1 }, m.lookback) +
@@ -499,6 +600,9 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     if (head === 'cfg') c[key] = val;
     else if (head === 'risk') c[key] = fin(val) ? val : 0;
     else if (head === 'mom') c.momentum[key] = val;
+    else if (head === 'fs') c.factor[key] = val;
+    else if (head[0] === 'f') c.factor.factors[+head.slice(1)][key] = val;
+    else if (key === 'role') c.rules[+head.slice(1)].role = val;
     else c.rules[+head.slice(1)].params[key] = val;
     return true;
   }
@@ -506,7 +610,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   function buildStrategy(config = state.config) {
     if (config.type === 'momentum') return new AQ.MomentumRotation(config.momentum);
     if (config.type === 'buy_hold') return new AQ.BuyAndHold();
-    return new AQ.RuleStrategy(config);
+    return R.buildStrategy(config);
   }
 
   function describeStrategy(config = state.config) {
@@ -515,8 +619,18 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       return `动量轮动 · 回看 ${m.lookback} 日 · 持有 ${m.topN} 只 · 每 ${m.rebalance} 日调仓${m.absFilter ? ' · 绝对动量过滤' : ''}`;
     }
     if (config.type === 'buy_hold') return '买入持有';
-    const rules = config.rules.map((r) => `${AQ.RULES[r.id].label}(${Object.values(r.params).join(',')})`);
-    const risk = [config.stopLoss && `止损 ${config.stopLoss}%`, config.takeProfit && `止盈 ${config.takeProfit}%`, config.trailATR && `ATR×${config.trailATR} 移动止损`].filter(Boolean);
+    if (config.type === 'factor') {
+      const f = config.factor;
+      const label = (id) => (R.FACTORS.find((x) => x.id === id) || { label: id }).label;
+      const parts = f.factors.filter((x) => +x.weight).map((x) => `${label(x.id)}×${x.weight}`);
+      return `多因子：${parts.join(' + ')} · 持有 ${f.topN} 只 · 每 ${f.rebalance} 日调仓${f.trendN ? ` · ${f.trendN} 日趋势过滤` : ''}`;
+    }
+    const roleTag = { entry: '[入]', exit: '[出]', both: '' };
+    const rules = config.rules.map((r) => `${AQ.RULES[r.id].label}(${Object.values(r.params).join(',')})${roleTag[r.role || 'both']}`);
+    const risk = [config.stopLoss && `止损 ${config.stopLoss}%`, config.takeProfit && `止盈 ${config.takeProfit}%`,
+      config.trailATR && `ATR×${config.trailATR} 移动止损`, config.maxPositions && `最多 ${config.maxPositions} 只`,
+      config.minHold && `至少持有 ${config.minHold} 天`, config.maxHold && `最多持有 ${config.maxHold} 天`,
+      config.cooldown && `冷却 ${config.cooldown} 天`].filter(Boolean);
     return [rules.join(config.entry === 'all' ? ' 且 ' : ' 或 '), ...risk].join(' · ');
   }
 
@@ -628,42 +742,44 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
 
   async function onFetch() {
     const btn = $('#fetchBtn');
-    const syms = $('#onSymbols').value.split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean);
+    const syms = [...new Set($('#onSymbols').value.split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean))];
     const bad = syms.filter((s) => !/^\d{6}$/.test(s));
     if (!syms.length || bad.length) return showStatus(`代码需要是 6 位数字：${bad.join('、') || '（空）'}`, true);
-    const start = $('#start').value || '2010-01-01';
-    const end = $('#end').value || new Date().toISOString().slice(0, 10);
+    // 一次取全历史，之后改回测区间不用重新获取
+    const start = '2005-01-01';
+    const end = new Date().toISOString().slice(0, 10);
+    const adjust = $('#onAdjust').value;
     btn.disabled = true;
-    const got = {};
-    try {
-      for (const s of syms) {
-        showStatus(`正在获取 ${s}（${Object.keys(got).length + 1}/${syms.length}）…`);
-        // 东方财富偶尔直接断开连接，失败后稍等重试，最多 3 次
-        for (let attempt = 1; ; attempt++) {
-          try {
-            const adjust = $('#onAdjust').value;
-            // 等比前复权 = 后复权价按最新真实价缩放，需要后复权与不复权两份数据
-            got[s] = adjust === 'qfq'
-              ? AQ.em.proportional(await fetchEastmoney(s, start, end, 'hfq'), await fetchEastmoney(s, start, end, 'none'), s)
-              : await fetchEastmoney(s, start, end, adjust);
-            AQ.em.checkPositive(got[s], s);
+    const got = {}, failed = [];
+    for (const [n, s] of syms.entries()) {
+      showStatus(`正在获取 ${s}（${n + 1}/${syms.length}）…`);
+      // 东方财富偶尔直接断开连接，失败后稍等重试，最多 3 次；仍失败则跳过这只
+      for (let attempt = 1; ; attempt++) {
+        try {
+          // 等比前复权 = 后复权价按最新真实价缩放，需要后复权与不复权两份数据
+          got[s] = adjust === 'qfq'
+            ? AQ.em.proportional(await fetchEastmoney(s, start, end, 'hfq'), await fetchEastmoney(s, start, end, 'none'), s)
+            : await fetchEastmoney(s, start, end, adjust);
+          AQ.em.checkPositive(got[s], s);
+          break;
+        } catch (e) {
+          if (attempt >= 3 || /没有数据|不能用于回测/.test(e.message)) {
+            failed.push(`${s}（${e.message.replace(/^\d{6}：/, '').slice(0, 40)}）`);
+            delete got[s];
             break;
-          } catch (e) {
-            if (attempt >= 3 || /没有数据/.test(e.message)) throw e;
-            showStatus(`${s} 第 ${attempt} 次失败，${attempt * 2} 秒后重试…`);
-            await new Promise((r) => setTimeout(r, attempt * 2000));
           }
+          showStatus(`${s} 第 ${attempt} 次失败，${attempt * 2} 秒后重试…`);
+          await new Promise((r) => setTimeout(r, attempt * 2000));
         }
       }
-      state.online = got;
-      saveData();
-      showStatus(`已获取 ${syms.length} 只，${start} ~ ${end}，已保存在本机。`);
-      dataChanged();
-    } catch (e) {
-      showStatus(e.message, true);
-    } finally {
-      btn.disabled = false;
     }
+    btn.disabled = false;
+    const ok = Object.keys(got);
+    if (!ok.length) return showStatus('全部获取失败：' + failed.join('；'), true);
+    state.online = got;
+    saveData();
+    showStatus(`已获取 ${ok.length} 只（2005 年至今），已保存在本机。` + (failed.length ? ` 失败 ${failed.length} 只：${failed.join('；')}` : ''), failed.length > 0);
+    dataChanged();
   }
   function showStatus(msg, isErr) {
     const el = $('#onStatus');
@@ -732,12 +848,34 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
         const c1 = f === 'pct' ? tone(m[k]) : '', c2 = f === 'pct' ? tone(bm[k]) : '';
         return `<tr><td>${label}</td><td class="num ${c1}">${fmt[f](m[k])}</td><td class="num ${c2}">${fmt[f](bm[k])}</td></tr>`;
       }).join('') + '</tbody>';
+    const rel = R.relativeStats(res.equity, state.last.bench.equity, 0, n - 1, rf());
+    $('#relKpis').innerHTML = rel
+      ? kpi('年化 α', rel.alpha, 'CAPM 超额', fmt.pct) + kpi('β', rel.beta, '对基准的敏感度', fmt.num, false) +
+        kpi('信息比率', rel.infoRatio, `跟踪误差 ${fmt.pctPlain(rel.trackingError)}`, fmt.num, false) +
+        kpi('超额收益', rel.excessReturn, '区间累计', fmt.pct)
+      : '';
+    const rt = R.roundTrips(res.trades, res.dates);
+    $('#rtNote').textContent = `${rt.count} 笔已平仓${rt.open ? `，${rt.open} 笔持仓中` : ''}；含全部费用`;
+    $('#rtKpis').innerHTML =
+      kpi('胜率', rt.winRate, `${rt.list.filter((x) => x.pnl > 0).length} 赢 / ${rt.list.filter((x) => x.pnl <= 0).length} 输`, fmt.pctPlain, false) +
+      kpi('盈亏比', rt.payoff, `平均盈利 ${fmt.pct(rt.avgWin)} / 亏损 ${fmt.pct(rt.avgLoss)}`, fmt.num, false) +
+      kpi('利润因子', rt.profitFactor, '总盈利 / 总亏损', fmt.num, false) +
+      kpi('平均持有', rt.avgDays, '交易日', fmt.int, false);
+    renderMonthly(R.monthlyReturns(res.dates, res.equity));
     renderTrades();
     renderSignal();
     drawNav('#chart', '#readout', res.dates, [
       { values: res.equity.map((v) => v / res.initialCash), color: 'var(--accent)', width: 1.8, label: '策略' },
       { values: state.last.bench.equity.map((v) => v / res.initialCash), color: 'var(--bench)', width: 1.3, label: '基准' },
     ], m._drawdown);
+  }
+
+  function renderMonthly(m) {
+    const cell = (v) => (v === null || !fin(v) ? '<td></td>' : `<td class="num ${tone(v)}">${(v * 100).toFixed(1)}</td>`);
+    $('#monthly').innerHTML = '<thead><tr><th>年份</th>' + Array.from({ length: 12 }, (_, i) => `<th>${i + 1}月</th>`).join('') +
+      '<th>全年</th></tr></thead><tbody>' +
+      m.years.slice().reverse().map((y) => `<tr><td class="num">${y}</td>${m.rows[y].months.map(cell).join('')}${cell(m.rows[y].year)}</tr>`).join('') +
+      '</tbody>';
   }
 
   function renderTrades() {
@@ -911,6 +1049,12 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   function spaceRows() {
     const c = state.config;
     const rows = [];
+    if (c.type === 'factor') {
+      const label = (id) => (R.FACTORS.find((x) => x.id === id) || { label: id }).label;
+      c.factor.factors.forEach((f, i) => rows.push({ path: `f${i}.weight`, label: `权重 · ${label(f.id)}`, spec: WEIGHT_SPEC, cur: f.weight }));
+      Object.entries(FACTOR_PARAMS).forEach(([k, spec]) => rows.push({ path: 'fs.' + k, label: '选股 · ' + spec.label, spec, cur: c.factor[k] }));
+      return rows;
+    }
     c.rules.forEach((r, i) => Object.entries(AQ.RULES[r.id].params).forEach(([k, spec]) => {
       rows.push({ path: `r${i}.${k}`, label: `${AQ.RULES[r.id].label} · ${spec.label}`, spec, cur: r.params[k] ?? spec.def });
     }));
@@ -919,18 +1063,18 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   }
 
   function renderSpace() {
-    if (state.config.type !== 'rules') {
+    if (!['rules', 'factor'].includes(state.config.type)) {
       $('#spaceTable').innerHTML = '';
-      $('#optHint').textContent = '参数优化针对"规则组合"策略。在左侧把策略类型切换到"规则组合"。';
+      $('#optHint').textContent = '参数优化支持"规则组合"和"多因子选股"。在左侧切换策略类型。';
       $('#optRun').disabled = true;
       $('#gridCount').textContent = '';
       return;
     }
-    $('#optHint').textContent = '勾选要优化的参数并设置范围。优化的是左侧"规则组合"里当前这套规则。';
+    $('#optHint').textContent = `勾选要优化的参数并设置范围。优化的是左侧当前这套${state.config.type === 'factor' ? '多因子选股' : '规则组合'}。勾选的参数越多，组合数成倍增加，过拟合风险也越大。`;
     $('#optRun').disabled = false;
     const rows = spaceRows();
     const sel = state.optSel;
-    if (!Object.keys(sel).length) rows.slice(0, 2).forEach((r) => (sel[r.path] = { on: true }));
+    if (!rows.some((r) => sel[r.path] && sel[r.path].on)) rows.slice(0, 2).forEach((r) => (sel[r.path] = { ...(sel[r.path] || {}), on: true }));
     $('#spaceTable').innerHTML = '<thead><tr><th>参数</th><th>优化</th><th>当前</th><th>起</th><th>止</th><th>步长</th><th>个数</th></tr></thead><tbody>' +
       rows.map((r) => {
         const s = sel[r.path] || (sel[r.path] = { on: false });
@@ -961,14 +1105,33 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     $('#optSamples').closest('label').style.opacity = method === 'random' ? 1 : 0.5;
   }
 
-  function setDefaultSplit(force) {
+  function rangeDates() {
+    const raw = rawData() || {};
+    const lo = $('#start').value || '0', hi = $('#end').value || '9';
+    const set = new Set();
+    Object.values(raw).forEach((d) => d.dates.forEach((x) => { if (x >= lo && x <= hi) set.add(x); }));
+    return [...set].sort();
+  }
+
+  function setDefaultSplit(force, pcts) {
     try {
-      const raw = rawData();
-      const syms = Object.keys(raw || {});
-      if (!syms.length || ($('#optSplit').value && !force)) return;
-      const dates = raw[syms[0]].dates.filter((d) => d >= ($('#start').value || '0') && d <= ($('#end').value || '9'));
-      $('#optSplit').value = dates[Math.floor(dates.length * 0.7)] || '';
+      const dates = rangeDates();
+      if (!dates.length || ($('#valStart').value && $('#testStart').value && !force)) return renderSplitBar();
+      const [a, b] = pcts || [60, 80];
+      $('#valStart').value = dates[Math.floor((dates.length * a) / 100)] || '';
+      $('#testStart').value = dates[Math.floor((dates.length * b) / 100)] || '';
     } catch (e) { /* 忽略 */ }
+    renderSplitBar();
+  }
+
+  function renderSplitBar() {
+    const dates = rangeDates();
+    const bar = $('#splitBar');
+    if (!dates.length) { bar.innerHTML = ''; return; }
+    const lb = (d) => { let i = dates.findIndex((x) => x >= d); return i < 0 ? dates.length : i; };
+    const v = lb($('#valStart').value || dates[0]), t = lb($('#testStart').value || dates[0]);
+    const seg = (n, color, label) => (n > 0 ? `<div style="flex:${n};background:${color}" title="${label} ${n} 天">${label} ${n}</div>` : '');
+    bar.innerHTML = seg(v, 'var(--accent)', '训练') + seg(Math.max(0, t - v), '#7a5cc2', '验证') + seg(Math.max(0, dates.length - t), '#b26a00', '测试');
   }
 
   const MAX_RUNS = 5000;
@@ -985,7 +1148,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       payload = {
         data: activeData(), engine: engineOpts(), config: JSON.parse(JSON.stringify(state.config)), space, method,
         samples: Math.min(+$('#optSamples').value || 200, MAX_RUNS), objective: $('#optObjective').value,
-        minTrades: +$('#optMinTrades').value || 0, splitDate: $('#optSplit').value, rf: rf(),
+        minTrades: +$('#optMinTrades').value || 0, valStart: $('#valStart').value, testStart: $('#testStart').value, rf: rf(),
         wf: { enabled: $('#wfOn').checked, trainYears: +$('#wfTrain').value || 3, testYears: +$('#wfTest').value || 1, anchored: $('#wfAnchored').checked },
       };
     } catch (e) {
@@ -1051,32 +1214,36 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     $('#optResults').hidden = false;
     const o = r.objective;
     const best = r.top[0];
+    const sel = r.selected;
     const dsr = r.dsr;
     $('#optKpis').innerHTML =
       kpi('回测次数', r.trials, `合格 ${r.eligible} · 无效 ${r.invalid}`, fmt.int, false) +
-      kpi(`样本内最优${OBJ_LABEL[o]}`, best ? best.is[o] : NaN, `基准 ${objFmt(o, r.bench.is[o])}`, (v) => objFmt(o, v), o === 'cagr') +
-      kpi(`同组样本外${OBJ_LABEL[o]}`, best ? best.oos[o] : NaN, `基准 ${objFmt(o, r.bench.oos[o])}`, (v) => objFmt(o, v), o === 'cagr') +
-      kpi('真实夏普 > 0 的概率', dsr ? dsr.prob : NaN, dsr ? `噪声期望最优夏普 ${fmt.num(dsr.sr0Annual)}` : '—', fmt.pctPlain, false);
+      kpi(`训练集最优${OBJ_LABEL[o]}`, best ? best.tr[o] : NaN, `基准 ${objFmt(o, r.bench.tr[o])}`, (v) => objFmt(o, v), o === 'cagr') +
+      kpi(`选定参数验证集${OBJ_LABEL[o]}`, sel ? sel.va[o] : NaN, `基准 ${objFmt(o, r.bench.va[o])}`, (v) => objFmt(o, v), o === 'cagr') +
+      kpi('训练集第一名真实夏普 > 0 的概率', dsr ? dsr.prob : NaN, dsr ? `噪声期望最优夏普 ${fmt.num(dsr.sr0Annual)}` : '—', fmt.pctPlain, false);
 
     let verdict = '';
-    if (!best) verdict = '没有满足"最少成交"要求的参数组合，调低门槛或换一组规则。';
+    if (!sel) verdict = '没有满足"最少成交"要求的参数组合，调低门槛或换一组规则。';
     else {
       const p = dsr ? dsr.prob : NaN;
       const level = p >= 0.95 ? '<b class="up">统计上显著</b>' : p >= 0.8 ? '<b class="warn">证据偏弱</b>' : '<b class="down">很可能是运气</b>';
-      const deg = fin(best.is.sharpe) && best.is.sharpe > 0 ? best.oos.sharpe / best.is.sharpe : NaN;
-      verdict = `试了 ${dsr ? dsr.trials : r.trials} 组参数，纯噪声下也能期望挑出年化夏普约 ${fmt.num(dsr && dsr.sr0Annual)} 的"最优"。` +
-        `最优组的样本内夏普 ${fmt.num(best.is.sharpe)}，通缩后真实夏普大于 0 的概率 ${fmt.pctPlain(dsr && dsr.prob)}：${level}。` +
-        (fin(deg) ? ` 样本外夏普是样本内的 ${(deg * 100).toFixed(0)}%${deg < 0.5 ? '，衰减明显，警惕过拟合' : ''}。` : '') +
-        (r.wf ? ` 最可信的是下方滚动前推的拼接结果：年化 ${fmt.pct(r.wf.stats.cagr)}，基准 ${fmt.pct(r.wf.benchStats.cagr)}。` : '');
+      const deg = fin(sel.tr.sharpe) && sel.tr.sharpe > 0 ? sel.va.sharpe / sel.tr.sharpe : NaN;
+      verdict = `训练集 ${r.splits.trainDays} 天、验证集 ${r.splits.valDays} 天、测试集 ${r.splits.testDays} 天（锁定）。` +
+        `试了 ${dsr ? dsr.trials : r.trials} 组参数，纯噪声下也能期望挑出年化夏普约 ${fmt.num(dsr && dsr.sr0Annual)} 的"最优"；` +
+        `训练集第一名夏普 ${fmt.num(best.tr.sharpe)}，真实夏普大于 0 的概率 ${fmt.pctPlain(p)}：${level}。` +
+        ` 在训练排名前 ${r.shortlist} 组中，验证集最好的是第 ${sel.trainRank} 名（★），其验证集夏普 ${fmt.num(sel.va.sharpe)}` +
+        (fin(deg) ? `，是训练集的 ${(deg * 100).toFixed(0)}%${deg < 0.5 ? '，衰减明显，警惕过拟合' : ''}` : '') + '。' +
+        (r.wf ? ` 训练+验证段内的滚动前推：年化 ${fmt.pct(r.wf.stats.cagr)}，基准 ${fmt.pct(r.wf.benchStats.cagr)}。` : '');
     }
     $('#optVerdict').innerHTML = verdict;
 
     const heads = r.space.map((d) => `<th>${esc(d.label.split(' · ').pop())}</th>`).join('');
-    $('#optTop').innerHTML = `<thead><tr><th>#</th>${heads}<th>样本内${OBJ_LABEL[o]}</th><th>样本内夏普</th><th>样本外夏普</th><th>样本外年化</th><th>样本外回撤</th><th>成交</th><th></th></tr></thead><tbody>` +
-      (r.top.slice(0, 20).map((t, i) => `<tr><td class="num">${i + 1}</td>${t.combo.map((v) => `<td class="num">${v}</td>`).join('')}` +
-        `<td class="num">${objFmt(o, t.is[o])}</td><td class="num">${fmt.num(t.is.sharpe)}</td><td class="num">${fmt.num(t.oos.sharpe)}</td>` +
-        `<td class="num ${tone(t.oos.cagr)}">${fmt.pct(t.oos.cagr)}</td><td class="num down">${fmt.pct(t.oos.max_drawdown)}</td>` +
-        `<td class="num">${t.isTrades}+${t.oosTrades}</td><td><button type="button" class="linkbtn" data-apply="${i}">应用</button></td></tr>`).join('') ||
+    const same = (a, b) => a && b && a.join() === b.join();
+    $('#optTop').innerHTML = `<thead><tr><th>#</th>${heads}<th>训练${OBJ_LABEL[o]}</th><th>训练夏普</th><th>验证夏普</th><th>验证年化</th><th>验证回撤</th><th>成交</th><th></th></tr></thead><tbody>` +
+      (r.top.slice(0, 20).map((t, i) => `<tr${same(t.combo, sel && sel.combo) ? ' class="sel"' : ''}><td class="num">${same(t.combo, sel && sel.combo) ? '★' : ''}${i + 1}</td>${t.combo.map((v) => `<td class="num">${v}</td>`).join('')}` +
+        `<td class="num">${objFmt(o, t.tr[o])}</td><td class="num">${fmt.num(t.tr.sharpe)}</td><td class="num">${fmt.num(t.va.sharpe)}</td>` +
+        `<td class="num ${tone(t.va.cagr)}">${fmt.pct(t.va.cagr)}</td><td class="num down">${fmt.pct(t.va.max_drawdown)}</td>` +
+        `<td class="num">${t.trTrades}+${t.vaTrades}</td><td><button type="button" class="linkbtn" data-apply="${i}">应用</button></td></tr>`).join('') ||
         `<tr><td colspan="${r.space.length + 8}">没有合格的组合</td></tr>`) + '</tbody>';
 
     const opts = r.space.map((d, k) => `<option value="${k}">${esc(d.label)}</option>`).join('');
@@ -1086,8 +1253,48 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     $('#heatCard').hidden = r.space.length < 1;
     renderHeat();
 
+    $('#testCard').hidden = !r.test;
+    $('#testMeta').textContent = r.test ? `${r.splits.testStart} 起，${r.splits.testDays} 个交易日` : '';
+    $('#testLocked').hidden = false;
+    $('#testBody').hidden = true;
     $('#wfCard').hidden = !r.wf;
     if (r.wf) renderWalkForward();
+  }
+
+  // 同一份数据、同一测试集起点、同一策略结构下查看测试集的次数
+  function testKey() {
+    const { result: r, config } = state.opt;
+    const structure = config.type === 'factor' ? config.factor.factors.map((f) => f.id) : config.rules.map((x) => x.id + ':' + (x.role || 'both'));
+    return JSON.stringify([state.source, Object.keys(rawData() || {}).sort(), r.splits.testStart, r.dates, config.type, structure]);
+  }
+
+  function revealTest() {
+    const r = state.opt.result;
+    const t = r.test;
+    const counts = load('aq-test-reveals') || {};
+    const key = testKey();
+    counts[key] = (counts[key] || 0) + 1;
+    store('aq-test-reveals', counts);
+    const nth = counts[key];
+    $('#testLocked').hidden = true;
+    $('#testBody').hidden = false;
+    $('#testWarn').innerHTML = nth === 1
+      ? '这是你第一次查看这个测试集。如果根据这里的结果回头调参，下一次的测试集结果就不再可信。'
+      : `<b class="warn">这是你第 ${nth} 次查看同一个测试集</b>：每多看一次、再根据结果调参，测试集就多一分"被拟合"。把测试集起点往后挪、或等积累新数据后再检验更可靠。`;
+    $('#testKpis').innerHTML =
+      kpi('测试集年化', t.stats.cagr, '基准 ' + fmt.pct(t.bench.cagr), fmt.pct) +
+      kpi('测试集夏普', t.stats.sharpe, '基准 ' + fmt.num(t.bench.sharpe), fmt.num, false) +
+      kpi('测试集最大回撤', t.stats.max_drawdown, '基准 ' + fmt.pct(t.bench.max_drawdown), fmt.pct) +
+      kpi('选定参数', NaN, comboText(r.space, t.combo), () => '', false);
+    $('#testRel').innerHTML = t.rel
+      ? kpi('年化 α', t.rel.alpha, 'CAPM 超额', fmt.pct) + kpi('β', t.rel.beta, '', fmt.num, false) +
+        kpi('信息比率', t.rel.infoRatio, `跟踪误差 ${fmt.pctPlain(t.rel.trackingError)}`, fmt.num, false) +
+        kpi('按笔胜率', t.trades.winRate, `${t.trades.count} 笔 · 盈亏比 ${fmt.num(t.trades.payoff)}`, fmt.pctPlain, false)
+      : '';
+    drawNav('#testChart', '#testReadout', t.dates, [
+      { values: t.equity, color: 'var(--accent)', width: 1.8, label: '选定' },
+      { values: t.benchEquity, color: 'var(--bench)', width: 1.3, label: '基准' },
+    ], null);
   }
 
   function renderHeat() {
@@ -1144,7 +1351,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   function applyCombo(i) {
     const { result: r, config } = state.opt;
     const cfg = R.applyParams(config, r.space, r.top[i].combo);
-    state.config = { ...state.config, ...cfg, type: 'rules' };
+    state.config = { ...state.config, ...cfg };
     renderBuilder();
     renderSpace();
     selectTab('backtest');
@@ -1233,6 +1440,8 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   if (saved.config && saved.config.rules) {
     state.config = { ...JSON.parse(JSON.stringify(DEFAULT_CONFIG)), ...saved.config };
     state.config.rules = state.config.rules.filter((r) => AQ.RULES[r.id]);
+    state.config.factor = { ...DEFAULT_CONFIG.factor, ...(saved.config.factor || {}) };
+    state.config.factor.factors = state.config.factor.factors.filter((f) => R.FACTORS.some((x) => x.id === f.id));
   }
   TX_IDS.forEach((id) => { if (saved[id] !== undefined) $('#' + id).value = saved[id]; });
   if (saved.onSymbols) $('#onSymbols').value = saved.onSymbols;
@@ -1268,7 +1477,47 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     if (e.target.tagName === 'SELECT' && onConfigInput(e)) autoRun();
     if (TX_IDS.includes(e.target.id)) { state.researchDirty = true; if (e.target.id === 'start' || e.target.id === 'end') setDefaultSplit(true); autoRun(); if (state.tab === 'research') runResearch(); }
   });
-  $('#stratType').addEventListener('change', (e) => { state.config.type = e.target.value; renderBuilder(); autoRun(); });
+  $('#stratType').addEventListener('change', (e) => { state.config.type = e.target.value; state.optSel = {}; renderBuilder(); autoRun(); });
+  $('#addFactorBtn').addEventListener('click', () => {
+    state.config.factor.factors.push({ id: $('#addFactor').value, weight: 1 });
+    state.optSel = {};
+    renderBuilder();
+    autoRun();
+  });
+  $('#factorList').addEventListener('click', (e) => {
+    const i = e.target.dataset && e.target.dataset.removeFactor;
+    if (i === undefined) return;
+    state.config.factor.factors.splice(+i, 1);
+    state.optSel = {};
+    renderBuilder();
+    autoRun();
+  });
+  $('#rangePresets').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-years]');
+    if (!b) return;
+    const years = +b.dataset.years;
+    const all = Object.values(rawData() || {}).flatMap((d) => [d.dates[0], d.dates[d.dates.length - 1]]).sort();
+    const lastDate = all[all.length - 1] || new Date().toISOString().slice(0, 10);
+    if (years) {
+      const d = new Date(lastDate);
+      d.setFullYear(d.getFullYear() - years);
+      $('#start').value = d.toISOString().slice(0, 10);
+    } else {
+      $('#start').value = '';
+    }
+    $('#end').value = '';
+    state.researchDirty = true;
+    setDefaultSplit(true);
+    autoRun();
+    if (state.tab === 'research') runResearch();
+  });
+  $('#onPreset').addEventListener('change', (e) => { if (e.target.value) $('#onSymbols').value = e.target.value; });
+  $('#splitPreset').addEventListener('change', (e) => {
+    if (e.target.value) setDefaultSplit(true, e.target.value.split(',').map(Number));
+    e.target.value = '';
+  });
+  ['#valStart', '#testStart'].forEach((sel) => $(sel).addEventListener('change', renderSplitBar));
+  $('#revealTest').addEventListener('click', revealTest);
   $('#addRuleBtn').addEventListener('click', () => {
     const id = $('#addRule').value;
     state.config.rules.push({ id, params: AQ.defaultParams(id) });

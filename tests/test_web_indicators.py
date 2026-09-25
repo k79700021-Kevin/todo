@@ -17,13 +17,15 @@ RUNNER = """
 const I = require(process.argv[1] + '/indicators.js');
 const d = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 const a = (x) => Array.from(x, (v) => (Number.isFinite(v) ? v : null));
-const m = I.macd(d.c, 12, 26, 9), b = I.boll(d.c, 20, 2), k = I.kdj(d.h, d.l, d.c, 9, 3, 3);
+const m = I.macd(d.c, 12, 26, 9), b = I.boll(d.c, 20, 2), k = I.kdj(d.h, d.l, d.c, 9, 3, 3), dm = I.dmi(d.h, d.l, d.c, 14, 6);
 process.stdout.write(JSON.stringify({
   sma: a(I.sma(d.c, 20)), ema: a(I.ema(d.c, 12)), std: a(I.stdev(d.c, 20, 0)),
   hh: a(I.highest(d.h, 20)), ll: a(I.lowest(d.l, 20)), roc: a(I.roc(d.c, 5)),
   dif: a(m.dif), dea: a(m.dea), hist: a(m.hist), rsi: a(I.rsi(d.c, 14)),
   upper: a(b.upper), lower: a(b.lower), pctb: a(b.pctB),
   K: a(k.K), D: a(k.D), J: a(k.J), atr: a(I.atr(d.h, d.l, d.c, 14)),
+  pdi: a(dm.pdi), mdi: a(dm.mdi), adx: a(dm.adx), cci: a(I.cci(d.h, d.l, d.c, 14)),
+  wr: a(I.willr(d.h, d.l, d.c, 14)), obv: a(I.obv(d.c, d.v)),
 }));
 """
 
@@ -56,7 +58,22 @@ def reference(df: pd.DataFrame) -> dict:
     prev = c.shift(1)
     tr = pd.concat([h - l, (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
     tr.iloc[0] = h.iloc[0] - l.iloc[0]
+    # DMI（通达信）：N 日累加
+    tr1 = pd.concat([h - l, (h - prev).abs(), (prev - l).abs()], axis=1).max(axis=1).where(prev.notna())
+    hd, ld = h.diff(), l.shift(1) - l
+    dp = hd.where((hd > 0) & (hd > ld), 0.0).where(prev.notna())
+    dm = ld.where((ld > 0) & (ld > hd), 0.0).where(prev.notna())
+    s_tr, s_dp, s_dm = tr1.rolling(14).sum(), dp.rolling(14).sum(), dm.rolling(14).sum()
+    pdi, mdi = s_dp * 100 / s_tr, s_dm * 100 / s_tr
+    adx = ((mdi - pdi).abs() / (mdi + pdi) * 100).rolling(6).mean()
+    tp = (h + l + c) / 3
+    tp_ma = tp.rolling(14).mean()
+    md = tp.rolling(14).apply(lambda w: np.mean(np.abs(w - w.mean())), raw=True)
+    hh14, ll14 = h.rolling(14).max(), l.rolling(14).min()
+    obv = (np.sign(c.diff()).fillna(0) * df["volume"]).cumsum()
     return {
+        "pdi": pdi, "mdi": mdi, "adx": adx, "cci": (tp - tp_ma) / (0.015 * md),
+        "wr": 100 * (hh14 - c) / (hh14 - ll14), "obv": obv,
         "sma": c.rolling(20).mean(), "ema": ema(c, 12), "std": sd,
         "hh": h.rolling(20).max(), "ll": l.rolling(20).min(), "roc": c / c.shift(5) - 1,
         "dif": dif, "dea": dea, "hist": 2 * (dif - dea), "rsi": rsi,
@@ -68,7 +85,7 @@ def reference(df: pd.DataFrame) -> dict:
 @pytest.mark.skipif(shutil.which("node") is None, reason="需要 Node.js")
 def test_indicators_match_pandas():
     df = make_synthetic(["600000"], "2018-01-01", "2020-12-31", seed=5)["600000"]
-    payload = {"c": df["close"].tolist(), "h": df["high"].tolist(), "l": df["low"].tolist()}
+    payload = {"c": df["close"].tolist(), "h": df["high"].tolist(), "l": df["low"].tolist(), "v": df["volume"].tolist()}
     out = subprocess.run(
         ["node", "-e", RUNNER, str(DOCS)], input=json.dumps(payload),
         capture_output=True, text=True, check=True,

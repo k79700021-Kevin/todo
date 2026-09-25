@@ -222,12 +222,16 @@
     return out;
   }
 
-  // 参数路径：r<规则序号>.<参数名> 或 risk.<参数名>
+  /* 参数路径：r<规则序号>.<参数名>（规则参数）、risk.<参数名>（风控与持仓）、
+   * f<因子序号>.weight（因子权重）、fs.<参数名>（多因子策略的持有数量等） */
   function applyParams(config, space, combo) {
-    const cfg = { ...config, rules: config.rules.map((r) => ({ id: r.id, params: { ...r.params } })) };
+    const cfg = JSON.parse(JSON.stringify(config));
+    (cfg.rules || []).forEach((r) => (r.params = r.params || {}));
     space.forEach((d, k) => {
       const [head, key] = d.path.split('.');
       if (head === 'risk') cfg[key] = combo[k];
+      else if (head === 'fs') cfg.factor[key] = combo[k];
+      else if (head[0] === 'f') cfg.factor.factors[+head.slice(1)][key] = combo[k];
       else cfg.rules[+head.slice(1)].params[key] = combo[k];
     });
     return cfg;
@@ -254,18 +258,23 @@
 
   const score = (st, objective) => (st && fin(st[objective]) ? st[objective] : -Infinity);
 
-  /* 参数优化主流程。
+  /* 参数优化主流程：训练 / 验证 / 测试三段。
+   * 训练集给所有参数组合排序；在训练排名前 10%（至少 5 组）中挑验证集表现最好的作为"选定参数"；
+   * 测试集只计算选定参数一组，供最后一次性检验。滚动前推只在训练+验证段内进行，不触碰测试集。
    * input: { data, engine, config, space: [{path, label, values}], method: 'grid'|'random', samples,
-   *          objective, minTrades, splitDate, rf, wf: { enabled, trainYears, testYears, anchored } } */
+   *          objective, minTrades, valStart, testStart, rf, wf: { enabled, trainYears, testYears, anchored } } */
   function optimize(input, onProgress = () => {}) {
     const { data, engine, config, space, objective = 'sharpe', minTrades = 0, rf = 0.02 } = input;
     if (!space.length) throw new Error('至少勾选一个要优化的参数');
     const bt = makeBacktester(data, engine);
     const dates = bt.dates;
     const n = dates.length;
-    const split = lowerBound(dates, input.splitDate || dates[Math.floor(n * 0.7)]);
-    if (split < 120 || split > n - 60) throw new Error('样本外起始日期要让样本内至少 120 天、样本外至少 60 天');
-    const isEnd = split - 1;
+    const v = lowerBound(dates, input.valStart || dates[Math.floor(n * 0.6)]);
+    const t = lowerBound(dates, input.testStart || dates[Math.floor(n * 0.8)]);
+    if (v < 120) throw new Error('训练集至少要 120 个交易日，请把验证集起始日期往后调');
+    if (t - v < 60) throw new Error('验证集至少要 60 个交易日，请调整验证集或测试集起始日期');
+    if (n - t < 60) throw new Error('测试集至少要 60 个交易日，请把测试集起始日期往前调');
+    const trEnd = v - 1, vaEnd = t - 1, last = n - 1;
     const dateIdx = new Map(dates.map((d, i) => [d, i]));
 
     const combos = input.method === 'random' ? randomCombos(space, input.samples || 200, input.seed) : [...gridIter(space)];
@@ -276,20 +285,20 @@
     combos.forEach((combo, c) => {
       let strat;
       try {
-        strat = new AQ.RuleStrategy(applyParams(config, space, combo));
+        strat = buildStrategy(applyParams(config, space, combo));
       } catch (e) {
         invalid++;
         return;
       }
       const res = bt.run(strat);
       const eq = Float64Array.from(res.equity);
-      const tIdx = Int32Array.from(res.trades.map((t) => dateIdx.get(t.date)));
+      const tIdx = Int32Array.from(res.trades.map((tr) => dateIdx.get(tr.date)));
       entries.push({
         combo,
-        is: segStats(eq, 0, isEnd, rf),
-        oos: segStats(eq, isEnd, n - 1, rf),
-        isTrades: tradesIn(tIdx, 0, isEnd),
-        oosTrades: tradesIn(tIdx, isEnd, n - 1),
+        tr: segStats(eq, 0, trEnd, rf),
+        va: segStats(eq, trEnd, vaEnd, rf),
+        trTrades: tradesIn(tIdx, 0, trEnd),
+        vaTrades: tradesIn(tIdx, trEnd, vaEnd),
         eq: keepEquity ? eq : null,
         tIdx: keepEquity ? tIdx : null,
       });
@@ -298,44 +307,143 @@
     onProgress(combos.length, combos.length);
     if (!entries.length) throw new Error('没有合法的参数组合（检查快线/慢线等约束）');
 
-    const eligible = entries.filter((e) => e.isTrades >= minTrades);
-    const ranked = eligible.slice().sort((x, y) => score(y.is, objective) - score(x.is, objective));
+    const eligible = entries.filter((e) => e.trTrades >= minTrades);
+    const ranked = eligible.slice().sort((x, y) => score(y.tr, objective) - score(x.tr, objective));
+    ranked.forEach((e, i) => (e.trainRank = i + 1));
+    const topK = Math.max(5, Math.ceil(ranked.length * 0.1));
+    const shortlist = ranked.slice(0, topK);
+    const selected = shortlist.slice().sort((x, y) => score(y.va, objective) - score(x.va, objective) || x.trainRank - y.trainRank)[0];
 
-    // 通缩夏普：以全部合格试验的样本内夏普为"噪声分布"
+    // 通缩夏普：以全部合格试验的训练集夏普为"噪声分布"，检验训练集第一名
     let dsr = null;
     const best = ranked[0];
-    if (best && fin(best.is.srDaily)) {
-      const srs = eligible.map((e) => e.is.srDaily).filter(fin);
-      const bestEq = best.eq || Float64Array.from(bt.run(new AQ.RuleStrategy(applyParams(config, space, best.combo))).equity);
-      const mom = moments(returnsOf(Array.from(bestEq.subarray(0, split))));
-      dsr = deflatedSharpe(srs, best.is.srDaily, isEnd, mom.skew, mom.kurt);
+    if (best && fin(best.tr.srDaily)) {
+      const srs = eligible.map((e) => e.tr.srDaily).filter(fin);
+      const bestEq = best.eq || Float64Array.from(bt.run(buildStrategy(applyParams(config, space, best.combo))).equity);
+      const mom = moments(returnsOf(Array.from(bestEq.subarray(0, v))));
+      dsr = deflatedSharpe(srs, best.tr.srDaily, trEnd, mom.skew, mom.kurt);
       dsr.sr0Annual = dsr.sr0 * Math.sqrt(TD);
-      dsr.bestAnnual = best.is.srDaily * Math.sqrt(TD);
+      dsr.bestAnnual = best.tr.srDaily * Math.sqrt(TD);
     }
 
-    const wf = keepEquity ? walkForward(entries, bench.equity, dates, input.wf, objective, minTrades, rf) : null;
-    const slim = (e) => ({ combo: e.combo, is: e.is, oos: e.oos, isTrades: e.isTrades, oosTrades: e.oosTrades });
+    // 测试集：只对选定参数计算一次
+    let test = null;
+    if (selected) {
+      const res = bt.run(buildStrategy(applyParams(config, space, selected.combo)));
+      const eq = res.equity;
+      const seg = (arr) => Array.from(arr.slice(vaEnd, n), (x) => x / arr[vaEnd]);
+      test = {
+        combo: selected.combo,
+        stats: segStats(eq, vaEnd, last, rf),
+        rel: relativeStats(eq, bench.equity, vaEnd, last, rf),
+        bench: segStats(bench.equity, vaEnd, last, rf),
+        trades: roundTrips(res.trades.filter((tr) => tr.date >= dates[t]), dates),
+        dates: dates.slice(vaEnd),
+        equity: seg(eq),
+        benchEquity: seg(bench.equity),
+      };
+    }
+
+    const wf = keepEquity ? walkForward(entries, bench.equity, dates.slice(0, t), input.wf, objective, minTrades, rf) : null;
+    const slim = (e) => ({ combo: e.combo, tr: e.tr, va: e.va, trTrades: e.trTrades, vaTrades: e.vaTrades, trainRank: e.trainRank });
     return {
-      dates: [dates[0], dates[n - 1]],
-      split: dates[split],
+      dates: [dates[0], dates[last]],
+      splits: { valStart: dates[v], testStart: dates[t], trainDays: v, valDays: t - v, testDays: n - t },
       space: space.map((d) => ({ path: d.path, label: d.label, values: d.values })),
       trials: entries.length,
       eligible: eligible.length,
       invalid,
       objective,
+      shortlist: topK,
       top: ranked.slice(0, 50).map(slim),
-      all: entries.map((e) => ({ combo: e.combo, is: score(e.is, objective), oos: score(e.oos, objective), ok: e.isTrades >= minTrades })),
-      bench: { is: segStats(bench.equity, 0, isEnd, rf), oos: segStats(bench.equity, isEnd, n - 1, rf) },
+      selected: selected ? slim(selected) : null,
+      all: entries.map((e) => ({ combo: e.combo, tr: score(e.tr, objective), va: score(e.va, objective), ok: e.trTrades >= minTrades })),
+      bench: { tr: segStats(bench.equity, 0, trEnd, rf), va: segStats(bench.equity, trEnd, vaEnd, rf) },
       dsr,
       wf,
+      test,
     };
+  }
+
+  /* 相对基准的指标（区间 (a, b]）：β、年化 α（CAPM）、跟踪误差、信息比率、超额收益 */
+  function relativeStats(eq, beq, a, b, rf = 0.02) {
+    const rfd = rf / TD;
+    const r = [], br = [];
+    for (let i = a + 1; i <= b; i++) {
+      r.push(eq[i] / eq[i - 1] - 1);
+      br.push(beq[i] / beq[i - 1] - 1);
+    }
+    if (r.length < 3) return null;
+    const mr = mean(r), mb = mean(br);
+    let cov = 0, vb = 0;
+    for (let i = 0; i < r.length; i++) { cov += (r[i] - mr) * (br[i] - mb); vb += (br[i] - mb) ** 2; }
+    const beta = vb > 0 ? cov / vb : NaN;
+    const diff = r.map((x, i) => x - br[i]);
+    const te = moments(diff).std * Math.sqrt(TD);
+    return {
+      beta,
+      alpha: ((mr - rfd) - beta * (mb - rfd)) * TD,
+      trackingError: te,
+      infoRatio: te > 0 ? (mean(diff) * TD) / te : NaN,
+      excessReturn: eq[b] / eq[a] - beq[b] / beq[a],
+    };
+  }
+
+  /* 按笔统计：同一标的从空仓到建仓再回到空仓算一笔。收益 = (卖出所得 - 买入花费) / 买入花费，均含费用 */
+  function roundTrips(trades, dates) {
+    const idx = new Map(dates.map((d, i) => [d, i]));
+    const open = {}, done = [];
+    for (const tr of trades) {
+      let p = open[tr.symbol];
+      if (!p) p = open[tr.symbol] = { symbol: tr.symbol, start: tr.date, shares: 0, cost: 0, proceeds: 0 };
+      if (tr.side === 'buy') { p.shares += tr.shares; p.cost += tr.amount + tr.fee; }
+      else { p.shares -= tr.shares; p.proceeds += tr.amount - tr.fee; }
+      if (p.shares <= 0) {
+        done.push({ symbol: p.symbol, start: p.start, end: tr.date, pnl: p.proceeds - p.cost, ret: p.cost > 0 ? p.proceeds / p.cost - 1 : NaN,
+          days: (idx.get(tr.date) ?? 0) - (idx.get(p.start) ?? 0) });
+        delete open[tr.symbol];
+      }
+    }
+    const wins = done.filter((x) => x.pnl > 0), losses = done.filter((x) => x.pnl <= 0);
+    const avg = (a, f) => (a.length ? a.reduce((s, x) => s + f(x), 0) / a.length : NaN);
+    const grossWin = wins.reduce((a, x) => a + x.pnl, 0), grossLoss = -losses.reduce((a, x) => a + x.pnl, 0);
+    const avgWin = avg(wins, (x) => x.ret), avgLoss = avg(losses, (x) => x.ret);
+    return {
+      count: done.length,
+      open: Object.keys(open).length,
+      winRate: done.length ? wins.length / done.length : NaN,
+      avgWin, avgLoss,
+      payoff: avgLoss < 0 ? avgWin / -avgLoss : NaN,
+      profitFactor: grossLoss > 0 ? grossWin / grossLoss : NaN,
+      avgDays: avg(done, (x) => x.days),
+      list: done,
+    };
+  }
+
+  /* 月度收益：{ years: [年份], rows: { 年份: [12 个月收益或 null], 全年收益 } } */
+  function monthlyReturns(dates, eq) {
+    const monthEnd = new Map();
+    dates.forEach((d, i) => monthEnd.set(d.slice(0, 7), eq[i]));
+    const keys = [...monthEnd.keys()];
+    const rows = {};
+    let prev = eq[0];
+    const yearStart = {};
+    keys.forEach((k) => {
+      const [y, m] = k.split('-');
+      if (!rows[y]) { rows[y] = { months: new Array(12).fill(null), year: NaN }; yearStart[y] = prev; }
+      const v = monthEnd.get(k);
+      rows[y].months[+m - 1] = v / prev - 1;
+      rows[y].year = v / yearStart[y] - 1;
+      prev = v;
+    });
+    return { years: Object.keys(rows), rows };
   }
 
   function walkForward(entries, benchEq, dates, opts, objective, minTrades, rf) {
     const n = dates.length;
     const train = Math.round((opts.trainYears || 3) * TD);
     const test = Math.round((opts.testYears || 1) * TD);
-    if (train + 20 >= n) throw new Error('数据太短，放不下一个训练窗口');
+    if (train + 20 >= n) throw new Error('训练+验证段太短，放不下一个滚动前推的训练窗口，请缩短训练窗口年数');
     const windows = [];
     const eqS = [1], bS = [1], dS = [dates[train]];
     for (let t0 = train; t0 < n - 1; t0 += test) {
@@ -396,8 +504,113 @@
         return v5.map((v, i) => v / v20[i] - 1);
       },
     },
+    {
+      id: 'high250', label: '距 250 日新高',
+      f: (b, s) => ind.highest(b.high[s], 250).map((h, i) => b.close[s][i] / h - 1),
+    },
+    {
+      id: 'maxret', label: '20 日最大单日涨幅',
+      f: (b, s) => ind.highest(Float64Array.from(ind.roc(b.close[s], 1)), 20),
+    },
+    {
+      id: 'illiq', label: '非流动性（Amihud）', needsVolume: true,
+      f: (b, s) => {
+        const r = ind.roc(b.close[s], 1);
+        const x = r.map((v, i) => Math.abs(v) / (b.close[s][i] * b.volume[s][i]) * 1e9);
+        return ind.sma(Float64Array.from(x, (v) => (Number.isFinite(v) ? v : NaN)), 20);
+      },
+    },
   ];
+  const FACTOR_BY_ID = Object.fromEntries(FACTORS.map((f) => [f.id, f]));
   const WARM = 60;
+
+  /* 多因子选股：每个调仓日，把各因子在标的之间转成排名分（-0.5~0.5），按权重相加得到综合分，
+   * 买入综合分最高的 topN 只。权重为负表示因子值越小越好（如反转、低波动）。
+   * trendN > 0 时加大盘趋势过滤：全部标的等权指数跌破其 trendN 日均线就空仓。 */
+  class FactorStrategy {
+    constructor({ factors = [], topN = 2, rebalance = 20, trendN = 0, sizing = 'equal' } = {}) {
+      const unknown = factors.find((f) => !FACTOR_BY_ID[f.id]);
+      if (unknown) throw new Error('未知因子：' + unknown.id);
+      this.factors = factors.map((f) => ({ id: f.id, weight: +f.weight || 0 })).filter((f) => f.weight !== 0);
+      if (!this.factors.length) throw new Error('至少选一个权重不为 0 的因子');
+      if (!(topN >= 1 && rebalance >= 1 && trendN >= 0)) throw new Error('持有数量、调仓间隔至少为 1，趋势均线不能为负');
+      Object.assign(this, { name: 'factor', topN: Math.floor(topN), rebalance: Math.floor(rebalance), trendN: Math.floor(trendN), sizing });
+    }
+
+    params() {
+      const out = { topN: this.topN, rebalance: this.rebalance, trendN: this.trendN };
+      this.factors.forEach((f) => (out['w.' + f.id] = f.weight));
+      return out;
+    }
+
+    generate(close, dates, symbols, bars) {
+      const n = dates.length;
+      const N = symbols.length;
+      const cache = (s, key, fn) => {
+        const k = s + '|' + key;
+        if (!bars.cache.has(k)) bars.cache.set(k, fn());
+        return bars.cache.get(k);
+      };
+      const vals = this.factors.map((f) => symbols.map((s) => cache(s, 'fac:' + f.id, () => FACTOR_BY_ID[f.id].f(bars, s))));
+      const vol = this.sizing === 'invvol' ? symbols.map((s) => cache(s, 'vol20', () => AQ.annVol(bars.close[s], 20))) : null;
+
+      // 等权指数：各标的相对自身首个价格的均值
+      let riskOn = () => true;
+      if (this.trendN > 0) {
+        const first = symbols.map((s) => close[s].find(fin));
+        const idx = dates.map((_, i) => {
+          let sum = 0, cnt = 0;
+          symbols.forEach((s, k) => { const c = close[s][i]; if (fin(c)) { sum += c / first[k]; cnt++; } });
+          return cnt ? sum / cnt : NaN;
+        });
+        const ma = ind.sma(idx, this.trendN);
+        riskOn = (i) => !fin(ma[i]) || idx[i] > ma[i];
+      }
+
+      const out = new Array(n).fill(null);
+      let wasOn = true;
+      let lastRebal = -Infinity;
+      for (let i = WARM; i < n; i++) {
+        const on = riskOn(i);
+        const due = i - lastRebal >= this.rebalance;
+        if (!on) {
+          if (wasOn) out[i] = new Array(N).fill(0);
+          wasOn = false;
+          continue;
+        }
+        if (!due && wasOn) continue;
+        wasOn = true;
+        lastRebal = i;
+        const eligible = [];
+        for (let k = 0; k < N; k++) if (vals.every((v) => fin(v[k][i])) && fin(close[symbols[k]][i])) eligible.push(k);
+        const score = new Array(N).fill(0);
+        this.factors.forEach((f, j) => {
+          const r = ranks(eligible.map((k) => vals[j][k][i]));
+          eligible.forEach((k, e) => (score[k] += f.weight * ((r[e] - 0.5) / eligible.length - 0.5)));
+        });
+        const picked = eligible.slice().sort((a, b2) => score[b2] - score[a]).slice(0, this.topN);
+        const row = new Array(N).fill(0);
+        if (this.sizing === 'invvol' && picked.length) {
+          const inv = picked.map((k) => (vol[k][i] > 0 ? 1 / vol[k][i] : 0));
+          const avg = inv.filter((v) => v > 0).reduce((a, x) => a + x, 0) / (inv.filter((v) => v > 0).length || 1) || 1;
+          const raw = inv.map((v) => v || avg);
+          const total = raw.reduce((a, x) => a + x, 0);
+          const budget = picked.length / this.topN;
+          picked.forEach((k, e) => (row[k] = (raw[e] / total) * budget));
+        } else {
+          picked.forEach((k) => (row[k] = 1 / this.topN));
+        }
+        out[i] = row;
+      }
+      return out;
+    }
+  }
+
+  // 按配置构建策略：type 为 'factor' 时是多因子选股，否则为规则组合
+  function buildStrategy(config) {
+    if (config.type === 'factor') return new FactorStrategy(config.factor || {});
+    return new AQ.RuleStrategy(config);
+  }
 
   // 未来收益：t 日收盘出信号，t+1 日开盘买入，持有 h 日后开盘卖出
   function forwardReturns(open, h) {
@@ -510,7 +723,8 @@
   const api = {
     moments, normCdf, normInv, ranks, spearman, acf, varianceRatio, segStats, deflatedSharpe,
     rangeValues, gridSize, gridIter, randomCombos, applyParams, makeBacktester, optimize,
-    FACTORS, factorIC, factorQuantiles, seriesStats, forwardReturns,
+    relativeStats, roundTrips, monthlyReturns,
+    FACTORS, FactorStrategy, buildStrategy, factorIC, factorQuantiles, seriesStats, forwardReturns,
   };
   if (isNode) module.exports = api;
   else AQ.research = api;
