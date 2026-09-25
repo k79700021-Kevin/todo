@@ -51,7 +51,7 @@ function build(mutate) {
     if (mutate) shares[s].push({ date: dates[CUT + 10], total: 1, float: 1 });
     universe[s] = k === 9 ? [[dates[100], mutate ? dates[CUT + 20] : null]] : [[dates[0], null]];
   });
-  const meta = { universe, fundamentals, shares, industry: INDUSTRY, delisted: mutate ? { '600008': dates[CUT + 30] } : {} };
+  const meta = { universe, fundamentals, shares, industry: INDUSTRY, industryPIT: true, delisted: mutate ? { '600008': dates[CUT + 30] } : {} };
   return { data, meta };
 }
 
@@ -95,6 +95,7 @@ test('every strategy: equity and fills up to the cut-off are unchanged', () => {
     ...Object.keys(RULES.RULES).map((id) => () => new RULES.RuleStrategy({ rules: [{ id }], stopLoss: 8, trailATR: 2, maxPositions: 4, minHold: 2, maxHold: 30, cooldown: 3, sizing: 'invvol' })),
     ...R.FACTORS.map((f) => () => new R.FactorStrategy({ factors: [{ id: f.id, weight: 1 }], topN: 3, rebalance: 7, trendN: 20, neutral: 'industry_size', sizing: 'invvol' })),
     () => new R.FactorStrategy({ factors: [{ id: 'ep', weight: 1 }, { id: 'roc20', weight: 1 }], topN: 3, rebalance: 10, sizing: 'optimize', maxWeight: 30, industryPenalty: 20 }),
+    () => new R.FactorStrategy({ factors: [{ id: 'bp', weight: 1 }, { id: 'roc60', weight: 1 }], topN: 4, rebalance: 5, trendN: 60, neutral: 'size', sizing: 'optimize', maxWeight: 20 }),
   ];
   for (const mk of strategies) {
     const ra = btA.run(mk()), rb = btB.run(mk());

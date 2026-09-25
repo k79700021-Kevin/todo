@@ -27,15 +27,45 @@
     return 'fnv' + (h >>> 0).toString(16);
   }
 
-  // 数据指纹：标的、长度、首末日期、收盘价之和
-  function fingerprint(data) {
-    const parts = Object.keys(data || {}).sort().map((s) => {
+  // 字节摘要：有 WebCrypto 时用 SHA-256，否则 FNV-1a（32 位 × 2 个种子）
+  async function digestBytes(u8) {
+    const c = root.crypto || (isNode ? require('crypto').webcrypto : null);
+    if (c && c.subtle) {
+      const buf = await c.subtle.digest('SHA-256', u8);
+      return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
+    }
+    let h1 = 0x811c9dc5, h2 = 0x01000193 ^ u8.length;
+    for (let i = 0; i < u8.length; i++) { h1 = Math.imul(h1 ^ u8[i], 16777619); h2 = Math.imul(h2 ^ u8[i], 2246822519); }
+    return 'fnv' + (h1 >>> 0).toString(16) + (h2 >>> 0).toString(16);
+  }
+
+  /* 数据指纹：每只标的的每个字段（日期、开高低收、成交量、不复权价、换手率……）逐值参与哈希，
+   * 再加上元数据（股票池、财务、股本、退市、行业、指数、上市日期等）。任何一个值变化，指纹都会变。 */
+  async function fingerprint(data, meta = null) {
+    const parts = [];
+    for (const s of Object.keys(data || {}).sort()) {
       const d = data[s];
-      let sum = 0;
-      for (const v of d.close) if (Number.isFinite(v)) sum += v;
-      return [s, d.dates.length, d.dates[0], d.dates[d.dates.length - 1], +sum.toFixed(4)];
-    });
-    return sha256(canon(parts));
+      const fields = {};
+      for (const k of Object.keys(d).sort()) {
+        const a = d[k];
+        if (!a || typeof a.length !== 'number' || typeof a === 'string') { fields[k] = canon(a); continue; }
+        if (k === 'dates' || (a.length && typeof a[0] === 'string')) {
+          fields[k] = await digestBytes(new TextEncoder().encode(Array.prototype.join.call(a, ',')));
+        } else {
+          const f = Float64Array.from(a, (v) => (v === null || v === undefined ? NaN : +v));
+          fields[k] = await digestBytes(new Uint8Array(f.buffer));
+        }
+      }
+      parts.push([s, fields]);
+    }
+    const metaHash = meta ? await digestBytes(new TextEncoder().encode(canon(meta))) : null;
+    return sha256(canon({ data: parts, meta: metaHash }));
+  }
+
+  /* 实验清单哈希：清单应包含数据指纹、策略配置、全部执行假设（资金、费用、滑点、调仓阈值、容量、冲击、退市回收）、
+   * 区间、留出期与训练/验证/测试切分、代码版本；任何一项不同都是不同的实验。 */
+  function manifestHash(manifest) {
+    return sha256(canon(manifest));
   }
 
   // 存储：浏览器用 IndexedDB，测试用内存
@@ -193,7 +223,7 @@
     }
   }
 
-  const api = { Ledger, canon, sha256, fingerprint, memoryStore, idbStore, FORMAT };
+  const api = { Ledger, canon, sha256, fingerprint, manifestHash, digestBytes, memoryStore, idbStore, FORMAT };
   if (isNode) module.exports = api;
   else (root.AQ = root.AQ || {}).ledger = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

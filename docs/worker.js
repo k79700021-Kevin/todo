@@ -1,4 +1,4 @@
-/* 后台线程：运行参数优化与因子 IC，不阻塞页面。 */
+/* 后台线程：运行参数优化、因子 IC、分组组合与压力测试，不阻塞页面。 */
 /* global importScripts */
 importScripts('indicators.js', 'engine.js', 'rules.js', 'portfolio.js', 'research.js');
 
@@ -8,6 +8,15 @@ self.onmessage = (e) => {
   if (type === 'ic') {
     try {
       self.postMessage({ type: 'result', result: R.factorIC(R.makeBacktester(payload.data, payload.engine), payload.h, { neutral: payload.neutral }) });
+    } catch (err) {
+      self.postMessage({ type: 'error', message: err.message || String(err) });
+    }
+    return;
+  }
+  if (type === 'quantiles') {
+    try {
+      const bt = R.makeBacktester(payload.data, payload.engine);
+      self.postMessage({ type: 'result', result: R.factorPortfolios(bt, payload.factor, payload.h, { neutral: payload.neutral }) });
     } catch (err) {
       self.postMessage({ type: 'error', message: err.message || String(err) });
     }

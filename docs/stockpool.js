@@ -46,8 +46,11 @@
   }
 
   /* 组装：records 为 IndexedDB 中的 { code, bars, fin }。返回 { data, meta, coverage }。
-   * meta.universe 只含有行情的股票；coverage 统计成分股里有多少取到了行情。 */
-  function assemble(members, records, start, end, { industry = null, fundAvail = 'notice' } = {}) {
+   * meta.universe 只含有行情的股票；coverage 统计成分股里有多少取到了行情，以及逐日覆盖率
+   * （当日应在池内的成分股中，有行情覆盖当日的比例；minDaily 为区间内最低的一天）。
+   * strict 为真时，逐日覆盖率低于 minCoverage（默认 99.5%）直接报错，不静默删除缺数据的历史成分
+   * （删掉的往往是后来表现差、退市或被剔除的股票，会造成幸存者偏差）。 */
+  function assemble(members, records, start, end, { industry = null, fundAvail = 'notice', strict = false, minCoverage = 0.995, listDate = null } = {}) {
     const want = plan(members, start, end);
     const data = {}, universe = {}, fundamentals = {}, delisted = {}, shares = {}, ind = {};
     let got = 0;
@@ -66,14 +69,41 @@
       got++;
     }
     const idx = records[INDEX_KEY];
+    // 逐日覆盖率：交易日取所有已取到行情（含指数）在区间内的日期
+    const days = new Set();
+    for (const code of Object.keys(data)) for (const d of data[code].dates) if (d >= start && d <= end) days.add(d);
+    if (idx && idx.bars) for (const d of idx.bars.dates) if (d >= start && d <= end) days.add(d);
+    let minDaily = Object.keys(want).length ? (days.size ? 1 : 0) : 1, worst = null;
+    for (const d of [...days].sort()) {
+      let wanted = 0, have = 0;
+      const lack = [];
+      for (const [code, w] of Object.entries(want)) {
+        if (!w.intervals.some(([f, t]) => f <= d && (!t || d < t))) continue;
+        wanted++;
+        const b = data[code];
+        if (b && b.dates[0] <= d && (b.dates[b.dates.length - 1] >= d || delisted[code])) have++;
+        else lack.push(code);
+      }
+      if (!wanted) continue;
+      const ratio = have / wanted;
+      if (ratio < minDaily) { minDaily = ratio; worst = { date: d, ratio, wanted, missing: lack.slice(0, 50) }; }
+    }
+    const coverage = { wanted: Object.keys(want).length, got, missing, minDaily, worst, stale: Object.values(records).filter((r) => r.code !== INDEX_KEY && r.v !== VERSION).length };
+    if (strict && (minDaily < minCoverage || (!days.size && coverage.wanted))) {
+      const w = worst ? `最低的一天 ${worst.date} 为 ${(worst.ratio * 100).toFixed(1)}%（${worst.wanted} 只应在池内，缺 ${worst.wanted - Math.round(worst.ratio * worst.wanted)} 只：${worst.missing.slice(0, 10).join('、')}${worst.missing.length > 10 ? '…' : ''}）` : '没有任何行情';
+      throw new Error(`时点股票池覆盖率不足 ${(minCoverage * 100).toFixed(1)}%：${w}。缺数据的历史成分不能静默删除（幸存者偏差）；请补齐数据，或关闭严格模式后自行承担偏差。`);
+    }
+    const ld = {};
+    if (listDate) for (const code of Object.keys(data)) if (listDate[code]) ld[code] = listDate[code];
     return {
       data,
       meta: {
         universe, fundamentals, delisted, shares, fundAvail,
         industry: Object.keys(ind).length ? ind : null,
         index: idx && idx.bars ? { code: '000300', name: '沪深300（价格指数）', dates: idx.bars.dates, close: idx.bars.close } : null,
+        listDate: Object.keys(ld).length ? ld : null,
       },
-      coverage: { wanted: Object.keys(want).length, got, missing, stale: Object.values(records).filter((r) => r.code !== INDEX_KEY && r.v !== VERSION).length },
+      coverage,
     };
   }
 

@@ -233,6 +233,7 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
           <label for="fundAvail">财报可用日
             <select id="fundAvail"><option value="notice">首次公告日的下一个交易日</option><option value="update">最后更新日（保守：排除事后追溯调整）</option></select>
           </label>
+          <label class="check"><input type="checkbox" id="poolStrict" checked> 严格模式：任一交易日成分股行情覆盖率低于 99.5% 时拒绝回测（缺数据的历史成分多为后来退市、被剔除的股票，静默删除会造成幸存者偏差）</label>
           <div class="row">
             <button type="button" class="btn btn-secondary" id="poolFetch">获取 / 更新</button>
             <button type="button" class="btn btn-secondary" id="poolStop" hidden>暂停</button>
@@ -357,7 +358,7 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
         </div>
         <div class="card" id="paperCard">
           <div class="card-head"><h3>影子组合（纸面跟踪）</h3><span class="note" id="paperMeta"></span></div>
-          <p class="note">历史数据迟早会被反复研究"用坏"，最干净的样本外是明天。每个交易日收盘后冻结一次目标仓位（写入研究账本，带策略与数据哈希，不能修改），之后更新行情时按下一交易日开盘买入、此后逐日按收盘价结算（按冻结权重每日再平衡近似，不含交易成本）。这里只统计与左侧当前策略配置相同的冻结记录。</p>
+          <p class="note">历史数据迟早会被反复研究"用坏"，最干净的样本外是明天。每个交易日收盘后冻结一次目标仓位（写入研究账本，带策略与数据哈希，不能修改），之后更新行情时，把冻结的目标交给回测引擎在一个影子账户里成交：下一交易日开盘、真实价格、整手，涨停买不进、跌停卖不出、停牌顺延，费用、滑点、容量与冲击按冻结时的设置。这里只统计与左侧当前策略配置相同的冻结记录。</p>
           <div class="kpis" id="paperKpis"></div>
           <div class="table-wrap"><table id="paperTable"></table></div>
         </div>
@@ -538,7 +539,7 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
               <select id="icH" aria-label="预测周期"><option value="1">预测未来 1 日</option><option value="5" selected>预测未来 5 日</option><option value="20">预测未来 20 日</option></select>
             </label>
             <label for="icNeutral" style="min-width:160px">
-              <select id="icNeutral" aria-label="截面中性化"><option value="none">截面不中性化</option><option value="industry">行业中性</option><option value="industry_size">行业 + 市值中性</option></select>
+              <select id="icNeutral" aria-label="截面中性化"><option value="none">截面不中性化</option><option value="size">市值中性</option><option value="industry" disabled>行业中性（需时点行业分类）</option><option value="industry_size" disabled>行业 + 市值中性（需时点行业分类）</option></select>
             </label>
           </div>
           <p class="note">IC 是因子值与未来收益（次日开盘买入、持有 N 日）的秩相关，非重叠抽样。时序 IC 看单只标的自身的择时能力（各标的等权平均），截面 IC 看在标的之间挑强弱的能力。区间为 95% 置信区间：按日期整块重抽样（块自助法），所有标的同时重抽，相关或重复的标的不会虚增显著性。点一行看分组组合。</p>
@@ -616,7 +617,6 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
     riskAversion: { label: '风险厌恶 λ', def: 10, min: 0, step: 1, range: [5, 20, 5] },
     maxWeight: { label: '单票上限（%）', def: 10, min: 1, step: 1, range: [5, 15, 5] },
     turnoverCost: { label: '单边成本（%，换手惩罚）', def: 0.15, min: 0, step: 0.05, range: [0.1, 0.3, 0.1] },
-    industryPenalty: { label: '行业偏离惩罚（0 = 不约束）', def: 0, min: 0, step: 10, range: [0, 100, 50] },
   };
   const state = {
     tab: 'backtest', source: 'sample', csv: {}, online: {},
@@ -691,8 +691,9 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
         .map(([v, t]) => `<option value="${v}" ${(f.sizing || 'equal') === v ? 'selected' : ''}>${t}</option>`).join('') + '</select></label>' +
       (f.sizing === 'optimize' ? Object.entries(OPT_PARAMS).map(([k, spec]) => paramInput('fs.' + k, spec, f[k] ?? spec.def)).join('') : '') +
       `<label for="in_fs_neutral">因子中性化<select id="in_fs_neutral" data-path="fs.neutral">` +
-      [['none', '不中性化'], ['industry', '行业中性（需个股池）'], ['industry_size', '行业 + 市值中性（需个股池）']]
-        .map(([v, t]) => `<option value="${v}" ${(f.neutral || 'none') === v ? 'selected' : ''}>${t}</option>`).join('') + '</select></label>';
+      // 行业标签是今天的分类（非时点），不能进入历史信号，只用于事后归因
+      [['none', '不中性化'], ['size', '市值中性（需个股池）'], ['industry', '行业中性（需时点行业分类，暂无）', true], ['industry_size', '行业 + 市值中性（需时点行业分类，暂无）', true]]
+        .map(([v, t, off]) => `<option value="${v}" ${(f.neutral || 'none') === v ? 'selected' : ''} ${off ? 'disabled' : ''}>${t}</option>`).join('') + '</select></label>';
     const m = c.momentum;
     $('#momBox').innerHTML =
       paramInput('mom.lookback', { label: '回看天数', min: 5, step: 1 }, m.lookback) +
@@ -734,7 +735,7 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
       const f = config.factor;
       const label = (id) => (R.FACTORS.find((x) => x.id === id) || { label: id }).label;
       const parts = f.factors.filter((x) => +x.weight).map((x) => `${label(x.id)}×${x.weight}`);
-      const neu = ({ industry: ' · 行业中性', industry_size: ' · 行业+市值中性' }[f.neutral] || '') +
+      const neu = ({ size: ' · 市值中性', industry: ' · 行业中性', industry_size: ' · 行业+市值中性' }[f.neutral] || '') +
         (f.sizing === 'optimize' ? ` · 组合优化（IC ${f.ic}，λ ${f.riskAversion}，单票 ≤ ${f.maxWeight}%${+f.industryPenalty ? `，行业惩罚 ${f.industryPenalty}` : ''}）` : '');
       return `多因子：${parts.join(' + ')} · 持有 ${f.topN} 只 · 每 ${f.rebalance} 日调仓${f.trendN ? ` · ${f.trendN} 日趋势过滤` : ''}${neu}`;
     }
@@ -794,19 +795,39 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
     await state.ledger.append('legacy', { perKey, testReveals: reveals, note: '账本启用前本机累计的计数' });
   }
 
+  const CODE_VERSION = '2026-09-audit12';
   function expKey() { return JSON.stringify([state.source, Object.keys(rawData() || {}).sort()]); }
   const ledgerStats = (key = expKey()) => state.ledger.stats(key);
   const expTrials = () => ledgerStats().trials;
 
-  // 同一份数据、同一区间下的不同策略配置各记一次（自动回测时重复的配置不重复记）
+  // 执行假设（不含数据元数据，元数据进数据指纹）
+  function engineSnapshot() {
+    const { meta, ...e } = engineOpts();
+    return e;
+  }
+
+  /* 实验清单：数据指纹（全部字段 + 元数据）、策略配置、全部执行假设、区间、留出期、数据口径、代码版本。
+   * 清单哈希即配置哈希：只改滑点、费用、容量、区间、财报可用日等任何一项，都是一次新的试验。 */
+  async function buildManifest(config) {
+    return {
+      schema: 'aq-manifest-v1', code: CODE_VERSION, source: state.source,
+      data: await dataHash(), strategy: config, engine: engineSnapshot(),
+      range: [$('#start').value, $('#end').value], holdout: holdoutCap(),
+      pool: state.source === 'pool' ? { start: $('#poolStart').value, fundAvail: $('#fundAvail').value, strict: $('#poolStrict').checked } : null,
+      rf: rf(),
+    };
+  }
+
+  // 同一份数据上的不同实验清单各记一次（自动回测时重复的清单不重复记）
   function logBacktest(config, m) {
     if (config.type === 'buy_hold') return;
     const dataKey = expKey();
     const range = [$('#start').value, $('#end').value, holdoutCap()];
-    LG.sha256(LG.canon([config, range])).then(async (configHash) => {
+    buildManifest(config).then(async (manifest) => {
+      const configHash = await LG.manifestHash(manifest);
       if (state.ledger.entries.some((e) => e.kind === 'backtest' && e.dataKey === dataKey && e.configHash === configHash)) return;
       await state.ledger.append('backtest', {
-        dataKey, configHash, config, range, dataHash: await dataHash(),
+        dataKey, configHash, config, range, dataHash: manifest.data, manifest,
         summary: { cagr: m.cagr, sharpe: m.sharpe, maxDD: m.max_drawdown, trades: m.trades },
       });
       renderLedger();
@@ -815,9 +836,9 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
 
   let dataHashMemo = null;
   async function dataHash() {
-    const key = JSON.stringify([state.source, state.dataVersion || 0, $('#start').value, $('#end').value, holdoutCap()]);
+    const key = JSON.stringify([state.source, state.dataVersion || 0, $('#start').value, $('#end').value, holdoutCap(), $('#fundAvail').value]);
     if (dataHashMemo && dataHashMemo.key === key) return dataHashMemo.hash;
-    const hash = await LG.fingerprint(activeData());
+    const hash = await LG.fingerprint(activeData(), engineOpts().meta);
     dataHashMemo = { key, hash };
     return hash;
   }
@@ -857,6 +878,7 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
       throw new Error(state.source === 'csv' ? '还没有上传 CSV 文件' : state.source === 'online' ? '还没有获取行情，先点"获取行情"'
         : state.source === 'pool' ? (state.poolLoading ? '正在读取本地股票池…' : '股票池还没有数据，先点"获取 / 更新"') : '示例数据加载失败');
     }
+    if (state.source === 'pool' && state.pool && state.pool.blocked) throw new Error(state.pool.blocked);
     const keep = dateFilter();
     const out = {};
     for (const s of syms) {
@@ -1034,14 +1056,23 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
       const m = await loadMembers();
       const [a, b] = poolRange();
       if (!state.industry) {
-        try { const r = await fetch('data/hs300_industry.json', { cache: 'no-cache' }); if (r.ok) state.industry = (await r.json()).level1; } catch (e) { /* 没有行业数据时不做行业中性化 */ }
+        try {
+          const r = await fetch('data/hs300_industry.json', { cache: 'no-cache' });
+          if (r.ok) { const j = await r.json(); state.industry = j.level1; state.listDate = j.listDate || null; }
+        } catch (e) { /* 没有行业数据时不做行业归因 */ }
       }
-      state.pool = await AQ.pool.load(m, a, b, { industry: state.industry });
+      state.pool = await AQ.pool.load(m, a, b, { industry: state.industry, listDate: state.listDate });
       const c = state.pool.coverage;
+      // 严格模式：逐日覆盖率不足时拒绝回测（数据仍保留，便于继续补齐）
+      state.pool.blocked = $('#poolStrict').checked && c.got && c.minDaily < 0.995
+        ? `严格模式：${c.worst ? c.worst.date : ''} 当日应在池内的成分股只有 ${(c.minDaily * 100).toFixed(1)}% 有行情（缺 ${c.worst ? c.worst.missing.slice(0, 8).join('、') + (c.worst.missing.length > 8 ? '…' : '') : ''}），低于 99.5%，拒绝回测。补齐数据，或取消严格模式后自行承担幸存者偏差。`
+        : null;
       poolStatus(`成分数据截至 ${m.asOf}（重建自 ${m.events} 次调整）。${a.slice(0, 4)} 年以来曾为成分 ${c.wanted} 只，本地已有 ${c.got} 只` +
         (c.missing.length ? `，缺 ${c.missing.length} 只：点"获取 / 更新"补齐（已退市且东方财富没有行情的会一直缺）。` : '。') +
         (c.stale ? ` 其中 ${c.stale} 只是旧格式（缺股本变动历史，估值会退回每股口径），点"获取 / 更新"会重新获取。` : '') +
-        (state.pool.meta.index ? '' : ' 还没有沪深300 指数行情（获取 / 更新时一并取）。'));
+        (state.pool.meta.index ? '' : ' 还没有沪深300 指数行情（获取 / 更新时一并取）。') +
+        (c.got ? ` 逐日覆盖率最低 ${(c.minDaily * 100).toFixed(1)}%${c.worst ? '（' + c.worst.date + '）' : ''}。` : '') +
+        (state.pool.blocked ? ' ' + state.pool.blocked : ''), !!state.pool.blocked);
     } catch (e) {
       state.pool = null;
       poolStatus(e.message, true);
@@ -1340,7 +1371,8 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
       $('#paperFreezeNote').textContent = `${date} 的信号已经冻结过`;
       return;
     }
-    await state.ledger.append('paper', { dataKey: expKey(), date, configHash, config, dataHash: await dataHash(), targets });
+    // 冻结时的执行假设一并写入：之后按这些假设在同一个回测引擎里成交结算
+    await state.ledger.append('paper', { dataKey: expKey(), date, configHash, config, dataHash: await dataHash(), targets, engine: engineSnapshot() });
     $('#paperFreezeNote').textContent = `已冻结 ${date} 收盘后的目标仓位（${Object.keys(targets).length} 只），写入研究账本`;
     renderLedger();
     renderPaper();
@@ -1359,38 +1391,50 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
       $('#paperTable').innerHTML = '';
       return;
     }
-    const bars = bt.bars(), dates = bt.dates;
-    let cum = 1, bcum = 1, days = 0, cur = null, j = 0;
-    const rows = entries.map((e) => ({ e, ret: 1, bret: 1, days: 0 }));
-    for (let t = 1; t < dates.length; t++) {
-      let fresh = false;
-      while (j < entries.length && entries[j].date < dates[t]) { cur = j; j++; fresh = true; }
-      if (cur === null) continue;
-      const tg = entries[cur].targets;
-      let r = 0;
-      for (const [s, w] of Object.entries(tg)) {
-        if (!bars.close[s]) continue;
-        const base = fresh ? bars.open[s][t] : bars.close[s][t - 1];
-        const x = bars.close[s][t] / base - 1;
-        if (fin(x)) r += w * x;
-      }
+    // 影子账户：冻结的目标交给回测引擎成交（次日开盘、真实价格、整手、涨跌停与停牌、费用、滑点、容量），执行假设取第一次冻结时的
+    let acct;
+    try {
+      acct = R.paperReplay(activeData(), entries.map((e) => ({ date: e.date, targets: e.targets, engine: e.engine || engineSnapshot() })), { meta: engineOpts().meta });
+    } catch (err) {
+      $('#paperKpis').innerHTML = `<p class="error">${esc(err.message)}</p>`;
+      return;
+    }
+    const cur = await dataHash();
+    const changed = entries.filter((e) => e.dataHash && e.dataHash !== cur).length;
+    const legacy = entries.filter((e) => !e.engine).length;
+    $('#paperMeta').textContent = `${entries.length} 次冻结 · 首次 ${entries[0].date}` +
+      (changed ? ` · ${changed} 次冻结时的数据指纹与当前不同（数据已更新；若历史行情被修订，结算会随之变化）` : '') +
+      (legacy ? ` · ${legacy} 条旧记录没有保存执行假设，按当前设置结算` : '');
+    if (!acct || acct.dates.length < 2) {
+      $('#paperKpis').innerHTML = '<p class="note">冻结之后还没有新的行情；更新数据后这里会自动结算。</p>';
+      $('#paperTable').innerHTML = '';
+      return;
+    }
+    const idx = new Map(bt.dates.map((d, k) => [d, k]));
+    let bcum = 1;
+    for (let k = 1; k < acct.dates.length; k++) {
+      const t = idx.get(acct.dates[k]);
+      if (t === undefined) continue;
       let bsum = 0, bn = 0;
+      const bars = bt.bars();
       for (const s of bt.symbols) {
         if (bt.member && !bt.member[s][t - 1]) continue;
         const x = bars.close[s][t] / bars.close[s][t - 1] - 1;
         if (fin(x)) { bsum += x; bn++; }
       }
-      const br = bn ? bsum / bn : 0;
-      cum *= 1 + r; bcum *= 1 + br; days++;
-      rows[cur].ret *= 1 + r; rows[cur].bret *= 1 + br; rows[cur].days++;
+      bcum *= 1 + (bn ? bsum / bn : 0);
     }
-    $('#paperMeta').textContent = `${entries.length} 次冻结 · 首次 ${entries[0].date}`;
-    $('#paperKpis').innerHTML = days
-      ? kpi('影子组合累计', cum - 1, `${days} 个交易日`, fmt.pct) + kpi('同期基准', bcum - 1, '当期成分等权', fmt.pct) + kpi('超额', cum - bcum, '不含交易成本', fmt.pct)
-      : '<p class="note">冻结之后还没有新的行情；更新数据后这里会自动结算。</p>';
-    $('#paperTable').innerHTML = '<thead><tr><th>冻结日</th><th>持仓数</th><th>持有天数</th><th>区间收益</th><th>基准</th><th>哈希</th></tr></thead><tbody>' +
-      rows.slice().reverse().slice(0, 20).map((x) => `<tr><td class="num">${x.e.date}</td><td class="num">${Object.keys(x.e.targets).length}</td><td class="num">${x.days}</td>` +
-        `<td class="num ${tone(x.ret - 1)}">${x.days ? fmt.pct(x.ret - 1) : '—'}</td><td class="num">${x.days ? fmt.pct(x.bret - 1) : '—'}</td><td class="num note">${x.e.hash.slice(0, 10)}</td></tr>`).join('') + '</tbody>';
+    const nav = acct.nav[acct.nav.length - 1];
+    const fees = acct.trades.reduce((a, t) => a + t.fee, 0);
+    const pend = acct.pending ? Object.entries(acct.pending).filter(([, w]) => w > 0).length : 0;
+    $('#paperKpis').innerHTML = kpi('影子账户累计', nav - 1, `${acct.dates.length - 1} 个交易日 · 引擎成交`, fmt.pct) + kpi('同期基准', bcum - 1, '当期成分等权', fmt.pct) +
+      kpi('超额', nav - bcum, `已扣费用 ${fmt.money(fees)} 元`, fmt.pct) +
+      kpi('现金占比', acct.cash / acct.equity[acct.equity.length - 1], `${Object.keys(acct.positions).length} 只持仓${pend ? ` · ${pend} 只待成交` : ''}`, fmt.pctPlain, false);
+    $('#paperTable').innerHTML = '<thead><tr><th>日期</th><th>代码</th><th>方向</th><th>股数</th><th>成交价</th><th>费用</th></tr></thead><tbody>' +
+      acct.trades.slice().reverse().slice(0, 20).map((t) => `<tr><td class="num">${t.date}</td><td class="num">${esc(t.symbol)}</td>` +
+        `<td class="side ${t.side === 'buy' ? 'up' : 'down'}">${t.side === 'buy' ? '买入' : '卖出'}</td><td class="num">${fmt.int(t.shares)}</td>` +
+        `<td class="num">${t.price.toFixed(3)}</td><td class="num">${t.fee.toFixed(2)}</td></tr>`).join('') + '</tbody>' +
+      `<caption class="note" style="caption-side:bottom;text-align:left">冻结记录：${entries.slice(-5).map((e) => e.date + ' ' + e.hash.slice(0, 8)).join('，')}</caption>`;
   }
 
   function indexCurve(bt) {
@@ -1417,10 +1461,11 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
     const trades = state.last.res.trades;
     const list = trades.slice().reverse();
     const shown = state.showAllTrades ? list : list.slice(0, 30);
-    $('#tradeCount').textContent = `共 ${trades.length} 笔${shown.length < list.length ? '，显示最近 30 笔' : ''}`;
+    const nFill = trades.filter(AQ.isFill).length;
+    $('#tradeCount').textContent = `共 ${nFill} 笔成交${trades.length > nFill ? `，另有 ${trades.length - nFill} 次送转 / 分红` : ''}${shown.length < list.length ? '，显示最近 30 条' : ''}`;
     $('#trades').innerHTML = '<thead><tr><th>日期</th><th>代码</th><th>方向</th><th>股数</th><th>成交价</th><th>金额</th><th>费用</th></tr></thead><tbody>' +
       (shown.length ? shown.map((t) => `<tr><td class="num">${t.date}</td><td class="num">${t.symbol}</td>` +
-        `<td class="side ${t.side === 'buy' ? 'up' : 'down'}">${t.side === 'buy' ? '买入' : '卖出'}</td>` +
+        `<td class="side ${t.side === 'buy' ? 'up' : t.side === 'sell' ? 'down' : 'note'}">${{ buy: '买入', sell: t.delisted ? '退市注销' : '卖出', corporate: '送转后', dividend: '分红' }[t.side] || t.side}</td>` +
         `<td class="num">${t.shares.toLocaleString('zh-CN')}</td><td class="num">${t.price.toFixed(3)}</td>` +
         `<td class="num">${fmt.money(t.amount)}</td><td class="num">${t.fee.toFixed(2)}</td></tr>`).join('')
         : '<tr><td colspan="7">没有成交</td></tr>') + '</tbody>';
@@ -1705,7 +1750,8 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
         dataKey: expKey(), trials: result.trials, config: payload.config, objective: result.objective,
         space: result.space.map((d) => ({ path: d.path, values: d.values })), splits: result.splits,
         selected: result.selected && result.selected.combo, dsr: result.dsr && result.dsr.prob,
-        pbo: of.pbo && of.pbo.pbo, spa: of.spa && of.spa.p,
+        pbo: of.pbo && of.pbo.pbo, spa: of.spa && of.spa.p, spaSE: of.spa && of.spa.se,
+        engine: engineSnapshot(), range: [$('#start').value, $('#end').value, holdoutCap()], code: CODE_VERSION,
       }).then(renderLedger);
       renderOptResults();
     };
@@ -1774,7 +1820,7 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
       kpi(`选定参数验证集${OBJ_LABEL[o]}`, sel ? sel.va[o] : NaN, `基准 ${objFmt(o, r.bench.va[o])}`, (v) => objFmt(o, v), o === 'cagr') +
       kpi('训练集第一名真实夏普 > 0 的概率', dsr ? dsr.prob : NaN, dsr ? `按累计 ${dsr.trials} 次试验折算` : '—', fmt.pctPlain, false) +
       kpi('回测过拟合概率 PBO', of.pbo ? of.pbo.pbo : NaN, of.pbo ? `样本外亏损概率 ${fmt.pctPlain(of.pbo.probLoss)}` : '至少 2 组合格参数', fmt.pctPlain, false) +
-      kpi('SPA 检验 p 值', of.spa ? of.spa.p : NaN, of.spa ? `${of.spa.models} 组参数 vs 基准` : of.spaSkipped ? '参数组合太多，未计算' : '—', fmt.num, false);
+      kpi('SPA 检验 p 值', of.spa ? of.spa.p : NaN, of.spa ? `${of.spa.models} 组参数 vs 基准 · 蒙特卡洛误差 ±${fmt.num3(1.96 * of.spa.se)}` : of.spaSkipped ? '参数组合太多，未计算' : '—', fmt.num, false);
 
     let verdict = '';
     if (!sel) verdict = '没有满足"最少成交"要求的参数组合，调低门槛或换一组规则。';
@@ -1787,8 +1833,9 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
         `训练集第一名夏普 ${fmt.num(best.tr.sharpe)}，按累计试验次数折算后真实夏普大于 0 的概率 ${fmt.pctPlain(p)}（只按本次计为 ${fmt.pctPlain(dsr && dsr.probThisRun)}）：${level}。` +
         '你在别的设备、别的工具或脑子里做过的尝试没有计入，所以这个概率仍然偏乐观。' +
         (of.pbo ? ` 组合对称交叉验证（CSCV，${of.pbo.blocks} 个时间块、${of.pbo.splits} 种切分）：样本内最优的参数在样本外落到后一半的概率 PBO = <b class="${of.pbo.pbo > 0.5 ? 'down' : of.pbo.pbo > 0.2 ? 'warn' : 'up'}">${fmt.pctPlain(of.pbo.pbo)}</b>` +
-          `，样本外亏损概率 ${fmt.pctPlain(of.pbo.probLoss)}，样本内外夏普回归斜率 ${fmt.num(of.pbo.slope)}（越接近 1 越好，≤ 0 说明样本内越好样本外越差）。` : '') +
-        (of.spa ? ` Hansen SPA 检验（${of.spa.models} 组参数相对基准的日超额收益，平稳自助法 ${of.spa.bootstrap} 次）：p = <b class="${of.spa.p < 0.05 ? 'up' : 'down'}">${fmt.num(of.spa.p)}</b>` +
+          `，样本外亏损概率 ${fmt.pctPlain(of.pbo.probLoss)}，样本内外夏普回归斜率 ${fmt.num(of.pbo.slope)}（越接近 1 越好，≤ 0 说明样本内越好样本外越差）。` +
+          (of.pbo.warning ? `<span class="warn">${esc(of.pbo.warning)}。</span>` : '') : '') +
+        (of.spa ? ` Hansen SPA 检验（${of.spa.models} 组参数相对基准的日超额收益，平稳自助法 ${of.spa.bootstrap} 次）：p = <b class="${of.spa.p < 0.05 ? 'up' : 'down'}">${fmt.num(of.spa.p)}</b>（蒙特卡洛 95% 误差 ±${fmt.num3(1.96 * of.spa.se)}）` +
           `${of.spa.p < 0.05 ? '，考虑了全部尝试后最优者仍显著优于基准' : '，考虑了全部尝试后无法拒绝"都不比基准好"'}。` : '') +
         ` 在训练排名前 ${r.shortlist} 组中，验证集最好的是第 ${sel.trainRank} 名（★），其验证集夏普 ${fmt.num(sel.va.sharpe)}` +
         (fin(deg) ? `，是训练集的 ${(deg * 100).toFixed(0)}%${deg < 0.5 ? '，衰减明显，警惕过拟合' : ''}` : '') + '。' +
@@ -1965,20 +2012,39 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
   }
 
   // 因子 IC 的自助法较慢，放到后台线程；无法创建后台线程时在主线程计算
-  function computeIC(h, neutral, done) {
+  function computeIC(h, neutral, done, fail) {
     const bt = state.research.bt;
     const token = (state.icToken = (state.icToken || 0) + 1);
     const finish = (ic) => { if (token === state.icToken) done(ic); };
-    const local = () => setTimeout(() => finish(R.factorIC(bt, h, { neutral })), 30);
+    const failed = (msg) => { if (token === state.icToken) fail(msg); };
+    const local = () => setTimeout(() => { try { finish(R.factorIC(bt, h, { neutral })); } catch (e) { failed(e.message); } }, 30);
     let w = null;
     try { w = new Worker('worker.js'); } catch (e) { w = null; }
     if (!w) return local();
     if (state.icWorker) state.icWorker.terminate();
     state.icWorker = w;
     const stop = () => { w.terminate(); if (state.icWorker === w) state.icWorker = null; };
-    w.onmessage = (e) => { stop(); if (e.data.type === 'result') finish(e.data.result); else local(); };
+    w.onmessage = (e) => { stop(); if (e.data.type === 'result') finish(e.data.result); else failed(e.data.message); };
     w.onerror = (e) => { stop(); e.preventDefault(); local(); };
     w.postMessage({ type: 'ic', payload: { data: activeData(), engine: engineOpts(), h, neutral } });
+  }
+
+  // 分组组合由回测引擎逐组成交（较慢），放到后台线程
+  function computeQuantiles(factor, h, neutral, done, fail) {
+    const bt = state.research.bt;
+    const token = (state.qToken = (state.qToken || 0) + 1);
+    const finish = (p) => { if (token === state.qToken) done(p); };
+    const failed = (msg) => { if (token === state.qToken) fail(msg); };
+    const local = () => setTimeout(() => { try { finish(R.factorPortfolios(bt, factor, h, { neutral })); } catch (e) { failed(e.message); } }, 30);
+    let w = null;
+    try { w = new Worker('worker.js'); } catch (e) { w = null; }
+    if (!w) return local();
+    if (state.qWorker) state.qWorker.terminate();
+    state.qWorker = w;
+    const stop = () => { w.terminate(); if (state.qWorker === w) state.qWorker = null; };
+    w.onmessage = (e) => { stop(); if (e.data.type === 'result') finish(e.data.result); else failed(e.data.message); };
+    w.onerror = (e) => { stop(); e.preventDefault(); local(); };
+    w.postMessage({ type: 'quantiles', payload: { data: activeData(), engine: engineOpts(), factor, h, neutral } });
   }
 
   function renderIC() {
@@ -2007,6 +2073,8 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
         `换一个预测周期、时间段（看前半 / 后半）仍然显著的因子才值得深挖。` +
         (nSym < 3 ? '截面 IC 需要至少 3 只标的。' : nSym < 10 ? `当前只有 ${nSym} 只标的，截面结论很不稳定。` : '');
       renderQuantiles();
+    }, (msg) => {
+      $('#icTable').innerHTML = `<tbody><tr><td class="down">${esc(msg)}</td></tr></tbody>`;
     });
   }
 
@@ -2016,8 +2084,18 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
     const f = state.research.ic.find((x) => x.id === state.icSel) || state.research.ic[0];
     state.icSel = f.id;
     const neutral = $('#icNeutral').value;
-    const p = R.factorPortfolios(state.research.bt, f.id, h, { neutral });
-    $('#qTitle').textContent = `分组组合：${f.label}，每 ${h} 日调仓${{ industry: '，行业中性', industry_size: '，行业+市值中性' }[neutral] || ''}`;
+    $('#qTitle').textContent = `分组组合：${f.label}，每 ${h} 日调仓${{ size: '，市值中性', industry: '，行业中性', industry_size: '，行业+市值中性' }[neutral] || ''}`;
+    $('#qMeta').textContent = '计算中（每组都由回测引擎实际成交）…';
+    $('#qChart').innerHTML = '';
+    $('#qReadout').innerHTML = '';
+    $('#qTable').innerHTML = '';
+    computeQuantiles(f.id, h, neutral, (p) => renderQuantileResult(p), (msg) => {
+      $('#qMeta').textContent = '';
+      $('#qTable').innerHTML = `<tbody><tr><td class="down">${esc(msg)}</td></tr></tbody>`;
+    });
+  }
+
+  function renderQuantileResult(p) {
     if (!p.q) {
       $('#qMeta').textContent = '';
       $('#qChart').innerHTML = '';
@@ -2025,15 +2103,14 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
       $('#qTable').innerHTML = `<tbody><tr><td>${esc(p.error)}（当前 ${state.research.bt.symbols.length} 只）。时序择时能力看上面的时序 IC。</td></tr></tbody>`;
       return;
     }
-    $('#qMeta').textContent = `${p.q} 组 · ${p.periods} 期 · ${p.dates[0]} ~ ${p.dates[p.dates.length - 1]}`;
+    $('#qMeta').textContent = `${p.q} 组 · ${p.periods} 次调仓 · ${p.dates[0]} ~ ${p.dates[p.dates.length - 1]} · 回测引擎成交（资金 ${fmt.money(p.capital)} 元/组，费用、滑点、涨跌停、停牌、整手与回测设置一致）`;
     const color = (k) => (k === p.q - 1 ? 'var(--up)' : k === 0 ? 'var(--down)' : 'var(--muted)');
-    const dates = [p.dates[0]].concat(p.dates);
-    drawNav('#qChart', '#qReadout', dates, p.groups.map((g, k) => ({ values: g.equity, color: color(k), width: k === 0 || k === p.q - 1 ? 1.6 : 1, label: 'Q' + g.group }))
+    drawNav('#qChart', '#qReadout', p.dates, p.groups.map((g, k) => ({ values: g.equity, color: color(k), width: k === 0 || k === p.q - 1 ? 1.6 : 1, label: 'Q' + g.group }))
       .concat([{ values: p.longShort.equity, color: 'var(--accent)', width: 1.8, label: '多空' }]), null);
     const row = (name, g, extra) => `<tr><td>${name}</td><td class="num ${tone(g.annReturn)}">${fmt.pct(g.annReturn)}</td><td class="num">${fmt.pctPlain(g.annVol)}</td>` +
       `<td class="num">${fmt.num(g.sharpe)}</td>${extra}<td class="num ${tone(g.first)}">${fmt.pct(g.first)}</td><td class="num ${tone(g.second)}">${fmt.pct(g.second)}</td></tr>`;
-    $('#qTable').innerHTML = '<thead><tr><th>组（低→高）</th><th>年化（扣成本）</th><th>波动</th><th>夏普</th><th>毛年化</th><th>每期换手</th><th>前半段</th><th>后半段</th></tr></thead><tbody>' +
-      p.groups.map((g) => row('Q' + g.group, g, `<td class="num">${fmt.pct(g.grossReturn)}</td><td class="num">${fmt.pctPlain(g.turnover)}</td>`)).join('') +
+    $('#qTable').innerHTML = '<thead><tr><th>组（低→高）</th><th>年化（扣成本）</th><th>波动</th><th>夏普</th><th>年化成本</th><th>年化换手</th><th>前半段</th><th>后半段</th></tr></thead><tbody>' +
+      p.groups.map((g) => row('Q' + g.group, g, `<td class="num">${fmt.pctPlain(g.costDrag)}</td><td class="num">${fmt.num(g.turnover)}</td>`)).join('') +
       row('<b>多空 Q' + p.q + '−Q1</b>', p.longShort, '<td></td><td></td>') + '</tbody>';
   }
 
@@ -2055,6 +2132,9 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
     state.config = { ...JSON.parse(JSON.stringify(DEFAULT_CONFIG)), ...saved.config };
     state.config.rules = state.config.rules.filter((r) => AQ.RULES[r.id]);
     state.config.factor = { ...DEFAULT_CONFIG.factor, ...(saved.config.factor || {}) };
+    // 旧版保存的行业中性 / 行业惩罚：当前行业分类不是时点数据，不再允许用于信号
+    if (['industry', 'industry_size'].includes(state.config.factor.neutral)) state.config.factor.neutral = 'none';
+    state.config.factor.industryPenalty = 0;
     state.config.factor.factors = state.config.factor.factors.filter((f) => R.FACTORS.some((x) => x.id === f.id));
   }
   TX_IDS.forEach((id) => { if (saved[id] !== undefined) $('#' + id).value = saved[id]; });
@@ -2104,6 +2184,10 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
   });
   $('#poolStart').addEventListener('change', async () => {
     saveSettings();
+    await loadPool();
+    if (state.source === 'pool') dataChanged();
+  });
+  $('#poolStrict').addEventListener('change', async () => {
     await loadPool();
     if (state.source === 'pool') dataChanged();
   });
@@ -2252,7 +2336,7 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
     setTimeout(() => {
       const neutral = $('#icNeutral').value;
       const d = R.factorDecay(state.research.bt, state.icSel, { horizons: [1, 5, 10, 20, 60], yearH: +$('#icH').value, neutral });
-      $('#decayMeta').textContent = `${d.label}${neutral !== 'none' ? '（' + ({ industry: '行业中性', industry_size: '行业+市值中性' }[neutral]) + '）' : ''}`;
+      $('#decayMeta').textContent = `${d.label}${neutral !== 'none' ? '（' + ({ size: '市值中性', industry: '行业中性', industry_size: '行业+市值中性' }[neutral]) + '）' : ''}`;
       $('#decayTable').innerHTML = '<thead><tr><th>预测周期（日）</th>' + d.byH.map((x) => `<th>${x.h}</th>`).join('') + '</tr></thead><tbody>' +
         '<tr><td>截面 IC</td>' + d.byH.map((x) => `<td class="num ${tone(x.ic)}">${fmt.num3(x.ic)}</td>`).join('') + '</tr>' +
         '<tr><td>ICIR</td>' + d.byH.map((x) => `<td class="num">${fmt.num(x.icir)}</td>`).join('') + '</tr>' +

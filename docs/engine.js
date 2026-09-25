@@ -27,12 +27,36 @@
     return out;
   }
 
+  /* 涨跌幅限制（历史规则）：
+   *   跟踪创业板指数的 ETF 自 2020-08-24 起 ±20%（名单不完整，只含已核实的；其他可用 meta.priceLimit 覆盖），科创板 ETF（588 开头）±20%；
+   *   科创板 ±20%；创业板 2020-08-24 起 ±20%；北交所 ±30%；其余 ±10%。ST 股 ±5% 需要状态数据，未处理。 */
+  const CHINEXT_ETFS = new Set(['159915', '159949']);
   function priceLimit(symbol, date) {
-    if (isEtf(symbol)) return 0.10;
+    if (isEtf(symbol)) {
+      if (/^588/.test(symbol)) return 0.20;
+      if (CHINEXT_ETFS.has(symbol)) return date >= CHINEXT_REFORM ? 0.20 : 0.10;
+      return 0.10;
+    }
     if (/^(688|689)/.test(symbol)) return 0.20;
     if (/^(300|301)/.test(symbol)) return date >= CHINEXT_REFORM ? 0.20 : 0.10;
     if (/^(4|8|92)/.test(symbol)) return 0.30;
     return 0.10;
+  }
+
+  /* 申报数量：科创板 200 股起、超出部分 1 股递增；其余 100 股整数倍 */
+  const isStar = (s) => /^(688|689)/.test(s);
+  function lotRound(symbol, qty) {
+    if (isStar(symbol)) return qty >= 200 ? Math.floor(qty) : 0;
+    return Math.floor(qty / LOT_SIZE) * LOT_SIZE;
+  }
+
+  /* 注册制新股上市后前 5 个交易日不设涨跌幅：科创板全部、创业板 2020-08-24 起、主板 2023-04-10 起、北交所上市首日 */
+  function noLimitDays(symbol, listDate) {
+    if (!listDate || isEtf(symbol)) return 0;
+    if (isStar(symbol)) return 5;
+    if (/^(300|301)/.test(symbol)) return listDate >= CHINEXT_REFORM ? 5 : 0;
+    if (/^(4|8|92)/.test(symbol)) return 1;
+    return listDate >= '2023-04-10' ? 5 : 0;
   }
 
   // 与 Python Decimal(str(x)).quantize(0.01, ROUND_HALF_UP) 一致（x > 0）
@@ -46,16 +70,20 @@
     return Number(cents) / 100;
   }
 
-  function isLimitUp(symbol, date, price, prevClose) {
+  function isLimitUp(symbol, date, price, prevClose, limit) {
     if (!(prevClose > 0)) return false;
-    const raw = prevClose * (1 + priceLimit(symbol, date));
+    const pct = limit === undefined ? priceLimit(symbol, date) : limit;
+    if (!(pct > 0)) return false;
+    const raw = prevClose * (1 + pct);
     const threshold = Math.min(roundCentHalfUp(raw), raw * (1 - LIMIT_REL_TOL));
     return price >= threshold - 1e-9;
   }
 
-  function isLimitDown(symbol, date, price, prevClose) {
+  function isLimitDown(symbol, date, price, prevClose, limit) {
     if (!(prevClose > 0)) return false;
-    const raw = prevClose * (1 - priceLimit(symbol, date));
+    const pct = limit === undefined ? priceLimit(symbol, date) : limit;
+    if (!(pct > 0)) return false;
+    const raw = prevClose * (1 - pct);
     const threshold = Math.max(roundCentHalfUp(raw), raw * (1 + LIMIT_REL_TOL));
     return price <= threshold + 1e-9;
   }
@@ -103,6 +131,7 @@
       const pos = new Map(dates.map((d, i) => [d, i]));
       const n = dates.length;
       const open = {}, close = {}, high = {}, low = {}, volume = {}, tradable = {}, prevClose = {}, raw = {}, turnover = {};
+      const xopen = {}, xclose = {}, gfac = {}, caf = {};
       for (const s of symbols) {
         const src = data[s];
         // 开盘、收盘（涨跌停判断用）保持双精度；其余用单精度省内存（个股池有几百只标的）
@@ -125,15 +154,40 @@
         high[s] = h; low[s] = l; volume[s] = v;
         if (rw) raw[s] = rw;
         if (tv) turnover[s] = tv;
+        open[s] = o; close[s] = c; tradable[s] = t;
+        /* 成交价与信号价分开：有不复权收盘价时，成交、估值、涨跌停、费用、成交额都用真实价格
+         * （当日复权因子 g = 复权收盘 / 不复权收盘，真实开盘 = 复权开盘 / g）；复权因子跳变即公司行为（送转或分红）。
+         * 没有不复权价时，成交价就是给定的价格。 */
+        if (rw) {
+          const g = new Float64Array(n).fill(NaN), xo = new Float64Array(n).fill(NaN), ca = new Float64Array(n).fill(1);
+          /* 复权价与不复权价各自四舍五入到分，g 每天都有约 0.005/价格 的舍入噪声（两天合计最多约 0.01/价格 × 2）；
+           * 只有跳变超过这个容差才认定为公司行为，否则每天的噪声会被当成"分红"凭空加钱。
+           * 代价：低于容差的小额分红（低价股约 0.3~0.7%）被忽略，按不复权价估值时表现为除息日的价格下跌。 */
+          let lastG = NaN, lastRaw = NaN;
+          for (let i = 0; i < n; i++) {
+            if (c[i] > 0 && rw[i] > 0) {
+              g[i] = c[i] / rw[i];
+              xo[i] = o[i] / g[i];
+              if (Number.isFinite(lastG)) {
+                const tol = 0.01 / rw[i] + 0.01 / lastRaw + 1e-6;
+                if (Math.abs(g[i] / lastG - 1) > tol) ca[i] = g[i] / lastG;
+              }
+              lastG = g[i]; lastRaw = rw[i];
+            } else g[i] = lastG;
+          }
+          xopen[s] = xo; xclose[s] = rw; gfac[s] = g; caf[s] = ca;
+        } else {
+          xopen[s] = o; xclose[s] = c; gfac[s] = null; caf[s] = null;
+        }
         const p = new Float64Array(n).fill(NaN);
         let last = NaN;
         for (let i = 0; i < n; i++) {
           p[i] = last;
-          if (Number.isFinite(c[i])) last = c[i];
+          if (Number.isFinite(xclose[s][i])) last = xclose[s][i];
         }
-        open[s] = o; close[s] = c; tradable[s] = t; prevClose[s] = p;
+        prevClose[s] = p;
       }
-      Object.assign(this, { symbols, dates, open, close, high, low, volume, tradable, prevClose, raw, turnover, initialCash, fees, slippage, rebalanceBand });
+      Object.assign(this, { symbols, dates, open, close, high, low, volume, tradable, prevClose, raw, turnover, initialCash, fees, slippage, rebalanceBand, xopen, xclose, gfac, caf });
       this.meta = meta || {};
       this.delistRecovery = delistRecovery;
       /* 成交容量与冲击成本（0 = 不启用）：
@@ -155,6 +209,15 @@
           this.member[s] = m;
         }
       }
+      // 新股上市初期不设涨跌幅：noLimitUntil[s] = 最后一个不设限的交易日序号
+      this.noLimitUntil = {};
+      for (const [s, ld] of Object.entries(this.meta.listDate || {})) {
+        const k = noLimitDays(s, ld);
+        // 上市日早于数据起点时无法数交易日，保守地保留涨跌幅限制
+        if (!k || !symbols.includes(s) || !dates.length || ld < dates[0]) continue;
+        const first = dates.findIndex((x) => x >= ld);
+        if (first >= 0) this.noLimitUntil[s] = first + k - 1;
+      }
       // 退市：第一个晚于退市日的交易日序号
       this.delistAt = {};
       for (const [s, d] of Object.entries(this.meta.delisted || {})) {
@@ -164,13 +227,20 @@
       }
     }
 
+    // 当日涨跌幅限制（考虑 meta.priceLimit 覆盖与新股上市初期）
+    limitOf(s, i) {
+      if (this.noLimitUntil[s] !== undefined && i <= this.noLimitUntil[s]) return 0;
+      const o = this.meta.priceLimit && this.meta.priceLimit[s];
+      return o !== undefined ? o : priceLimit(s, this.dates[i]);
+    }
+
     liquidity(data) {
       const n = this.dates.length;
       this.adv = {};
       this.sigma = {};
       this.hasVolume = {};
       for (const s of this.symbols) {
-        const v = this.volume[s], c = this.close[s], px = this.raw[s] || c;
+        const v = this.volume[s], c = this.close[s], px = this.xclose[s];
         const adv = new Float64Array(n).fill(NaN), sig = new Float64Array(n).fill(NaN);
         const amt = [], ret = [];
         let prev = NaN;
@@ -205,7 +275,7 @@
       }
       let q = qty, capped = false;
       if (this.participation > 0) {
-        const max = Math.floor((this.participation * adv) / price / LOT_SIZE) * LOT_SIZE;
+        const max = lotRound(s, (this.participation * adv) / price);
         if (q > max) { q = max; capped = true; }
       }
       const sig = this.sigma[s][i];
@@ -265,9 +335,25 @@
       const lastClose = Object.fromEntries(symbols.map((s) => [s, NaN]));
       let pending = null;
       const equity = [], trades = [];
-      const ctx = { shares, book };
+      const ctx = { shares, book, equity: this.initialCash, value: (s) => (shares[s] ? shares[s] * lastClose[s] : 0) };
 
       dates.forEach((d, i) => {
+        // 公司行为（除权除息日开盘前）：复权因子上跳 ≥ 5% 视为送转，按比例增加股数；否则视为现金分红
+        for (const s of symbols) {
+          const ca = this.caf[s];
+          if (!ca || ca[i] === 1 || !shares[s]) continue;
+          const m = ca[i], prev = lastClose[s];
+          if (m >= 1.05 || m <= 0.95) {
+            const exact = shares[s] * m, whole = Math.floor(exact + 1e-9);
+            cash += (exact - whole) * (prev / m); // 零碎股按除权参考价折现
+            shares[s] = whole;
+            trades.push({ date: d, symbol: s, side: 'corporate', shares: whole, price: prev / m, amount: 0, fee: 0, factor: m, cash: (exact - whole) * (prev / m) });
+          } else if (m > 1) {
+            const div = shares[s] * prev * (1 - 1 / m);
+            cash += div;
+            trades.push({ date: d, symbol: s, side: 'dividend', shares: shares[s], price: prev * (1 - 1 / m), amount: div, fee: 0 });
+          }
+        }
         // 退市：仍持有的股份按最后价格 × 回收比例注销，记为一笔卖出
         for (const s in this.delistAt) {
           if (i < this.delistAt[s]) continue;
@@ -284,12 +370,13 @@
         if (pending) [cash, pending] = this.rebalance(i, pending, cash, shares, lastClose, trades, book);
         let value = 0;
         for (const s of symbols) {
-          const c = this.close[s][i];
+          const c = this.xclose[s][i];
           if (Number.isFinite(c)) lastClose[s] = c;
           if (shares[s]) value += shares[s] * lastClose[s];
         }
         equity.push(cash + value);
         ctx.pending = pending;
+        ctx.equity = cash + value;
         const row = live ? strategy.decide(i, ctx) : signals[i];
         if (row) {
           if (live) validateSignals([row]);
@@ -312,7 +399,7 @@
 
     rebalance(i, targets, cash, shares, lastClose, trades, book) {
       const d = this.dates[i];
-      const mark = (s) => (this.tradable[s][i] ? this.open[s][i] : lastClose[s]);
+      const mark = (s) => (this.tradable[s][i] ? this.xopen[s][i] : lastClose[s]);
       let held = 0;
       for (const s of this.symbols) if (shares[s]) held += shares[s] * mark(s);
       const equity = cash + held;
@@ -324,8 +411,10 @@
           if (w > 0 || shares[s] > 0) unfilled.set(s, w);
           continue;
         }
-        const price = this.open[s][i];
-        const target = w > 0 ? Math.floor((w * equity) / price / LOT_SIZE) * LOT_SIZE : 0;
+        const price = this.xopen[s][i];
+        let target = w > 0 ? lotRound(s, (w * equity) / price) : 0;
+        // 时点股票池由引擎强制：决策日（前一交易日）不是成分股的，只能卖不能买
+        if (this.member && target > shares[s] && !(i > 0 && this.member[s][i - 1])) target = shares[s];
         const delta = target - shares[s];
         if (target && shares[s] && Math.abs(delta) * price < this.rebalanceBand * equity) continue;
         if (delta < 0) sells.push([s, -delta, price, w]);
@@ -333,10 +422,12 @@
       }
 
       for (const [s, want, price, w] of sells) {
-        if (isLimitDown(s, d, price, this.prevClose[s][i])) { unfilled.set(s, w); continue; }
+        if (isLimitDown(s, d, price, this.prevClose[s][i], this.limitOf(s, i))) { unfilled.set(s, w); continue; }
         const cap = this.capacity(s, i, want, price);
         if (cap.capped) unfilled.set(s, w);
-        const qty = cap.qty;
+        let qty = cap.qty;
+        // 科创板：卖出后剩余不足 200 股的须一次卖完
+        if (isStar(s) && shares[s] - qty > 0 && shares[s] - qty < 200 && !cap.capped) qty = shares[s];
         if (qty <= 0) continue;
         const fill = price * (1 - cap.slip);
         const amount = qty * fill;
@@ -347,21 +438,26 @@
         if (book && shares[s] === 0) book[s] = { cost: NaN, entry: -1, exit: i };
       }
 
+      // 还有卖单没成交（跌停、停牌、容量）：因现金不足少买的部分次日继续
+      const cashComing = [...unfilled.keys()].some((k) => shares[k] > 0 && (unfilled.get(k) || 0) * equity < shares[k] * mark(k) - 1e-6);
       buys.sort((a, b) => b[1] * b[2] - a[1] * a[2]);
       for (const [s, want0, price, w] of buys) {
-        if (isLimitUp(s, d, price, this.prevClose[s][i])) { unfilled.set(s, w); continue; }
+        if (isLimitUp(s, d, price, this.prevClose[s][i], this.limitOf(s, i))) { unfilled.set(s, w); continue; }
         const cap = this.capacity(s, i, want0, price);
         if (cap.capped) unfilled.set(s, w);
         const fill = price * (1 + cap.slip);
         const qty = this.affordable(s, d, cap.qty, fill, cash);
+        if (qty < cap.qty && cashComing) unfilled.set(s, w);
         if (qty <= 0) continue;
         const amount = qty * fill;
         const fee = this.fees.cost(s, d, 'buy', amount, qty);
         cash -= amount + fee;
         if (book) {
           const bk = book[s];
-          // 成本价含费用；从空仓买入时记录建仓成交日
-          bk.cost = shares[s] > 0 ? (bk.cost * shares[s] + amount + fee) / (shares[s] + qty) : (amount + fee) / qty;
+          // 成本价含费用，换算到复权价尺度（与策略看到的收盘价可比）；从空仓买入时记录建仓成交日
+          const g = this.gfac[s] ? this.gfac[s][i] : 1;
+          const unit = ((amount + fee) / qty) * (Number.isFinite(g) ? g : 1);
+          bk.cost = shares[s] > 0 ? (bk.cost * shares[s] + unit * qty) / (shares[s] + qty) : unit;
           if (shares[s] === 0) bk.entry = i;
         }
         shares[s] += qty;
@@ -371,8 +467,10 @@
     }
 
     affordable(s, d, qty, price, cash) {
-      qty = Math.min(qty, Math.floor(cash / price / LOT_SIZE) * LOT_SIZE);
-      while (qty > 0 && qty * price + this.fees.cost(s, d, 'buy', qty * price, qty) > cash + 1e-9) qty -= LOT_SIZE;
+      // 买入申报必须是整手（科创板 ≥200 股）；送股产生的零股不能靠买入凑整
+      qty = lotRound(s, Math.min(qty, cash / price));
+      const step = isStar(s) ? 1 : LOT_SIZE;
+      while (qty > 0 && qty * price + this.fees.cost(s, d, 'buy', qty * price, qty) > cash + 1e-9) qty = lotRound(s, qty - step);
       return Math.max(qty, 0);
     }
   }
@@ -512,22 +610,26 @@
     };
   }
 
+  const isFill = (t) => t.side === 'buy' || t.side === 'sell';
+
   function summarize(result, rf = 0.02) {
     const m = equityMetrics(result.equity, rf);
     const years = Math.max(result.equity.length - 1, 1) / TRADING_DAYS;
     const meanEquity = result.equity.reduce((a, b) => a + b, 0) / result.equity.length;
-    const traded = result.trades.reduce((a, t) => a + t.amount, 0);
+    // 成交只算买卖；送转、分红（side 为 corporate / dividend）是公司行为，不是交易
+    const fills = result.trades.filter(isFill);
+    const traded = fills.reduce((a, t) => a + t.amount, 0);
     return Object.assign(m, {
       final_equity: result.equity[result.equity.length - 1],
-      trades: result.trades.length,
-      total_fees: result.trades.reduce((a, t) => a + t.fee, 0),
-      total_impact: result.trades.reduce((a, t) => a + (t.impact || 0), 0),
-      annual_turnover: result.trades.length ? traded / meanEquity / years : 0,
+      trades: fills.length,
+      total_fees: fills.reduce((a, t) => a + t.fee, 0),
+      total_impact: fills.reduce((a, t) => a + (t.impact || 0), 0),
+      annual_turnover: fills.length ? traded / meanEquity / years : 0,
     });
   }
 
   const api = {
-    LOT_SIZE, TRADING_DAYS, isEtf, priceLimit, isLimitUp, isLimitDown, FeeModel,
+    LOT_SIZE, TRADING_DAYS, isEtf, isFill, priceLimit, lotRound, noLimitDays, isLimitUp, isLimitDown, FeeModel,
     Backtester, BuyAndHold, DualMA, MomentumRotation, equityMetrics, summarize,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
