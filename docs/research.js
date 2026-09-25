@@ -249,6 +249,8 @@
       rebalanceBand: engine.rebalanceBand,
       meta: engine.meta || null,
       delistRecovery: engine.delistRecovery || 0,
+      participation: engine.participation || 0,
+      impact: engine.impact || 0,
     });
   }
 
@@ -618,20 +620,39 @@
     return { coef, se, t: coef.map((c, i) => (se[i] > 0 ? c / se[i] : NaN)), r2: sst > 0 ? 1 - sse / sst : NaN, n: T, lag: L };
   }
 
-  /* 股票池内的风格因子日收益（第 i 个元素为 i-1 收盘到 i 收盘）：
-   * MKT：全部标的等权收益 − 无风险利率；
-   * MOM：按前一日的 60 日涨幅分三组，强势组 − 弱势组；
-   * LOWVOL：按前一日的 20 日波动率分三组，低波组 − 高波组。
-   * 当日有效标的不足 6 只时，MOM 与 LOWVOL 记为 NaN。 */
+  /* 风格因子：按前一日收盘时的因子值把当期成分分三组，高组 − 低组（sign 为 −1 时反过来），等权。
+   * 只有当前数据支持的才计算（价值、质量需要财务数据，规模需要不复权价与股本或换手率）。 */
+  const STYLE_DEFS = [
+    { id: 'SIZE', label: '规模（小 − 大）', factor: 'size', sign: -1 },
+    { id: 'VALUE', label: '价值（高 E/P − 低）', factor: 'ep', sign: 1 },
+    { id: 'MOM', label: '动量（60 日）', factor: 'roc60', sign: 1 },
+    { id: 'LOWVOL', label: '低波动', factor: 'vol20', sign: -1 },
+    { id: 'QUALITY', label: '质量（高 ROE − 低）', factor: 'roe', sign: 1 },
+    { id: 'LIQ', label: '非流动性（Amihud 高 − 低）', factor: 'illiq', sign: 1 },
+  ];
+
+  const facValues = (b, s, id) => cachedPanel(b, s, 'fac:' + id, () => FACTOR_BY_ID[id].f(b, s));
+  const industryOf = (b, s) => (((b.meta || {}).industry || {})[s]) || null;
+
+  /* 股票池内的风格因子日收益（第 i 个元素为 i−1 收盘到 i 收盘）：MKT 为成分等权收益 − 无风险利率；
+   * 其余见 STYLE_DEFS，当日有效标的不足 6 只时记为 NaN。
+   * 有行业分类时另给出各行业等权收益 − 全体等权收益（industries），用于加入行业的归因模型；平均不足 3 只的行业不单列，
+   * 成分最多的行业作为基准不单列（避免与市场因子共线）。 */
   function styleFactors(bt, rf = 0.02) {
     const b = bt.bars();
     const syms = bt.symbols;
     const n = bt.dates.length;
     const rfd = rf / TD;
     const ret = syms.map((s) => b.close[s].map((c, i) => (i ? c / b.close[s][i - 1] - 1 : NaN)));
-    const mom = syms.map((s) => ind.roc(b.close[s], 60));
-    const vol = syms.map((_, k) => ind.stdev(Float64Array.from(ret[k], (v) => (fin(v) ? v : NaN)), 20, 1));
-    const MKT = new Float64Array(n).fill(NaN), MOM = new Float64Array(n).fill(NaN), LOWVOL = new Float64Array(n).fill(NaN);
+    const avail = new Set(availableFactors(b, syms).map((f) => f.id));
+    const defs = STYLE_DEFS.filter((d) => avail.has(d.factor));
+    const vals = defs.map((d) => syms.map((s) => facValues(b, s, d.factor)));
+    const out = { MKT: new Float64Array(n).fill(NaN), order: defs.map((d) => d.id), labels: { MKT: '市场（等权）' } };
+    defs.forEach((d) => { out[d.id] = new Float64Array(n).fill(NaN); out.labels[d.id] = d.label; });
+    const groups = syms.map((s) => industryOf(b, s));
+    const hasInd = groups.some(Boolean);
+    const indSum = new Map(), indCnt = new Map(), indDays = new Map();
+    const indRet = hasInd ? new Map() : null;
     const spread = (keys, i, sign) => {
       if (keys.length < 6) return NaN;
       keys.sort((p, q) => p[1] - q[1]);
@@ -641,54 +662,101 @@
     };
     for (let i = 1; i < n; i++) {
       let sum = 0, cnt = 0;
-      const km = [], kv = [];
+      const keys = defs.map(() => []);
+      indSum.clear(); indCnt.clear();
       syms.forEach((s, k) => {
         const r = ret[k][i];
         if (!fin(r) || (b.member && !b.member[s][i - 1])) return;
         sum += r; cnt++;
-        if (fin(mom[k][i - 1])) km.push([k, mom[k][i - 1]]);
-        if (fin(vol[k][i - 1])) kv.push([k, vol[k][i - 1]]);
+        defs.forEach((d, j) => { const v = vals[j][k][i - 1]; if (fin(v)) keys[j].push([k, v]); });
+        if (hasInd && groups[k]) {
+          indSum.set(groups[k], (indSum.get(groups[k]) || 0) + r);
+          indCnt.set(groups[k], (indCnt.get(groups[k]) || 0) + 1);
+        }
       });
       if (!cnt) continue;
-      MKT[i] = sum / cnt - rfd;
-      MOM[i] = spread(km, i, 1);
-      LOWVOL[i] = spread(kv, i, -1);
+      const mkt = sum / cnt;
+      out.MKT[i] = mkt - rfd;
+      defs.forEach((d, j) => (out[d.id][i] = spread(keys[j], i, d.sign)));
+      if (hasInd) {
+        for (const [g, c] of indCnt) {
+          if (!indRet.has(g)) indRet.set(g, new Float64Array(n).fill(NaN));
+          indRet.get(g)[i] = indSum.get(g) / c - mkt;
+          indDays.set(g, (indDays.get(g) || 0) + c);
+        }
+      }
     }
-    return { MKT, MOM, LOWVOL };
+    if (hasInd) {
+      const days = n - 1;
+      const keep = [...indDays].filter(([, c]) => c / days >= 3).sort((p, q) => q[1] - p[1]);
+      out.industries = Object.fromEntries(keep.slice(1).map(([g]) => [g, indRet.get(g)]));
+      out.baseIndustry = keep.length ? keep[0][0] : null;
+    }
+    return out;
   }
 
-  const STYLE_LABELS = { MKT: '市场（等权）', MOM: '动量', LOWVOL: '低波动' };
-
   /* 暴露回归：策略日超额收益 = α + Σ β·因子 + ε，区间 (a, b]。
-   * 某个因子在区间内缺失超过一半就不纳入。α 为年化，t 值用 HAC 标准误。 */
-  function exposure(eq, sf, a, b, rf = 0.02) {
+   * industry 为真时再加入行业因子（行业等权 − 全体等权）。区间内缺失超过一半的因子不纳入。α 为年化，t 值用 HAC 标准误。 */
+  function exposure(eq, sf, a, b, rf = 0.02, { industry = false } = {}) {
     const rfd = rf / TD;
-    const names = ['MKT', 'MOM', 'LOWVOL'].filter((k) => {
+    const okCol = (arr) => {
       let ok = 0;
-      for (let i = a + 1; i <= b; i++) if (fin(sf[k][i])) ok++;
+      for (let i = a + 1; i <= b; i++) if (fin(arr[i])) ok++;
       return ok >= (b - a) / 2 && ok >= 60;
-    });
-    if (!names.includes('MKT')) return null;
+    };
+    if (!okCol(sf.MKT)) return null;
+    const cols = [{ id: 'MKT', label: sf.labels.MKT, arr: sf.MKT, kind: 'style' }];
+    const order = sf.order || ['MOM', 'LOWVOL'];
+    for (const id of order) if (sf[id] && okCol(sf[id])) cols.push({ id, label: sf.labels ? sf.labels[id] : id, arr: sf[id], kind: 'style' });
+    if (industry && sf.industries) {
+      for (const [g, arr] of Object.entries(sf.industries)) if (okCol(arr)) cols.push({ id: 'IND:' + g, label: g, arr, kind: 'industry' });
+    }
     const y = [], X = [];
     for (let i = a + 1; i <= b; i++) {
       const r = eq[i] / eq[i - 1] - 1;
-      const row = names.map((k) => sf[k][i]);
+      const row = cols.map((c) => c.arr[i]);
       if (!fin(r) || !row.every(fin)) continue;
       y.push(r - rfd);
       X.push(row);
     }
-    if (y.length < 60) return null;
+    if (y.length < Math.max(60, 4 * cols.length)) return null;
     const fit = olsHAC(y, X);
     if (!fit) return null;
     return {
       alpha: fit.coef[0] * TD,
       alphaT: fit.t[0],
-      loadings: names.map((k, j) => ({ id: k, label: STYLE_LABELS[k], beta: fit.coef[j + 1], t: fit.t[j + 1] })),
+      loadings: cols.map((c, j) => ({ id: c.id, label: c.label, kind: c.kind, beta: fit.coef[j + 1], t: fit.t[j + 1] })),
       r2: fit.r2,
       n: fit.n,
       lag: fit.lag,
-      missing: ['MOM', 'LOWVOL'].filter((k) => !names.includes(k)),
+      missing: STYLE_DEFS.map((d) => d.id).filter((id) => !cols.some((c) => c.id === id)),
+      baseIndustry: industry ? sf.baseIndustry : null,
     };
+  }
+
+  /* 截面中性化：先把因子值转成截面秩分（−0.5 ~ 0.5），'industry' 再减去所在行业均值（行业内只有 1 只时为 0），
+   * 'industry_size' 再对行业内去均值后的对数流通市值回归取残差（Frisch–Waugh），缺市值的保留行业中性化结果。
+   * xs 与 syms 一一对应（已剔除缺失值），t 为日期序号。 */
+  function neutralize(xs, syms, mode, b, t) {
+    const n = xs.length;
+    const r = ranks(xs).map((v) => (v - 0.5) / n - 0.5);
+    if (!mode || mode === 'none' || n < 3) return r;
+    const g = syms.map((s) => industryOf(b, s) || '—');
+    const demean = (v, use) => {
+      const sum = new Map(), cnt = new Map();
+      v.forEach((x, k) => { if (use[k]) { sum.set(g[k], (sum.get(g[k]) || 0) + x); cnt.set(g[k], (cnt.get(g[k]) || 0) + 1); } });
+      return v.map((x, k) => (use[k] ? x - sum.get(g[k]) / cnt.get(g[k]) : 0));
+    };
+    const all = r.map(() => true);
+    const xd = demean(r, all);
+    if (mode !== 'industry_size') return xd;
+    const z = syms.map((s) => { const c = floatCap(b, s)[t]; return c > 0 ? Math.log(c) : NaN; });
+    const use = z.map(fin);
+    const zd = demean(z.map((v) => (fin(v) ? v : 0)), use);
+    let sxz = 0, szz = 0;
+    for (let k = 0; k < n; k++) if (use[k]) { sxz += xd[k] * zd[k]; szz += zd[k] * zd[k]; }
+    const beta = szz > 0 ? sxz / szz : 0;
+    return xd.map((x, k) => (use[k] ? x - beta * zd[k] : x));
   }
 
   // ---------- 因子研究 ----------
@@ -699,45 +767,86 @@
     return b.cache.get(k);
   }
 
-  // 滚动 12 个月每股收益：年报即全年；其余 = 本期累计 + 上年年报 − 上年同期累计（只用当时已公告的数据）
-  function epsTTM(r, known) {
+  /* 滚动 12 个月值（年初至今累计口径）：年报即全年；其余 = 本期累计 + 上年年报 − 上年同期累计，只用当时已公告的报告。 */
+  function ttm(r, known, key) {
     const md = r.report.slice(5);
-    if (md === '12-31') return r.eps;
+    if (md === '12-31') return fin(r[key]) ? r[key] : NaN;
     const y = +r.report.slice(0, 4);
     const annual = known.get(`${y - 1}-12-31`), same = known.get(`${y - 1}-${md}`);
-    return annual && same && fin(annual.eps) && fin(same.eps) && fin(r.eps) ? r.eps + annual.eps - same.eps : NaN;
+    return annual && same && fin(annual[key]) && fin(same[key]) && fin(r[key]) ? r[key] + annual[key] - same[key] : NaN;
+  }
+
+  // 股本在某天（含）之前最近一次变动后的值
+  function sharesAt(list, date, key) {
+    let v = NaN;
+    for (const x of list) { if (x.date > date) break; v = x[key]; }
+    return v;
+  }
+
+  /* 股本（总股本、流通 A 股）按变动日对齐的逐日序列，来自 meta.shares（股本变动历史）。 */
+  function sharesPanel(b, s) {
+    return cachedPanel(b, s, 'shares', () => {
+      const n = b.dates.length;
+      const total = new Float64Array(n).fill(NaN), float = new Float64Array(n).fill(NaN);
+      const list = (((b.meta || {}).shares || {})[s]) || [];
+      let j = -1;
+      for (let i = 0; i < n; i++) {
+        while (j + 1 < list.length && list[j + 1].date <= b.dates[i]) j++;
+        if (j >= 0) { total[i] = list[j].total; float[i] = list[j].float; }
+      }
+      return { total, float, has: list.length > 0 };
+    });
   }
 
   /* 财务数据按公告日对齐：公告日之后的第一个交易日起才可用（公告可能在盘后发布）。
-   * 同一时点取报告期最新的一期；更正公告按数据源的最新值计，存在轻微前视。 */
+   * meta.fundAvail === 'update' 时改用最后更新日（保守口径：数据源会在次年用追溯调整后的数值覆盖，更新日之前看不到这个数）。
+   * 估值用归母净利润总额与总股本计算：数据源的每股收益会按之后的送转追溯调整，直接用会低估当时的 E/P。 */
   function fundPanel(b, s) {
     return cachedPanel(b, s, 'fund', () => {
       const dates = b.dates, n = dates.length;
-      const recs = (((b.meta || {}).fundamentals || {})[s] || [])
+      const meta = b.meta || {};
+      const useUpdate = meta.fundAvail === 'update';
+      const avail = (r) => (useUpdate && r.update > r.notice ? r.update : r.notice);
+      const recs = ((meta.fundamentals || {})[s] || [])
         .filter((r) => r.notice && r.report)
-        .slice()
-        .sort((x, y) => (x.notice < y.notice ? -1 : x.notice > y.notice ? 1 : x.report < y.report ? -1 : 1));
+        .map((r) => ({ ...r, avail: avail(r) }))
+        .sort((x, y) => (x.avail < y.avail ? -1 : x.avail > y.avail ? 1 : x.report < y.report ? -1 : 1));
+      const shares = (meta.shares || {})[s] || [];
       const col = () => new Float32Array(n).fill(NaN); // 财务指标单精度足够，省内存
-      const out = { epsTTM: col(), bps: col(), roe: col(), revYoy: col(), profitYoy: col() };
+      const out = { profitTTM: col(), epsTTM: col(), bps: col(), equity: col(), revYoy: col(), profitYoy: col() };
       const known = new Map();
-      let latest = null, j = 0, ttm = NaN;
+      let latest = null, j = 0, cur = null;
       for (let i = 0; i < n; i++) {
         let changed = false;
-        while (j < recs.length && recs[j].notice < dates[i]) {
+        while (j < recs.length && recs[j].avail < dates[i]) {
           const r = recs[j++];
           known.set(r.report, r);
           if (!latest || r.report >= latest.report) latest = r;
           changed = true;
         }
         if (!latest) continue;
-        if (changed) ttm = epsTTM(latest, known);
-        out.epsTTM[i] = ttm;
-        out.bps[i] = latest.bps > 0 ? latest.bps : NaN;
-        out.roe[i] = latest.bps > 0 ? ttm / latest.bps : NaN;
-        out.revYoy[i] = fin(latest.revYoy) ? latest.revYoy : NaN;
-        out.profitYoy[i] = fin(latest.profitYoy) ? latest.profitYoy : NaN;
+        if (changed) {
+          const bps = latest.bps > 0 ? latest.bps : NaN;
+          cur = {
+            profitTTM: ttm(latest, known, 'profit'),
+            epsTTM: ttm(latest, known, 'eps'),
+            bps,
+            equity: bps * sharesAt(shares, latest.report, 'total'), // 报告期末归母净资产
+            revYoy: fin(latest.revYoy) ? latest.revYoy : NaN,
+            profitYoy: fin(latest.profitYoy) ? latest.profitYoy : NaN,
+          };
+        }
+        for (const k in cur) out[k][i] = cur[k];
       }
       return out;
+    });
+  }
+
+  // 总市值 = 不复权价 × 当时总股本
+  function marketCap(b, s) {
+    return cachedPanel(b, s, 'mktcap', () => {
+      const px = b.raw[s], sh = sharesPanel(b, s).total;
+      return Float64Array.from(b.dates, (_, i) => (px && px[i] > 0 && sh[i] > 0 ? px[i] * sh[i] : NaN));
     });
   }
 
@@ -746,6 +855,12 @@
     return cachedPanel(b, s, 'floatcap', () => {
       const n = b.dates.length;
       const out = new Float64Array(n).fill(NaN);
+      // 有股本变动历史时直接用流通 A 股 × 不复权价（时点数据）；否则用换手率反推
+      const sp = sharesPanel(b, s);
+      if (sp.has && b.raw[s]) {
+        for (let i = 0; i < n; i++) out[i] = b.raw[s][i] > 0 && sp.float[i] > 0 ? b.raw[s][i] * sp.float[i] : NaN;
+        return out;
+      }
       const px = b.raw[s], tv = b.turnover[s], vol = b.volume[s];
       if (!px || !tv) return out;
       let sv = 0, st = 0, cnt = 0;
@@ -803,9 +918,22 @@
       },
     },
     // 以下需要个股数据：财务数据（按公告日对齐）、不复权价与换手率
-    { id: 'ep', label: '盈利收益率 E/P（TTM）', needsFund: true, f: (b, s) => byPrice(b, s, fundPanel(b, s).epsTTM) },
+    {
+      id: 'ep', label: '盈利收益率 E/P（TTM）', needsFund: true,
+      f: (b, s) => {
+        const F = fundPanel(b, s), cap = marketCap(b, s);
+        // 优先：滚动归母净利润 / 总市值；缺股本数据时退回每股收益 / 股价（每股收益可能被追溯调整）
+        return Float64Array.from(b.dates, (_, i) => (cap[i] > 0 ? F.profitTTM[i] / cap[i] : b.raw[s] && b.raw[s][i] > 0 ? F.epsTTM[i] / b.raw[s][i] : NaN));
+      },
+    },
     { id: 'bp', label: '账面市值比 B/P', needsFund: true, f: (b, s) => byPrice(b, s, fundPanel(b, s).bps) },
-    { id: 'roe', label: 'ROE（TTM）', needsFund: true, f: (b, s) => fundPanel(b, s).roe },
+    {
+      id: 'roe', label: 'ROE（TTM）', needsFund: true,
+      f: (b, s) => {
+        const F = fundPanel(b, s);
+        return Float64Array.from(b.dates, (_, i) => (F.equity[i] > 0 ? F.profitTTM[i] / F.equity[i] : F.bps[i] > 0 ? F.epsTTM[i] / F.bps[i] : NaN));
+      },
+    },
     { id: 'profit_g', label: '净利润同比增速', needsFund: true, f: (b, s) => fundPanel(b, s).profitYoy },
     { id: 'rev_g', label: '营业收入同比增速', needsFund: true, f: (b, s) => fundPanel(b, s).revYoy },
     { id: 'size', label: '流通市值（对数）', needsCap: true, f: (b, s) => floatCap(b, s).map((v) => (v > 0 ? Math.log(v) : NaN)) },
@@ -817,13 +945,14 @@
    * 买入综合分最高的 topN 只。权重为负表示因子值越小越好（如反转、低波动）。
    * trendN > 0 时加大盘趋势过滤：全部标的等权指数跌破其 trendN 日均线就空仓。 */
   class FactorStrategy {
-    constructor({ factors = [], topN = 2, rebalance = 20, trendN = 0, sizing = 'equal' } = {}) {
+    constructor({ factors = [], topN = 2, rebalance = 20, trendN = 0, sizing = 'equal', neutral = 'none' } = {}) {
       const unknown = factors.find((f) => !FACTOR_BY_ID[f.id]);
       if (unknown) throw new Error('未知因子：' + unknown.id);
       this.factors = factors.map((f) => ({ id: f.id, weight: +f.weight || 0 })).filter((f) => f.weight !== 0);
       if (!this.factors.length) throw new Error('至少选一个权重不为 0 的因子');
       if (!(topN >= 1 && rebalance >= 1 && trendN >= 0)) throw new Error('持有数量、调仓间隔至少为 1，趋势均线不能为负');
-      Object.assign(this, { name: 'factor', topN: Math.floor(topN), rebalance: Math.floor(rebalance), trendN: Math.floor(trendN), sizing });
+      Object.assign(this, { name: 'factor', topN: Math.floor(topN), rebalance: Math.floor(rebalance), trendN: Math.floor(trendN), sizing,
+        neutral: ['industry', 'industry_size'].includes(neutral) ? neutral : 'none' });
     }
 
     params() {
@@ -878,8 +1007,9 @@
         }
         const score = new Array(N).fill(0);
         this.factors.forEach((f, j) => {
-          const r = ranks(eligible.map((k) => vals[j][k][i]));
-          eligible.forEach((k, e) => (score[k] += f.weight * ((r[e] - 0.5) / eligible.length - 0.5)));
+          // 截面秩分（−0.5 ~ 0.5），可选行业 / 行业 + 市值中性化
+          const z = neutralize(eligible.map((k) => vals[j][k][i]), eligible.map((k) => symbols[k]), this.neutral, bars, i);
+          eligible.forEach((k, e) => (score[k] += f.weight * z[e]));
         });
         const picked = eligible.slice().sort((a, b2) => score[b2] - score[a]).slice(0, this.topN);
         const row = new Array(N).fill(0);
@@ -934,7 +1064,8 @@
     const hasVolume = symbols.every((s) => b.volume[s].some(fin));
     const hasFund = !!(b.meta && b.meta.fundamentals) && symbols.some((s) => (b.meta.fundamentals[s] || []).length);
     const hasRaw = symbols.some((s) => b.raw[s]);
-    const hasCap = symbols.some((s) => b.raw[s] && b.turnover[s]);
+    const shares = (b.meta && b.meta.shares) || {};
+    const hasCap = symbols.some((s) => b.raw[s] && (b.turnover[s] || (shares[s] && shares[s].length)));
     return FACTORS.filter((f) => (!f.needsVolume || hasVolume) && (!f.needsFund || (hasFund && hasRaw)) && (!f.needsCap || hasCap));
   }
 
@@ -1011,7 +1142,8 @@
    *   因此高度相关或重复的标的不会虚增显著性（9 只一样的标的与 1 只结果相同）。
    * 截面 IC：每个抽样日在标的之间做秩相关（至少 3 只），对这条日度序列做块自助法。
    * 以 95% 置信区间是否跨过 0 判断显著。 */
-  function factorIC(bt, h, { B = 200, seed = 7 } = {}) {
+  function factorIC(bt, h, { B = 200, seed = 7, neutral = 'none' } = {}) {
+    const b = bt.bars();
     const { factors, fwd, vals } = factorPanel(bt, h);
     const syms = bt.symbols;
     const ts = [];
@@ -1044,13 +1176,13 @@
       const cs = [];
       if (syms.length >= 3) {
         for (const t of ts) {
-          const x = [], y = [];
+          const x = [], y = [], ss = [];
           for (const s of syms) {
             const v = vals[s][f.id][t], r = fwd[s][t];
-            if (fin(v) && fin(r)) { x.push(v); y.push(r); }
+            if (fin(v) && fin(r)) { x.push(v); y.push(r); ss.push(s); }
           }
           if (x.length >= 3) {
-            const ic = spearman(x, y);
+            const ic = spearman(neutral === 'none' ? x : neutralize(x, ss, neutral, b, t), y);
             if (fin(ic)) cs.push(ic);
           }
         }
@@ -1099,7 +1231,8 @@
    * t+1 日开盘买入、持有 h 日后开盘卖出；每次调仓按权重变化扣成本（cost 为单边费率，含佣金、印花税、滑点）。
    * 多空 = 最高组 - 最低组（A 股融券受限，仅作因子强弱的参考）。
    * 组数按标的数量：≥10 只分 5 组，6~9 只分 3 组，更少不分组。 */
-  function factorPortfolios(bt, factorId, h, { q, cost = 0.0015 } = {}) {
+  function factorPortfolios(bt, factorId, h, { q, cost = 0.0015, neutral = 'none' } = {}) {
+    const b = bt.bars();
     const syms = bt.symbols;
     const N = syms.length;
     q = q || (N >= 10 ? 5 : N >= 6 ? 3 : 0);
@@ -1111,7 +1244,9 @@
     for (let t = WARM; t < bt.dates.length; t += h) {
       const elig = syms.filter((s) => fin(vals[s][factorId][t]) && fin(fwd[s][t]));
       if (elig.length < q) continue;
-      elig.sort((a, b) => vals[a][factorId][t] - vals[b][factorId][t]);
+      const z = neutralize(elig.map((s) => vals[s][factorId][t]), elig, neutral, b, t);
+      const zs = new Map(elig.map((s, k) => [s, z[k]]));
+      elig.sort((p, q2) => zs.get(p) - zs.get(q2));
       const m = elig.length;
       groups.forEach((g, k) => {
         const members = elig.slice(Math.floor((k * m) / q), Math.floor(((k + 1) * m) / q));
@@ -1144,6 +1279,54 @@
     };
   }
 
+  /* 因子相关性：每个抽样日在标的之间计算两两秩相关，再对日期取平均（至少 10 只标的的日子才计入）。 */
+  function factorCorrelation(bt, h, ids) {
+    const b = bt.bars();
+    const syms = bt.symbols;
+    const factors = availableFactors(b, syms).filter((f) => !ids || ids.includes(f.id));
+    const ts = [];
+    for (let t = WARM; t < bt.dates.length; t += h) ts.push(t);
+    const T = ts.length, N = syms.length, F = factors.length;
+    // 只保留抽样日的值（F × T × N 单精度），不同时持有各因子的完整逐日序列
+    const V = factors.map((f) => {
+      const m = new Float32Array(T * N).fill(NaN);
+      syms.forEach((s, k) => {
+        const v = f.f(b, s);
+        const mem = b.member ? b.member[s] : null;
+        ts.forEach((t, j) => { if (!mem || mem[t]) m[j * N + k] = v[t]; });
+      });
+      return m;
+    });
+    const sum = Array.from({ length: F }, () => new Float64Array(F)), cnt = Array.from({ length: F }, () => new Float64Array(F));
+    for (let j = 0; j < T; j++) {
+      const rk = V.map((m) => {
+        const idx = [], x = [];
+        for (let k = 0; k < N; k++) { const v = m[j * N + k]; if (fin(v)) { idx.push(k); x.push(v); } }
+        if (x.length < 10) return null;
+        const r = new Float64Array(N).fill(NaN);
+        ranks(x).forEach((v, i) => (r[idx[i]] = v));
+        return r;
+      });
+      for (let p = 0; p < F; p++) {
+        if (!rk[p]) continue;
+        for (let q = p + 1; q < F; q++) {
+          if (!rk[q]) continue;
+          const xs = [], ys = [];
+          for (let k = 0; k < N; k++) if (rk[p][k] === rk[p][k] && rk[q][k] === rk[q][k]) { xs.push(rk[p][k]); ys.push(rk[q][k]); }
+          if (xs.length < 10) continue;
+          const c = pearson(xs, ys);
+          if (fin(c)) { sum[p][q] += c; cnt[p][q]++; }
+        }
+      }
+    }
+    const m = factors.map((_, p) => factors.map((__, q) => {
+      if (p === q) return 1;
+      const [a2, b2] = p < q ? [p, q] : [q, p];
+      return cnt[a2][b2] ? sum[a2][b2] / cnt[a2][b2] : NaN;
+    }));
+    return { ids: factors.map((f) => f.id), labels: factors.map((f) => f.label), matrix: m };
+  }
+
   function seriesStats(bt, symbol) {
     const r = returnsOf(bt.bars().close[symbol].filter(fin));
     const m = moments(r);
@@ -1164,8 +1347,8 @@
   const api = {
     moments, normCdf, normInv, ranks, spearman, acf, varianceRatio, segStats, deflatedSharpe,
     rangeValues, gridSize, gridIter, randomCombos, applyParams, makeBacktester, optimize,
-    relativeStats, roundTrips, monthlyReturns, SwitchingStrategy, olsHAC, styleFactors, exposure,
-    FACTORS, availableFactors, fundPanel, floatCap, FactorStrategy, buildStrategy, factorIC, factorPortfolios, seriesStats, forwardReturns, blockIndices,
+    relativeStats, roundTrips, monthlyReturns, SwitchingStrategy, olsHAC, styleFactors, exposure, neutralize, STYLE_DEFS,
+    FACTORS, availableFactors, factorCorrelation, fundPanel, floatCap, sharesPanel, marketCap, FactorStrategy, buildStrategy, factorIC, factorPortfolios, seriesStats, forwardReturns, blockIndices,
   };
   if (isNode) module.exports = api;
   else AQ.research = api;

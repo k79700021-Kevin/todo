@@ -29,12 +29,40 @@
     return out;
   }
 
-  /* 财务主要指标（含已退市公司）：报告期、首次公告日、基本每股收益（年初至今）、每股净资产、营收与归母净利润同比。 */
+  const secucode = (sym) => `${sym}.${market(sym) === 1 ? 'SH' : /^(4|8|92)/.test(sym) ? 'BJ' : 'SZ'}`;
+  const DC = 'https://datacenter.eastmoney.com/securities/api/data/v1/get?reportName=';
+
+  /* 财务主要指标（含已退市公司）：报告期、首次公告日、最后更新日、归母净利润（年初至今，原始披露值）、
+   * 每股净资产、营收与归母净利润同比。注意：数据源中的每股收益会按之后的送转追溯调整，所以估值用净利润总额计算。 */
   function financeUrl(sym, cb) {
-    const secu = `${sym}.${market(sym) === 1 ? 'SH' : /^(4|8|92)/.test(sym) ? 'BJ' : 'SZ'}`;
-    return 'https://datacenter.eastmoney.com/securities/api/data/v1/get?reportName=RPT_F10_FINANCE_MAINFINADATA' +
-      '&columns=REPORT_DATE,NOTICE_DATE,EPSJB,BPS,TOTALOPERATEREVETZ,PARENTNETPROFITTZ' +
-      `&filter=(SECUCODE%3D%22${secu}%22)&pageSize=300&sortColumns=REPORT_DATE&sortTypes=1` + (cb ? `&callback=${cb}` : '');
+    return DC + 'RPT_F10_FINANCE_MAINFINADATA' +
+      '&columns=REPORT_DATE,NOTICE_DATE,UPDATE_DATE,PARENTNETPROFIT,EPSJB,BPS,TOTALOPERATEREVETZ,PARENTNETPROFITTZ' +
+      `&filter=(SECUCODE%3D%22${secucode(sym)}%22)&pageSize=300&sortColumns=REPORT_DATE&sortTypes=1` + (cb ? `&callback=${cb}` : '');
+  }
+
+  // 股本变动历史：变动日（除权日/上市日）、总股本、流通 A 股
+  function sharesUrl(sym, cb) {
+    return DC + 'RPT_F10_EH_EQUITY&columns=END_DATE,NOTICE_DATE,TOTAL_SHARES,LISTED_A_SHARES' +
+      `&filter=(SECUCODE%3D%22${secucode(sym)}%22)&pageSize=500&sortColumns=END_DATE&sortTypes=1` + (cb ? `&callback=${cb}` : '');
+  }
+
+  function parseShares(json) {
+    const rows = (json && json.result && json.result.data) || [];
+    return rows
+      .filter((r) => r.END_DATE && r.TOTAL_SHARES > 0)
+      .map((r) => {
+        const end = r.END_DATE.slice(0, 10), notice = (r.NOTICE_DATE || r.END_DATE).slice(0, 10);
+        // 公告晚于变动日时（如定期报告披露的期末股本）以公告日为准，避免前视
+        return { date: notice > end ? notice : end, total: +r.TOTAL_SHARES, float: +r.LISTED_A_SHARES || NaN };
+      })
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  }
+
+  // 指数日线（沪深300 为 1.000300，价格指数，不含分红）
+  function indexKlineUrl(code, start, end, cb) {
+    return `https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=${/^(000|880)/.test(code) ? 1 : 0}.${code}` +
+      `&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=0` +
+      `&beg=${start.replace(/-/g, '')}&end=${end.replace(/-/g, '')}` + (cb ? `&cb=${cb}` : '');
   }
 
   function parseFinance(json) {
@@ -44,7 +72,9 @@
       .filter((r) => r.REPORT_DATE && r.NOTICE_DATE)
       .map((r) => ({
         report: r.REPORT_DATE.slice(0, 10), notice: r.NOTICE_DATE.slice(0, 10),
-        eps: num(r.EPSJB), bps: num(r.BPS), revYoy: num(r.TOTALOPERATEREVETZ), profitYoy: num(r.PARENTNETPROFITTZ),
+        update: (r.UPDATE_DATE || r.NOTICE_DATE).slice(0, 10),
+        profit: num(r.PARENTNETPROFIT), eps: num(r.EPSJB), bps: num(r.BPS),
+        revYoy: num(r.TOTALOPERATEREVETZ), profitYoy: num(r.PARENTNETPROFITTZ),
       }));
   }
 
@@ -81,7 +111,7 @@
     return d;
   }
 
-  const api = { market, klineUrl, parseKlines, proportional, checkPositive, financeUrl, parseFinance };
+  const api = { market, klineUrl, parseKlines, proportional, checkPositive, financeUrl, parseFinance, sharesUrl, parseShares, indexKlineUrl };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else (root.AQ = root.AQ || {}).em = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

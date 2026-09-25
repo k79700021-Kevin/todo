@@ -74,7 +74,7 @@
    *   delisted: { symbol: 退市日 }：此后仍持有的股份按最后价格 × delistRecovery 注销
    *   fundamentals: { symbol: [{ report, notice, eps, bps, revYoy, profitYoy }] }：财务数据，公告日之后才可用 */
   class Backtester {
-    constructor(data, { initialCash = 1e6, fees = new FeeModel(), slippage = 0.0005, rebalanceBand = 0.01, meta = null, delistRecovery = 0 } = {}) {
+    constructor(data, { initialCash = 1e6, fees = new FeeModel(), slippage = 0.0005, rebalanceBand = 0.01, meta = null, delistRecovery = 0, participation = 0, impact = 0 } = {}) {
       const symbols = Object.keys(data).sort();
       if (!symbols.length) throw new Error('没有行情数据');
       const dateSet = new Set();
@@ -116,6 +116,13 @@
       Object.assign(this, { symbols, dates, open, close, high, low, volume, tradable, prevClose, raw, turnover, initialCash, fees, slippage, rebalanceBand });
       this.meta = meta || {};
       this.delistRecovery = delistRecovery;
+      /* 成交容量与冲击成本（0 = 不启用）：
+       *   participation：单只标的单日成交额不超过前 20 日平均成交额的这个比例，超出部分次日继续；
+       *   impact：平方根冲击系数，额外滑点 = impact × 前 20 日日波动率 × √(成交额 / 前 20 日平均成交额)。
+       * 成交额 = 成交量（手）× 100 × 不复权收盘价（没有不复权价时用收盘价），只用前一日及以前的数据。 */
+      this.participation = participation;
+      this.impact = impact;
+      if (participation > 0 || impact > 0) this.liquidity(data);
       // 时点股票池：member[s][i] = 1 表示第 i 天收盘时是成分股
       this.member = null;
       if (this.meta.universe) {
@@ -135,6 +142,55 @@
         const i = dates.findIndex((x) => x > d);
         if (i >= 0) this.delistAt[s] = i;
       }
+    }
+
+    liquidity(data) {
+      const n = this.dates.length;
+      this.adv = {};
+      this.sigma = {};
+      this.hasVolume = {};
+      for (const s of this.symbols) {
+        const v = this.volume[s], c = this.close[s], px = this.raw[s] || c;
+        const adv = new Float64Array(n).fill(NaN), sig = new Float64Array(n).fill(NaN);
+        const amt = [], ret = [];
+        let prev = NaN;
+        for (let i = 0; i < n; i++) {
+          // 先用前 20 日的数据给出第 i 天的值，再把第 i 天加入窗口
+          const a = amt.filter(Number.isFinite);
+          if (a.length >= 10) adv[i] = a.reduce((x, y) => x + y, 0) / a.length;
+          const r = ret.filter(Number.isFinite);
+          if (r.length >= 10) {
+            const m = r.reduce((x, y) => x + y, 0) / r.length;
+            sig[i] = Math.sqrt(r.reduce((x, y) => x + (y - m) ** 2, 0) / (r.length - 1));
+          }
+          amt.push(v[i] > 0 && px[i] > 0 ? v[i] * 100 * px[i] : NaN);
+          ret.push(c[i] > 0 && prev > 0 ? c[i] / prev - 1 : NaN);
+          if (c[i] > 0) prev = c[i];
+          if (amt.length > 20) amt.shift();
+          if (ret.length > 20) ret.shift();
+        }
+        this.adv[s] = adv;
+        this.hasVolume[s] = v.some((x) => x > 0);
+        this.sigma[s] = sig;
+      }
+    }
+
+    // 按容量限制截断的股数与冲击滑点
+    capacity(s, i, qty, price) {
+      const adv = this.adv ? this.adv[s][i] : NaN;
+      if (!(adv > 0)) {
+        // 有成交量数据但历史不足 10 天（刚开始或刚上市）：设了参与率上限时先不成交，等积累历史；完全没有成交量数据的不限制
+        if (this.participation > 0 && this.hasVolume[s]) return { qty: 0, slip: this.slippage, capped: true };
+        return { qty, slip: this.slippage, capped: false };
+      }
+      let q = qty, capped = false;
+      if (this.participation > 0) {
+        const max = Math.floor((this.participation * adv) / price / LOT_SIZE) * LOT_SIZE;
+        if (q > max) { q = max; capped = true; }
+      }
+      const sig = this.sigma[s][i];
+      const extra = this.impact > 0 && sig > 0 ? this.impact * sig * Math.sqrt((q * price) / adv) : 0;
+      return { qty: q, slip: this.slippage + extra, capped };
     }
 
     closeFfill() {
@@ -256,22 +312,28 @@
         else if (delta > 0) buys.push([s, delta, price, w]);
       }
 
-      for (const [s, qty, price, w] of sells) {
+      for (const [s, want, price, w] of sells) {
         if (isLimitDown(s, d, price, this.prevClose[s][i])) { unfilled.set(s, w); continue; }
-        const fill = price * (1 - this.slippage);
+        const cap = this.capacity(s, i, want, price);
+        if (cap.capped) unfilled.set(s, w);
+        const qty = cap.qty;
+        if (qty <= 0) continue;
+        const fill = price * (1 - cap.slip);
         const amount = qty * fill;
         const fee = this.fees.cost(s, d, 'sell', amount);
         cash += amount - fee;
         shares[s] -= qty;
-        trades.push({ date: d, symbol: s, side: 'sell', shares: qty, price: fill, amount, fee });
+        trades.push({ date: d, symbol: s, side: 'sell', shares: qty, price: fill, amount, fee, impact: qty * price * (cap.slip - this.slippage) });
         if (book && shares[s] === 0) book[s] = { cost: NaN, entry: -1, exit: i };
       }
 
       buys.sort((a, b) => b[1] * b[2] - a[1] * a[2]);
-      for (const [s, want, price, w] of buys) {
+      for (const [s, want0, price, w] of buys) {
         if (isLimitUp(s, d, price, this.prevClose[s][i])) { unfilled.set(s, w); continue; }
-        const fill = price * (1 + this.slippage);
-        const qty = this.affordable(s, d, want, fill, cash);
+        const cap = this.capacity(s, i, want0, price);
+        if (cap.capped) unfilled.set(s, w);
+        const fill = price * (1 + cap.slip);
+        const qty = this.affordable(s, d, cap.qty, fill, cash);
         if (qty <= 0) continue;
         const amount = qty * fill;
         const fee = this.fees.cost(s, d, 'buy', amount);
@@ -283,7 +345,7 @@
           if (shares[s] === 0) bk.entry = i;
         }
         shares[s] += qty;
-        trades.push({ date: d, symbol: s, side: 'buy', shares: qty, price: fill, amount, fee });
+        trades.push({ date: d, symbol: s, side: 'buy', shares: qty, price: fill, amount, fee, impact: qty * price * (cap.slip - this.slippage) });
       }
       return [cash, unfilled.size ? unfilled : null];
     }
@@ -439,6 +501,7 @@
       final_equity: result.equity[result.equity.length - 1],
       trades: result.trades.length,
       total_fees: result.trades.reduce((a, t) => a + t.fee, 0),
+      total_impact: result.trades.reduce((a, t) => a + (t.impact || 0), 0),
       annual_turnover: result.trades.length ? traded / meanEquity / years : 0,
     });
   }
