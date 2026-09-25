@@ -147,6 +147,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
 .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .row > label { flex: 1 1 140px; }
 .heat { display: grid; gap: 2px; font: 11px var(--mono); }
+table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
 .heat .cell { padding: 6px 2px; text-align: center; border-radius: 3px; font-variant-numeric: tabular-nums; }
 .heat .hd { color: var(--muted); text-align: center; padding: 4px 2px; }
 .chips-row { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -228,6 +229,9 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
           <p class="note">沪深300 <strong>历史成分</strong>（时点股票池）：每只股票只在它是成分股的时段内可买，被调出后卖出，基准为当期成分等权。成分由中证指数公司历次调整公告重建（含已退市公司），行情与财务数据从东方财富获取，财务数据按公告日对齐。</p>
           <label for="poolStart">起始年份
             <select id="poolStart"><option value="2018">2018 年至今（约 560 只）</option><option value="2015">2015 年至今（约 670 只）</option><option value="2010">2010 年至今（约 800 只）</option></select>
+          </label>
+          <label for="fundAvail">财报可用日
+            <select id="fundAvail"><option value="notice">首次公告日的下一个交易日</option><option value="update">最后更新日（保守：排除事后追溯调整）</option></select>
           </label>
           <div class="row">
             <button type="button" class="btn btn-secondary" id="poolFetch">获取 / 更新</button>
@@ -313,8 +317,11 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
           <label for="slippage">滑点（千分之）<input type="number" id="slippage" value="0.5" min="0" step="0.1"></label>
           <label for="band">调仓容差（%）<input type="number" id="band" value="1" min="0" step="0.5"></label>
           <label for="rf">无风险利率（%）<input type="number" id="rf" value="2" min="0" step="0.1"></label>
-          <label for="delistRecovery">退市回收比例（%）<input type="number" id="delistRecovery" value="100" min="0" max="100" step="10"></label>
+          <label for="delistRecovery">退市回收比例（%）<input type="number" id="delistRecovery" value="0" min="0" max="100" step="10"></label>
+          <label for="participation">单日成交上限（% 20日均额）<input type="number" id="participation" value="10" min="0" max="100" step="1"></label>
+          <label for="impactY">冲击系数（0 = 不计）<input type="number" id="impactY" value="0.5" min="0" max="5" step="0.1"></label>
         </div>
+        <p class="note">单日成交上限：每只标的每天的买卖金额不超过前 20 日平均成交额的这个比例，其余次日继续（0 = 不限）。冲击成本按平方根模型：额外滑点 = 系数 × 日波动率 × √(成交额 / 20 日均额)。成交量按"手"计。退市回收：成分期内退市时持仓按最后价格的这个比例收回，默认 0% 为最保守口径，可改成 100% 做对比。</p>
       </details>
 
       <label class="check"><input type="checkbox" id="autoRun" checked>改动后自动重新回测</label>
@@ -336,6 +343,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
           <div class="legend">
             <span><i style="background:var(--accent)"></i>策略净值</span>
             <span><i style="background:var(--bench)"></i><span id="benchLabel">基准（等权买入持有）</span></span>
+            <span id="idxLegend" hidden><i style="background:var(--warn)"></i>沪深300 指数（不含分红）</span>
             <span><i style="background:var(--down)"></i>回撤</span>
           </div>
         </div>
@@ -350,12 +358,14 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
         <div class="card">
           <div class="card-head"><h3>相对基准</h3><span class="note">基准为全部标的等权买入持有</span></div>
           <div class="kpis" id="relKpis"></div>
+          <div id="relIdxWrap" hidden><p class="note" style="margin:8px 0 4px">相对沪深300 官方指数（衡量真实的市场超额；上面的成分等权基准衡量选股能力）：</p><div class="kpis" id="relIdx"></div></div>
           <p class="note">这里的 α 只剔除了对等权基准的 β，没有剔除动量、低波动等风格暴露，见下方暴露归因。信息比率 = 年化超额收益 / 跟踪误差。</p>
         </div>
         <div class="card">
           <div class="card-head"><h3>暴露归因</h3><span class="note" id="expoNote"></span></div>
           <div class="table-wrap"><table id="expoTable"></table></div>
-          <p class="note">策略日超额收益对股票池内的风格因子做回归：市场（等权）、动量（60 日涨幅强 − 弱三分之一）、低波动（20 日波动率低 − 高三分之一），t 值用 Newey–West 标准误。剔除这些暴露后剩下的截距才更接近真正的 α；它仍可能来自这里没覆盖的行业、市值等暴露。</p>
+          <div class="table-wrap"><table id="expoInd"></table></div>
+          <p class="note">策略日超额收益对股票池内的因子模拟组合做回归（每个因子按前一日的值把当期成分分三组，高 − 低，等权）：市场、规模、价值（E/P）、动量、低波动、质量（ROE）、非流动性；个股池另给出加入行业因子（行业等权 − 全体等权）的模型。t 值用 Newey–West 标准误。剔除这些暴露后剩下的截距才更接近真正的 α。行业分类为东方财富一级行业（当前分类，非时点）。</p>
         </div>
         <div class="card">
           <div class="card-head"><h3>按笔统计</h3><span class="note" id="rtNote"></span></div>
@@ -490,6 +500,9 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
             <label for="icH" style="min-width:160px">
               <select id="icH" aria-label="预测周期"><option value="1">预测未来 1 日</option><option value="5" selected>预测未来 5 日</option><option value="20">预测未来 20 日</option></select>
             </label>
+            <label for="icNeutral" style="min-width:160px">
+              <select id="icNeutral" aria-label="截面中性化"><option value="none">截面不中性化</option><option value="industry">行业中性</option><option value="industry_size">行业 + 市值中性</option></select>
+            </label>
           </div>
           <p class="note">IC 是因子值与未来收益（次日开盘买入、持有 N 日）的秩相关，非重叠抽样。时序 IC 看单只标的自身的择时能力（各标的等权平均），截面 IC 看在标的之间挑强弱的能力。区间为 95% 置信区间：按日期整块重抽样（块自助法），所有标的同时重抽，相关或重复的标的不会虚增显著性。点一行看分组组合。</p>
           <div class="table-wrap"><table id="icTable"></table></div>
@@ -501,6 +514,12 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
           <div class="readout" id="qReadout"></div>
           <div class="chart" id="qChart"></div>
           <div class="table-wrap"><table id="qTable"></table></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>因子相关性</h3><span class="note" id="corrMeta"></span></div>
+          <p class="note">每个抽样日在标的之间算两两秩相关，再对日期平均。高度相关的因子（|ρ| &gt; 0.7）合成时等于重复下注，应先合并或二选一。</p>
+          <button type="button" class="btn btn-secondary" id="corrRun">计算</button>
+          <div class="table-wrap"><table id="corrTable" class="corr"></table></div>
         </div>
       </div>
     </main>
@@ -536,7 +555,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     entry: 'all', exit: 'any', sizing: 'fixed',
     stopLoss: 0, takeProfit: 0, trailATR: 0, maxPositions: 0, minHold: 0, maxHold: 0, cooldown: 0,
     momentum: { lookback: 60, topN: 2, rebalance: 20, absFilter: true },
-    factor: { factors: [{ id: 'roc60', weight: 1 }, { id: 'vol20', weight: -1 }], topN: 2, rebalance: 20, trendN: 60, sizing: 'equal' },
+    factor: { factors: [{ id: 'roc60', weight: 1 }, { id: 'vol20', weight: -1 }], topN: 2, rebalance: 20, trendN: 60, sizing: 'equal', neutral: 'none' },
   };
   const FACTOR_PARAMS = {
     topN: { label: '持有几只', def: 2, min: 1, step: 1, range: [1, 4, 1] },
@@ -567,7 +586,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   // ---------- 持久化（失败时静默，页面照常工作） ----------
   function store(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) { /* 存储不可用 */ } }
   function load(key) { try { return JSON.parse(localStorage.getItem(key)); } catch (e) { return null; } }
-  const TX_IDS = ['start', 'end', 'holdout', 'cash', 'commission', 'minCommission', 'slippage', 'band', 'rf', 'delistRecovery'];
+  const TX_IDS = ['start', 'end', 'holdout', 'cash', 'commission', 'minCommission', 'slippage', 'band', 'rf', 'delistRecovery', 'participation', 'impactY', 'fundAvail'];
   function saveSettings() {
     const s = { config: state.config, source: state.source, onSymbols: $('#onSymbols').value, onAdjust: $('#onAdjust').value, autoRun: $('#autoRun').checked, poolStart: $('#poolStart').value };
     TX_IDS.forEach((id) => (s[id] = $('#' + id).value));
@@ -612,7 +631,10 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       `<button type="button" class="linkbtn" data-remove-factor="${i}">移除</button></div>`).join('') || '<p class="note">还没有因子，从下面添加。</p>';
     $('#addFactor').innerHTML = facOpts('');
     $('#factorFields').innerHTML = Object.entries(FACTOR_PARAMS).map(([k, spec]) => paramInput('fs.' + k, spec, f[k])).join('') +
-      `<label for="in_fs_sizing">仓位<select id="in_fs_sizing" data-path="fs.sizing"><option value="equal" ${f.sizing !== 'invvol' ? 'selected' : ''}>等权</option><option value="invvol" ${f.sizing === 'invvol' ? 'selected' : ''}>按波动率倒数</option></select></label>`;
+      `<label for="in_fs_sizing">仓位<select id="in_fs_sizing" data-path="fs.sizing"><option value="equal" ${f.sizing !== 'invvol' ? 'selected' : ''}>等权</option><option value="invvol" ${f.sizing === 'invvol' ? 'selected' : ''}>按波动率倒数</option></select></label>` +
+      `<label for="in_fs_neutral">因子中性化<select id="in_fs_neutral" data-path="fs.neutral">` +
+      [['none', '不中性化'], ['industry', '行业中性（需个股池）'], ['industry_size', '行业 + 市值中性（需个股池）']]
+        .map(([v, t]) => `<option value="${v}" ${(f.neutral || 'none') === v ? 'selected' : ''}>${t}</option>`).join('') + '</select></label>';
     const m = c.momentum;
     $('#momBox').innerHTML =
       paramInput('mom.lookback', { label: '回看天数', min: 5, step: 1 }, m.lookback) +
@@ -654,7 +676,8 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       const f = config.factor;
       const label = (id) => (R.FACTORS.find((x) => x.id === id) || { label: id }).label;
       const parts = f.factors.filter((x) => +x.weight).map((x) => `${label(x.id)}×${x.weight}`);
-      return `多因子：${parts.join(' + ')} · 持有 ${f.topN} 只 · 每 ${f.rebalance} 日调仓${f.trendN ? ` · ${f.trendN} 日趋势过滤` : ''}`;
+      const neu = { industry: ' · 行业中性', industry_size: ' · 行业+市值中性' }[f.neutral] || '';
+      return `多因子：${parts.join(' + ')} · 持有 ${f.topN} 只 · 每 ${f.rebalance} 日调仓${f.trendN ? ` · ${f.trendN} 日趋势过滤` : ''}${neu}`;
     }
     const roleTag = { entry: '[入]', exit: '[出]', both: '' };
     const rules = config.rules.map((r) => `${AQ.RULES[r.id].label}(${Object.values(r.params).join(',')})${roleTag[r.role || 'both']}`);
@@ -747,8 +770,10 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       fees: { commissionRate: (+$('#commission').value || 0) / 10000, minCommission: +$('#minCommission').value || 0 },
       slippage: (+$('#slippage').value || 0) / 1000,
       rebalanceBand: (+$('#band').value || 0) / 100,
-      meta: state.source === 'pool' && state.pool ? state.pool.meta : null,
-      delistRecovery: $('#delistRecovery').value === '' ? 1 : Math.min(Math.max(+$('#delistRecovery').value, 0), 100) / 100,
+      meta: state.source === 'pool' && state.pool ? { ...state.pool.meta, fundAvail: $('#fundAvail').value } : null,
+      delistRecovery: Math.min(Math.max(+$('#delistRecovery').value || 0, 0), 100) / 100,
+      participation: Math.max(+$('#participation').value || 0, 0) / 100,
+      impact: Math.max(+$('#impactY').value || 0, 0),
     };
   }
   const rf = () => (+$('#rf').value || 0) / 100;
@@ -757,7 +782,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   let btMemo = null;
   function sharedBacktester() {
     const eng = engineOpts();
-    const key = JSON.stringify([state.source, state.dataVersion || 0, $('#start').value, $('#end').value, holdoutCap(), { ...eng, meta: !!eng.meta }]);
+    const key = JSON.stringify([state.source, state.dataVersion || 0, $('#start').value, $('#end').value, holdoutCap(), $('#fundAvail').value, { ...eng, meta: !!eng.meta }]);
     if (btMemo && btMemo.key === key) return btMemo.bt;
     btMemo = null;
     const bt = R.makeBacktester(activeData(), eng);
@@ -899,10 +924,15 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       if (!AQ.pool || typeof indexedDB === 'undefined') throw new Error('当前浏览器不支持本地数据库，无法使用股票池');
       const m = await loadMembers();
       const [a, b] = poolRange();
-      state.pool = await AQ.pool.load(m, a, b);
+      if (!state.industry) {
+        try { const r = await fetch('data/hs300_industry.json', { cache: 'no-cache' }); if (r.ok) state.industry = (await r.json()).level1; } catch (e) { /* 没有行业数据时不做行业中性化 */ }
+      }
+      state.pool = await AQ.pool.load(m, a, b, { industry: state.industry });
       const c = state.pool.coverage;
       poolStatus(`成分数据截至 ${m.asOf}（重建自 ${m.events} 次调整）。${a.slice(0, 4)} 年以来曾为成分 ${c.wanted} 只，本地已有 ${c.got} 只` +
-        (c.missing.length ? `，缺 ${c.missing.length} 只：点"获取 / 更新"补齐（已退市且东方财富没有行情的会一直缺）。` : '。'));
+        (c.missing.length ? `，缺 ${c.missing.length} 只：点"获取 / 更新"补齐（已退市且东方财富没有行情的会一直缺）。` : '。') +
+        (c.stale ? ` 其中 ${c.stale} 只是旧格式（缺股本变动历史，估值会退回每股口径），点"获取 / 更新"会重新获取。` : '') +
+        (state.pool.meta.index ? '' : ' 还没有沪深300 指数行情（获取 / 更新时一并取）。'));
     } catch (e) {
       state.pool = null;
       poolStatus(e.message, true);
@@ -1004,7 +1034,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     ['total_return', '累计收益', 'pct'], ['cagr', '年化收益', 'pct'], ['volatility', '年化波动', 'pctPlain'],
     ['sharpe', '夏普比率', 'num'], ['sortino', '索提诺比率', 'num'], ['max_drawdown', '最大回撤', 'pct'],
     ['calmar', '卡玛比率', 'num'], ['max_dd_days', '最长回撤（交易日）', 'int'], ['daily_win_rate', '日胜率', 'pctPlain'],
-    ['final_equity', '期末资产（元）', 'money'], ['trades', '成交笔数', 'int'], ['total_fees', '手续费合计（元）', 'money'],
+    ['final_equity', '期末资产（元）', 'money'], ['trades', '成交笔数', 'int'], ['total_fees', '手续费合计（元）', 'money'], ['total_impact', '冲击成本合计（元）', 'money'],
     ['annual_turnover', '年化换手（倍）', 'num'],
   ];
 
@@ -1031,12 +1061,21 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
         return `<tr><td>${label}</td><td class="num ${c1}">${fmt[f](m[k])}</td><td class="num ${c2}">${fmt[f](bm[k])}</td></tr>`;
       }).join('') + '</tbody>';
     const rel = R.relativeStats(res.equity, state.last.bench.equity, 0, n - 1, rf());
+    // 第二基准：沪深300 官方指数（价格指数，不含分红），按回测日期对齐、停牌日沿用前值
+    const idxEq = indexCurve(bt);
+    const relIdx = idxEq ? R.relativeStats(res.equity, idxEq, 0, n - 1, rf()) : null;
+    $('#relIdx').innerHTML = relIdx
+      ? kpi('相对沪深300指数 α', relIdx.alpha, '年化；指数不含分红，约少算 2%/年', fmt.pct) + kpi('β', relIdx.beta, '对官方指数', fmt.num, false) +
+        kpi('信息比率', relIdx.infoRatio, `跟踪误差 ${fmt.pctPlain(relIdx.trackingError)}`, fmt.num, false) +
+        kpi('指数区间收益', idxEq[n - 1] / idxEq[0] - 1, `策略超额 ${fmt.pct(relIdx.excessReturn)}`, fmt.pct)
+      : '';
+    $('#relIdxWrap').hidden = !relIdx;
     $('#relKpis').innerHTML = rel
       ? kpi('相对等权基准的 α', rel.alpha, '年化，未剔除风格暴露', fmt.pct) + kpi('β', rel.beta, '对基准的敏感度', fmt.num, false) +
         kpi('信息比率', rel.infoRatio, `跟踪误差 ${fmt.pctPlain(rel.trackingError)}`, fmt.num, false) +
         kpi('超额收益', rel.excessReturn, '区间累计', fmt.pct)
       : '';
-    renderExposure(R.exposure(res.equity, R.styleFactors(bt, rf()), 0, n - 1, rf()), bt.symbols.length);
+    renderExposure(bt, res);
     const rt = R.roundTrips(res.trades, res.dates);
     $('#rtNote').textContent = `${rt.count} 笔已平仓${rt.open ? `，${rt.open} 笔持仓中` : ''}；含全部费用`;
     $('#rtKpis').innerHTML =
@@ -1050,20 +1089,65 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     drawNav('#chart', '#readout', res.dates, [
       { values: res.equity.map((v) => v / res.initialCash), color: 'var(--accent)', width: 1.8, label: '策略' },
       { values: state.last.bench.equity.map((v) => v / res.initialCash), color: 'var(--bench)', width: 1.3, label: '基准' },
-    ], m._drawdown);
+    ].concat(idxEq ? [{ values: idxEq.map((v) => v / idxEq[0]), color: 'var(--warn)', width: 1.1, label: '沪深300' }] : []), m._drawdown);
+    $('#idxLegend').hidden = !idxEq;
   }
 
-  function renderExposure(ex, nSym) {
+  function renderExposure(bt, res) {
+    const n = res.dates.length;
+    const sf = R.styleFactors(bt, rf());
+    const ex = R.exposure(res.equity, sf, 0, n - 1, rf());
+    const exI = sf.industries ? R.exposure(res.equity, sf, 0, n - 1, rf(), { industry: true }) : null;
     if (!ex) {
       $('#expoNote').textContent = '';
-      $('#expoTable').innerHTML = '<tbody><tr><td>样本太短（至少 60 个交易日）</td></tr></tbody>';
+      $('#expoTable').innerHTML = '<tbody><tr><td>样本太短（至少 60 个交易日），或因子高度共线无法回归</td></tr></tbody>';
+      $('#expoInd').innerHTML = '';
       return;
     }
-    const tcell = (t) => `<td class="num ${Math.abs(t) > 2 ? 'warn' : ''}">${fmt.num(t)}</td>`;
-    $('#expoNote').textContent = `${ex.n} 个交易日 · R² ${fmt.num(ex.r2)}` + (ex.missing.length ? ` · 标的不足 6 只（当前 ${nSym}），只做市场因子` : '');
-    $('#expoTable').innerHTML = '<thead><tr><th>项目</th><th>系数</th><th>t 值（HAC）</th></tr></thead><tbody>' +
-      `<tr><td><b>剔除暴露后的 α（年化）</b></td><td class="num ${tone(ex.alpha)}">${fmt.pct(ex.alpha)}</td>${tcell(ex.alphaT)}</tr>` +
-      ex.loadings.map((l) => `<tr><td>${esc(l.label)} 暴露</td><td class="num">${fmt.num(l.beta)}</td>${tcell(l.t)}</tr>`).join('') + '</tbody>';
+    const cell = (l) => (l ? `<td class="num">${fmt.num(l.beta)} <span class="${Math.abs(l.t) > 2 ? 'warn' : 'note'}">(${fmt.num(l.t)})</span></td>` : '<td class="num note">—</td>');
+    const why = { SIZE: '需个股池', VALUE: '需个股池财务数据', QUALITY: '需个股池财务数据' };
+    const miss = ex.missing.filter((id) => ex.loadings.length > 1 || true).map((id) => (R.STYLE_DEFS.find((d) => d.id === id) || {}).label + (why[id] ? `（${why[id]}）` : ''));
+    $('#expoNote').textContent = `${ex.n} 个交易日 · R² ${fmt.num(ex.r2)}${exI ? ` / 加行业 ${fmt.num(exI.r2)}` : ''}` +
+      (ex.loadings.length === 1 ? ` · 标的不足 6 只（当前 ${bt.symbols.length}），只做市场因子` : '');
+    const styleRows = ex.loadings.map((l) => `<tr><td>${esc(l.label)}</td>${cell(l)}${exI ? cell(exI.loadings.find((x) => x.id === l.id)) : ''}</tr>`).join('');
+    const indRows = exI ? exI.loadings.filter((l) => l.kind === 'industry').sort((p, q) => Math.abs(q.t) - Math.abs(p.t)) : [];
+    $('#expoTable').innerHTML = `<thead><tr><th>项目</th><th>风格模型 β (t)</th>${exI ? '<th>风格 + 行业 β (t)</th>' : ''}</tr></thead><tbody>` +
+      `<tr><td><b>剔除暴露后的 α（年化）</b></td><td class="num ${tone(ex.alpha)}"><b>${fmt.pct(ex.alpha)}</b> <span class="note">(${fmt.num(ex.alphaT)})</span></td>` +
+      (exI ? `<td class="num ${tone(exI.alpha)}"><b>${fmt.pct(exI.alpha)}</b> <span class="note">(${fmt.num(exI.alphaT)})</span></td>` : '') + '</tr>' +
+      styleRows +
+      (indRows.length ? `<tr><td colspan="3" class="note">行业因子（行业等权 − 全体等权，基准行业：${esc(exI.baseIndustry || '')}），按 |t| 排序前 6 个：</td></tr>` +
+        indRows.slice(0, 6).map((l) => `<tr><td>${esc(l.label)}</td><td class="num note">—</td>${cell(l)}</tr>`).join('') : '') +
+      '</tbody>' + (miss.length && ex.loadings.length > 1 ? `<caption class="note" style="caption-side:bottom;text-align:left">未纳入：${esc(miss.join('、'))}</caption>` : '');
+    // 当前持仓的行业分布 vs 当期成分等权
+    const industry = bt.meta && bt.meta.industry;
+    if (!industry || !bt.member) { $('#expoInd').innerHTML = ''; return; }
+    const i = n - 1, bars = bt.bars();
+    const eq = res.equity[i];
+    const port = new Map(), bench = new Map();
+    let nb = 0;
+    for (const s of bt.symbols) {
+      const g = industry[s] || '其他';
+      const w = (res.finalShares[s] || 0) * bars.close[s][i] / eq;
+      if (w > 0) port.set(g, (port.get(g) || 0) + w);
+      if (bt.member[s][i]) { bench.set(g, (bench.get(g) || 0) + 1); nb++; }
+    }
+    const rows = [...new Set([...port.keys(), ...bench.keys()])]
+      .map((g) => [g, port.get(g) || 0, (bench.get(g) || 0) / (nb || 1)])
+      .sort((p, q) => Math.abs(q[1] - q[2]) - Math.abs(p[1] - p[2])).slice(0, 8);
+    $('#expoInd').innerHTML = `<thead><tr><th>当前持仓行业（偏离最大的 8 个）</th><th>组合</th><th>成分等权</th><th>偏离</th></tr></thead><tbody>` +
+      rows.map(([g, p, q]) => `<tr><td>${esc(g)}</td><td class="num">${fmt.pctPlain(p)}</td><td class="num">${fmt.pctPlain(q)}</td><td class="num ${tone(p - q)}">${fmt.pct(p - q)}</td></tr>`).join('') + '</tbody>';
+  }
+
+  function indexCurve(bt) {
+    const idx = bt.meta && bt.meta.index;
+    if (!idx || !idx.dates || !idx.dates.length) return null;
+    const map = new Map(idx.dates.map((d, i) => [d, idx.close[i]]));
+    let last = NaN, hits = 0;
+    const out = bt.dates.map((d) => { const v = map.get(d); if (v > 0) { last = v; hits++; } return last; });
+    const first = out.findIndex((v) => v > 0);
+    if (first < 0 || hits < bt.dates.length * 0.9) return null;
+    for (let i = 0; i < first; i++) out[i] = out[first];
+    return out;
   }
 
   function renderMonthly(m) {
@@ -1615,11 +1699,11 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   }
 
   // 因子 IC 的自助法较慢，放到后台线程；无法创建后台线程时在主线程计算
-  function computeIC(h, done) {
+  function computeIC(h, neutral, done) {
     const bt = state.research.bt;
     const token = (state.icToken = (state.icToken || 0) + 1);
     const finish = (ic) => { if (token === state.icToken) done(ic); };
-    const local = () => setTimeout(() => finish(R.factorIC(bt, h)), 30);
+    const local = () => setTimeout(() => finish(R.factorIC(bt, h, { neutral })), 30);
     let w = null;
     try { w = new Worker('worker.js'); } catch (e) { w = null; }
     if (!w) return local();
@@ -1628,7 +1712,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     const stop = () => { w.terminate(); if (state.icWorker === w) state.icWorker = null; };
     w.onmessage = (e) => { stop(); if (e.data.type === 'result') finish(e.data.result); else local(); };
     w.onerror = (e) => { stop(); e.preventDefault(); local(); };
-    w.postMessage({ type: 'ic', payload: { data: activeData(), engine: engineOpts(), h } });
+    w.postMessage({ type: 'ic', payload: { data: activeData(), engine: engineOpts(), h, neutral } });
   }
 
   function renderIC() {
@@ -1636,7 +1720,8 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     const h = +$('#icH').value;
     $('#icTable').innerHTML = '<tbody><tr><td>计算中（块自助法 200 次）…</td></tr></tbody>';
     $('#icNote').textContent = '';
-    computeIC(h, (ic) => {
+    const neutral = $('#icNeutral').value;
+    computeIC(h, neutral, (ic) => {
       state.research.ic = ic;
       const ci = (lo, hi) => {
         if (!fin(lo)) return '<td class="num">—</td>';
@@ -1664,8 +1749,9 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     const h = +$('#icH').value;
     const f = state.research.ic.find((x) => x.id === state.icSel) || state.research.ic[0];
     state.icSel = f.id;
-    const p = R.factorPortfolios(state.research.bt, f.id, h);
-    $('#qTitle').textContent = `分组组合：${f.label}，每 ${h} 日调仓`;
+    const neutral = $('#icNeutral').value;
+    const p = R.factorPortfolios(state.research.bt, f.id, h, { neutral });
+    $('#qTitle').textContent = `分组组合：${f.label}，每 ${h} 日调仓${{ industry: '，行业中性', industry_size: '，行业+市值中性' }[neutral] || ''}`;
     if (!p.q) {
       $('#qMeta').textContent = '';
       $('#qChart').innerHTML = '';
@@ -1890,6 +1976,21 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
 
   $('#acfSym').addEventListener('change', renderAcf);
   $('#icH').addEventListener('change', renderIC);
+  $('#icNeutral').addEventListener('change', renderIC);
+  $('#corrRun').addEventListener('click', () => {
+    if (!state.research) return;
+    $('#corrMeta').textContent = '计算中…';
+    setTimeout(() => {
+      const c = R.factorCorrelation(state.research.bt, +$('#icH').value);
+      const short = (l) => esc(l.replace(/（.*?）|\(.*?\)/g, '').slice(0, 8));
+      const color = (v) => (!fin(v) ? '' : `background:rgba(${v > 0 ? '200,37,47' : '23,138,76'},${Math.min(Math.abs(v), 1) * 0.55})`);
+      $('#corrTable').innerHTML = '<thead><tr><th></th>' + c.labels.map((l) => `<th>${short(l)}</th>`).join('') + '</tr></thead><tbody>' +
+        c.matrix.map((row, p) => `<tr><td>${short(c.labels[p])}</td>` + row.map((v, q) => `<td class="num" style="${p === q ? '' : color(v)}">${p === q ? '' : fin(v) ? v.toFixed(2) : '—'}</td>`).join('') + '</tr>').join('') + '</tbody>';
+      const high = [];
+      c.matrix.forEach((row, p) => row.forEach((v, q) => { if (q > p && Math.abs(v) > 0.7) high.push(`${short(c.labels[p])} / ${short(c.labels[q])} ${v.toFixed(2)}`); }));
+      $('#corrMeta').textContent = `未来 ${$('#icH').value} 日抽样；${high.length ? '高度相关：' + high.slice(0, 6).join('，') : '没有 |ρ| > 0.7 的因子对'}`;
+    }, 30);
+  });
   $('#icTable').addEventListener('click', (e) => {
     const tr = e.target.closest('tr[data-factor]');
     if (!tr) return;

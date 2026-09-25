@@ -542,11 +542,12 @@ test('exposure: the equal-weight market itself has beta 1 and no alpha', () => {
   const mkt = ex.loadings.find((l) => l.id === 'MKT');
   close(mkt.beta, 1, 1e-9);
   close(ex.alpha, 0, 1e-9);
-  assert.deepEqual(ex.loadings.map((l) => l.id), ['MKT', 'MOM', 'LOWVOL']);
+  assert.deepEqual(ex.loadings.map((l) => l.id), ['MKT', 'MOM', 'LOWVOL', 'LIQ'], '没有财务与股本数据时不含规模、价值、质量');
+  assert.deepEqual(ex.missing, ['SIZE', 'VALUE', 'QUALITY']);
   // 标的不足 6 只时只做市场因子
   const few = new AQ.Backtester({ a: series(600, 1), b: series(600, 2), c: series(600, 3) }, {});
   const ex2 = R.exposure(few.bars().close.a, R.styleFactors(few), 0, 599);
-  assert.deepEqual(ex2.missing, ['MOM', 'LOWVOL']);
+  assert.deepEqual(ex2.loadings.map((l) => l.id), ['MKT']);
 });
 
 test('deflated sharpe counts prior trials', () => {
@@ -665,7 +666,7 @@ test('stock pool: plan windows, trim with warmup, assemble meta and coverage', (
   const dates = dayList(4000);
   const mk = () => ({ dates, open: dates.map(() => 10), close: dates.map(() => 10), volume: dates.map(() => 1) });
   const out = pool.assemble(members, { '600002': { code: '600002', bars: mk(), fin: [{ report: '2012-12-31', notice: '2013-03-01', eps: 1 }] } }, '2012-01-01', '2020-12-31');
-  assert.deepEqual(out.coverage, { wanted: 2, got: 1, missing: ['600003'] });
+  assert.deepEqual(out.coverage, { wanted: 2, got: 1, missing: ['600003'], stale: 1 }, '没有版本号的旧记录计为待更新');
   const d = out.data['600002'];
   assert.ok(d.dates[0] >= p['600002'].from && d.dates[d.dates.length - 1] <= '2020-12-31');
   assert.deepEqual(out.meta.universe['600002'], members.members['600002']);
@@ -689,4 +690,89 @@ test('eastmoney: klines with turnover and finance rows parse', () => {
   const q = em.proportional(hfq, raw, 'x');
   assert.deepEqual(q.raw, [1, 1]);
   assert.deepEqual(q.turnover, [0.5, 0.6]);
+});
+
+test('neutralize: industry demeaning removes industry effects; size regression removes size', () => {
+  const syms = ['a', 'b', 'c', 'd', 'e', 'f'];
+  const b = { meta: { industry: { a: '银行', b: '银行', c: '银行', d: '白酒', e: '白酒', f: '白酒' } }, cache: new Map(), dates: ['x'], raw: {}, turnover: {}, volume: {} };
+  // 因子值完全由行业决定：中性化后全为 0
+  const x = [1, 1, 1, 5, 5, 5];
+  assert.ok(R.neutralize(x, syms, 'industry', b, 0).every((v) => Math.abs(v) < 1e-12));
+  // 行业内的排序得以保留
+  const y = [1, 2, 3, 10, 11, 12];
+  const n1 = R.neutralize(y, syms, 'industry', b, 0);
+  close(n1[0], n1[3], 1e-12);
+  assert.ok(n1[2] > n1[0]);
+  const raw = R.neutralize(y, syms, 'none', b, 0);
+  assert.ok(raw[3] > raw[2], '不中性化时白酒整体排在前面');
+});
+
+test('exposure with industry factors and new style factors on a stock-like pool', () => {
+  const n = 700;
+  const dates = dayList(n);
+  const data = {}, industry = {}, shares = {}, fundamentals = {};
+  for (let k = 0; k < 12; k++) {
+    const sym = '6000' + String(k).padStart(2, '0');
+    const d = series(n, 90 + k, 0.0002 * ((k % 4) - 1.5), 0.012);
+    data[sym] = { ...d, dates, raw: d.close.slice() };
+    industry[sym] = ['银行', '白酒', '电力'][k % 3];
+    shares[sym] = [{ date: dates[0], total: 1e9 * (1 + k), float: 5e8 * (1 + k) }];
+    fundamentals[sym] = [{ report: '2019-12-31', notice: dates[5], update: dates[5], profit: 1e8 * (k + 1), bps: 3 + k, eps: 0.1 }];
+  }
+  const bt = new AQ.Backtester(data, { meta: { industry, shares, fundamentals } });
+  const sf = R.styleFactors(bt);
+  assert.deepEqual(sf.order, ['SIZE', 'VALUE', 'MOM', 'LOWVOL', 'QUALITY', 'LIQ']);
+  assert.ok(sf.industries && Object.keys(sf.industries).length === 2, '三个行业去掉基准行业后剩两个');
+  const eq = bt.run(new AQ.BuyAndHold()).equity;
+  const ex = R.exposure(eq, sf, 0, n - 1, 0.02, { industry: true });
+  assert.ok(ex.loadings.some((l) => l.kind === 'industry'));
+  assert.ok(ex.baseIndustry);
+  // E/P 用净利润 / 总市值，不受每股收益追溯调整影响
+  const ep = R.FACTORS.find((f) => f.id === 'ep').f(bt.bars(), '600003');
+  close(ep[n - 1], (1e8 * 4) / (data['600003'].close[n - 1] * 4e9), 1e-9);
+});
+
+// ---------- 成交容量与冲击成本 ----------
+
+test('participation cap splits a large order across days using only past volume', () => {
+  const n = 60;
+  const dates = dayList(n);
+  const px = dates.map(() => 10);
+  // 每天成交 1000 手 = 100 万元；参与率 10% → 每天最多买 10 万元
+  const mk = (vol) => ({ '600000': { dates, open: px, close: px, high: px, low: px, volume: vol } });
+  const vol = dates.map(() => 1000);
+  const opts = { initialCash: 1e6, rebalanceBand: 0, slippage: 0, participation: 0.1 };
+  const bt = new AQ.Backtester(mk(vol), opts);
+  const res = bt.run(new AQ.BuyAndHold());
+  const buys = res.trades.filter((t) => t.side === 'buy');
+  assert.ok(buys.length >= 9, `分 ${buys.length} 天买入`);
+  assert.ok(buys.every((t) => t.amount <= 1e5 + 1e-6));
+  assert.ok(res.dates.indexOf(buys[0].date) >= 10, '成交量历史不足 10 天时先不买')
+  // 篡改当天及以后的成交量不影响当天的成交上限
+  const vol2 = vol.slice();
+  const day = res.dates.indexOf(buys[3].date);
+  for (let i = day; i < n; i++) vol2[i] = 1e9;
+  const res2 = new AQ.Backtester(mk(vol2), opts).run(new AQ.BuyAndHold());
+  assert.equal(res2.trades.filter((t) => t.side === 'buy')[3].amount, buys[3].amount);
+});
+
+test('square-root impact raises cost with order size', () => {
+  const d = series(300, 77, 0, 0.02);
+  d.volume = d.volume.map(() => 200); // 每天约 2000 万股·元级别的成交额
+  // 第二只从第 30 天才有行情：等权买入发生在有了 20 日历史之后
+  const late = { dates: d.dates.slice(30), open: d.open.slice(30), close: d.close.slice(30), volume: d.volume.slice(30) };
+  const data = { '600000': d, '600001': late };
+  const run = (cash) => new AQ.Backtester(data, { initialCash: cash, rebalanceBand: 0, slippage: 0, impact: 1 }).run(new AQ.BuyAndHold()).trades.find((t) => t.symbol === '600000');
+  const small = run(1e5), big = run(1e7);
+  assert.ok(small.impact > 0 && big.impact > 0);
+  assert.ok(big.impact / big.amount > small.impact / small.amount * 5, `${small.impact / small.amount} vs ${big.impact / big.amount}`);
+});
+
+test('makeBacktester forwards capacity, impact, delisting and meta settings', () => {
+  const bt = R.makeBacktester({ '600000': series(100, 1) }, { fees: {}, participation: 0.1, impact: 0.5, delistRecovery: 0.3, meta: { industry: { '600000': '银行' } } });
+  assert.equal(bt.participation, 0.1);
+  assert.equal(bt.impact, 0.5);
+  assert.equal(bt.delistRecovery, 0.3);
+  assert.equal(bt.meta.industry['600000'], '银行');
+  assert.ok(bt.adv && bt.sigma, '启用容量或冲击时预先计算成交额与波动率');
 });

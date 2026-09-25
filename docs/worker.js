@@ -7,7 +7,7 @@ self.onmessage = (e) => {
   const R = self.AQ.research;
   if (type === 'ic') {
     try {
-      self.postMessage({ type: 'result', result: R.factorIC(R.makeBacktester(payload.data, payload.engine), payload.h) });
+      self.postMessage({ type: 'result', result: R.factorIC(R.makeBacktester(payload.data, payload.engine), payload.h, { neutral: payload.neutral }) });
     } catch (err) {
       self.postMessage({ type: 'error', message: err.message || String(err) });
     }

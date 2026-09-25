@@ -8,6 +8,8 @@
   const DB_NAME = 'aq-stockpool';
   const STORE = 'stocks';
   const WARMUP_DAYS = 420; // 纳入前预留约 280 个交易日，供 250 日指标预热
+  const VERSION = 2;       // 本地记录格式：2 = 含股本变动历史、原始净利润与更新日
+  const INDEX_KEY = 'IDX000300';
 
   const addDays = (d, n) => {
     const t = new Date(d + 'T00:00:00Z');
@@ -45,9 +47,9 @@
 
   /* 组装：records 为 IndexedDB 中的 { code, bars, fin }。返回 { data, meta, coverage }。
    * meta.universe 只含有行情的股票；coverage 统计成分股里有多少取到了行情。 */
-  function assemble(members, records, start, end) {
+  function assemble(members, records, start, end, { industry = null, fundAvail = 'notice' } = {}) {
     const want = plan(members, start, end);
-    const data = {}, universe = {}, fundamentals = {}, delisted = {};
+    const data = {}, universe = {}, fundamentals = {}, delisted = {}, shares = {}, ind = {};
     let got = 0;
     const missing = [];
     for (const code of Object.keys(want)) {
@@ -58,13 +60,20 @@
       data[code] = bars;
       universe[code] = want[code].intervals;
       if (r.fin && r.fin.length) fundamentals[code] = r.fin;
+      if (r.shares && r.shares.length) shares[code] = r.shares;
+      if (industry && industry[code]) ind[code] = industry[code];
       if (members.delisted && members.delisted[code]) delisted[code] = members.delisted[code];
       got++;
     }
+    const idx = records[INDEX_KEY];
     return {
       data,
-      meta: { universe, fundamentals, delisted },
-      coverage: { wanted: Object.keys(want).length, got, missing },
+      meta: {
+        universe, fundamentals, delisted, shares, fundAvail,
+        industry: Object.keys(ind).length ? ind : null,
+        index: idx && idx.bars ? { code: '000300', name: '沪深300（价格指数）', dates: idx.bars.dates, close: idx.bars.close } : null,
+      },
+      coverage: { wanted: Object.keys(want).length, got, missing, stale: Object.values(records).filter((r) => r.code !== INDEX_KEY && r.v !== VERSION).length },
     };
   }
 
@@ -141,7 +150,7 @@
     }
   }
 
-  // 一只股票：后复权 + 不复权（含换手率）→ 等比前复权；财务主要指标
+  // 一只股票：后复权 + 不复权（含换手率）→ 等比前复权；财务主要指标；股本变动历史
   async function fetchStock(code, from, to) {
     const k = (adj) => withRetry(async () => em.parseKlines(await jsonp((cb) => em.klineUrl(code, from, to, adj, cb)), code));
     const hfq = await k('hfq');
@@ -149,7 +158,9 @@
     const bars = em.proportional(hfq, raw, code);
     let fin = [];
     try { fin = em.parseFinance(await withRetry(() => jsonp((cb) => em.financeUrl(code, cb)))); } catch (e) { /* 财务数据缺失不影响行情 */ }
-    return { code, name: raw.name || hfq.name || '', bars, fin, from, to, fetched: new Date().toISOString().slice(0, 10) };
+    let shares = [];
+    try { shares = em.parseShares(await withRetry(() => jsonp((cb) => em.sharesUrl(code, cb)))); } catch (e) { /* 缺股本时估值退回每股口径 */ }
+    return { code, v: VERSION, name: raw.name || hfq.name || '', bars, fin, shares, from, to, fetched: new Date().toISOString().slice(0, 10) };
   }
 
   /* 构建股票池：已存且覆盖所需区间的股票跳过（可中断后继续）。onProgress(done, total, code, failed) */
@@ -158,8 +169,13 @@
     const have = await dbAll();
     const todo = Object.entries(want).filter(([code, w]) => {
       const r = have[code];
-      return !(r && r.from <= w.from && r.to >= w.to);
+      return !(r && r.v === VERSION && r.from <= w.from && r.to >= w.to);
     });
+    // 官方指数（第二基准）：取全历史（成分股行情含预热期，早于起始年份），每次都更新
+    try {
+      const bars = em.parseKlines(await withRetry(() => jsonp((cb) => em.indexKlineUrl('000300', '2005-01-01', end, cb))), '000300');
+      await dbPut({ code: INDEX_KEY, bars, fetched: new Date().toISOString().slice(0, 10) });
+    } catch (e) { /* 取不到指数时只用成分等权基准 */ }
     const failed = [];
     let done = Object.keys(want).length - todo.length;
     const total = Object.keys(want).length;
@@ -182,11 +198,11 @@
     return { total, failed, stopped: shouldStop() };
   }
 
-  async function load(members, start, end) {
-    return assemble(members, await dbAll(), start, end);
+  async function load(members, start, end, opts) {
+    return assemble(members, await dbAll(), start, end, opts);
   }
 
-  const api = { plan, trim, assemble, build, load, dbAll, dbClear, WARMUP_DAYS };
+  const api = { plan, trim, assemble, build, load, dbAll, dbClear, WARMUP_DAYS, VERSION, INDEX_KEY };
   if (isNode) module.exports = api;
   else root.AQ.pool = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
