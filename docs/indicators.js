@@ -53,21 +53,25 @@
     return out;
   }
 
-  function rolling(x, n, pick) {
-    const out = nan(x.length);
-    for (let i = n - 1; i < x.length; i++) {
-      let v = x[i - n + 1];
-      let valid = ok(v);
-      for (let j = i - n + 2; j <= i && valid; j++) {
-        if (!ok(x[j])) valid = false;
-        else v = pick(v, x[j]);
-      }
-      if (valid) out[i] = v;
+  /* 滚动最大/最小值（单调队列，O(n)）：窗口内有缺失值时为 NaN。
+   * better(a, b) 为真表示 a 比 b 更应留在队首（最大值用 >=，最小值用 <=）。 */
+  function rolling(x, n, better) {
+    const len = x.length;
+    const out = nan(len);
+    const q = new Int32Array(len);
+    let head = 0, tail = 0, lastBad = -1;
+    for (let i = 0; i < len; i++) {
+      const v = x[i];
+      if (!ok(v)) { lastBad = i; head = tail = 0; continue; }
+      while (tail > head && better(v, x[q[tail - 1]])) tail--;
+      q[tail++] = i;
+      while (q[head] <= i - n) head++;
+      if (i >= n - 1 && lastBad <= i - n) out[i] = x[q[head]];
     }
     return out;
   }
-  const highest = (x, n) => rolling(x, n, Math.max);
-  const lowest = (x, n) => rolling(x, n, Math.min);
+  const highest = (x, n) => rolling(x, n, (a, b) => a >= b);
+  const lowest = (x, n) => rolling(x, n, (a, b) => a <= b);
 
   function shift(x, k) {
     const out = nan(x.length);

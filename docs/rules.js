@@ -324,6 +324,8 @@
         })),
         desired: new Uint8Array(N),
         emitted: false,
+        // 时点股票池：不在池内不能新买入，持仓被剔出股票池后卖出
+        member: bars && bars.member ? symbols.map((s) => bars.member[s]) : null,
       };
     }
 
@@ -332,7 +334,7 @@
      * 止损、止盈、移动止损、最短/最长持有、冷却期全部以实际成交为准。 */
     decide(i, { shares, book }) {
       const c0 = this.ctx;
-      const { close, symbols, N, slots, entryIdx, exitIdx, state, desired } = c0;
+      const { close, symbols, N, slots, entryIdx, exitIdx, state, desired, member } = c0;
       const allOf = (st, idx, v) => idx.length > 0 && idx.every((j) => st.sigs[j][i] === v);
       const anyOf = (st, idx, v) => idx.some((j) => st.sigs[j][i] === v);
       const entrySignal = (st) => (this.entry === 'all' ? allOf(st, entryIdx, 1) : anyOf(st, entryIdx, 1));
@@ -347,7 +349,7 @@
         if (!fin(c)) continue;
         const bk = book[s];
         if (!(shares[s] > 0)) {
-          if (!entrySignal(st)) { desired[k] = 0; changed = true; }
+          if (!entrySignal(st) || (member && !member[k][i])) { desired[k] = 0; changed = true; }
           continue;
         }
         if (st.peakEntry !== bk.entry) {
@@ -367,6 +369,7 @@
         if (this.stopLoss && c <= bk.cost * (1 - this.stopLoss)) exit = true;
         if (this.trailATR && fin(st.atr[i]) && c < st.peak - this.trailATR * st.atr[i]) exit = true;
         if (this.maxHold && held >= this.maxHold) exit = true;
+        if (member && !member[k][i]) exit = true;
         if (exit) { desired[k] = 0; changed = true; }
       }
 
@@ -378,6 +381,7 @@
           if (desired[k]) continue;
           const s = symbols[k];
           if (!fin(close[s][i]) || shares[s] > 0 || i - book[s].exit <= this.cooldown) continue;
+          if (member && !member[k][i]) continue;
           if (entrySignal(state[k])) cands.push(k);
         }
         if (cands.length > free && this.maxPositions > 0) {

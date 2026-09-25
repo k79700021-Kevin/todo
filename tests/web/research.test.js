@@ -556,3 +556,137 @@ test('deflated sharpe counts prior trials', () => {
   assert.equal(withPrior.trials, 500);
   assert.ok(withPrior.prob < now.prob && withPrior.sr0 > now.sr0);
 });
+
+// ---------- 个股：时点股票池、退市、财务数据 ----------
+
+test('point-in-time universe: no buys outside the pool, exits on removal, PIT benchmark', () => {
+  const n = 60;
+  const dates = dayList(n);
+  const up = ramp(n, 10, 0.1);
+  const data = {};
+  for (const s of ['600000', '600001', '600002']) data[s] = { dates, open: up, close: up, high: up, low: up, volume: up.map(() => 1e6) };
+  const universe = { '600000': [[dates[0], null]], '600001': [[dates[0], dates[30]]], '600002': [[dates[40], null]] };
+  const bt = new AQ.Backtester(data, { rebalanceBand: 0, meta: { universe } });
+  const res = bt.run(new RuleStrategy({ rules: [{ id: 'price_ma', params: { n: 5 } }] }));
+  const idx = (d) => dates.indexOf(d);
+  const by = (s, side) => res.trades.filter((t) => t.symbol === s && t.side === side).map((t) => idx(t.date));
+  assert.ok(by('600002', 'buy').every((i) => i > 40), '纳入前不买：' + by('600002', 'buy'));
+  assert.ok(by('600002', 'buy').length > 0);
+  assert.deepEqual(by('600001', 'sell'), [31], '剔除当日收盘决定卖出，次日开盘成交');
+  // 基准：当期成分等权，成分变化时调仓
+  const bench = bt.run(new AQ.BuyAndHold());
+  const days = [...new Set(bench.trades.map((t) => idx(t.date)))];
+  assert.deepEqual(days, [1, 31, 41]);
+});
+
+test('delisted positions are written off at the recovery ratio', () => {
+  const dates = dayList(30);
+  const px = ramp(30, 10, 0);
+  const data = {
+    '600000': { dates: dates.slice(0, 20), open: px.slice(0, 20), close: px.slice(0, 20), volume: px.slice(0, 20) },
+    '600001': { dates, open: px, close: px, volume: px },
+  };
+  const run = (rec) => new AQ.Backtester(data, { rebalanceBand: 0, fees: new AQ.FeeModel({ minCommission: 0, commissionRate: 0, transferRate: 0, stampDutyRate: 0 }), slippage: 0, meta: { delisted: { '600000': dates[19] } }, delistRecovery: rec })
+    .run(new AQ.BuyAndHold());
+  const full = run(1), zero = run(0), half = run(0.5);
+  const w = full.trades.find((t) => t.delisted);
+  assert.equal(w.date, dates[20]);
+  close(full.equity[29], 1e6, 1);
+  close(zero.equity[29], 5e5, 1);
+  close(half.equity[29], 7.5e5, 1);
+});
+
+test('fundamentals become visible only after the notice date; TTM EPS uses announced reports', () => {
+  const dates = ['2021-04-28', '2021-04-29', '2021-04-30', '2021-08-30', '2021-08-31'];
+  const px = [20, 20, 20, 20, 20];
+  const fundamentals = { '600000': [
+    { report: '2020-06-30', notice: '2020-08-20', eps: 0.4, bps: 5 },
+    { report: '2020-12-31', notice: '2021-03-30', eps: 1.0, bps: 5.5, profitYoy: 10 },
+    { report: '2021-06-30', notice: '2021-08-30', eps: 0.6, bps: 6, profitYoy: 30 },
+  ] };
+  const bt = new AQ.Backtester({ '600000': { dates, open: px, close: px, raw: px, volume: [1, 1, 1, 1, 1] } }, { meta: { fundamentals } });
+  const F = R.fundPanel(bt.bars(), '600000');
+  close(F.epsTTM[3], 1.0, 1e-6); // 财务指标以单精度存储 // 8-30 当天公告，当天还不可用
+  close(F.epsTTM[4], 0.6 + 1.0 - 0.4, 1e-6); // 财务指标以单精度存储
+  close(F.bps[4], 6, 1e-6); // 财务指标以单精度存储
+  close(F.profitYoy[3], 10, 1e-6); // 财务指标以单精度存储
+  const ep = R.FACTORS.find((f) => f.id === 'ep').f(bt.bars(), '600000');
+  close(ep[4], 1.2 / 20, 1e-6); // 财务指标以单精度存储
+  // 未来才公告的数据不影响之前的值
+  const later = JSON.parse(JSON.stringify(fundamentals));
+  later['600000'][2].eps = 99;
+  const bt2 = new AQ.Backtester({ '600000': { dates, open: px, close: px, raw: px, volume: [1, 1, 1, 1, 1] } }, { meta: { fundamentals: later } });
+  const F2 = R.fundPanel(bt2.bars(), '600000');
+  assert.deepEqual(Array.from(F2.epsTTM.slice(0, 4)), Array.from(F.epsTTM.slice(0, 4)));
+  assert.ok(R.availableFactors(bt.bars(), ['600000']).some((f) => f.id === 'ep'));
+  assert.ok(!R.availableFactors(new AQ.Backtester({ '600000': series(100, 1) }, {}).bars(), ['600000']).some((f) => f.id === 'ep'));
+});
+
+test('float market cap from turnover', () => {
+  const n = 40;
+  const dates = dayList(n);
+  const px = ramp(n, 10, 0);
+  // 流通股本 1 亿股：成交 50 万手 = 5000 万股，换手率 50%
+  const bt = new AQ.Backtester({ '600000': { dates, open: px, close: px, raw: px, volume: px.map(() => 5e5), turnover: px.map(() => 50) } }, {});
+  const cap = R.floatCap(bt.bars(), '600000');
+  close(cap[30], 10 * 1e8, 1);
+  assert.ok(!Number.isFinite(cap[5]));
+});
+
+test('factor panel ignores days outside the universe', () => {
+  const data = {};
+  for (let k = 0; k < 4; k++) data['60000' + k] = series(400, 70 + k);
+  const dates = new AQ.Backtester(data, {}).dates;
+  const universe = { '600000': [[dates[0], null]], '600001': [[dates[0], null]], '600002': [[dates[0], null]], '600003': [[dates[200], null]] };
+  const bt = new AQ.Backtester(data, { meta: { universe } });
+  const ic = R.factorIC(bt, 5, { B: 20 });
+  const bt3 = new AQ.Backtester({ '600000': data['600000'], '600001': data['600001'], '600002': data['600002'] }, {});
+  // 前 200 天第 4 只不在池内：截面 IC 的前段与只有 3 只时相同 → 整体不同但有效期数相同
+  assert.equal(ic[0].csN, R.factorIC(bt3, 5, { B: 20 })[0].csN);
+});
+
+// ---------- 股票池组装 ----------
+
+test('stock pool: plan windows, trim with warmup, assemble meta and coverage', () => {
+  const pool = require(path.join(docs, 'stockpool.js'));
+  const members = {
+    members: {
+      '600001': [['2005-07-01', '2009-12-29']],
+      '600002': [['2012-01-01', '2014-01-01'], ['2016-01-01', null]],
+      '600003': [['2011-06-01', null]],
+    },
+    delisted: { '600001': '2009-12-29' },
+  };
+  const p = pool.plan(members, '2012-01-01', '2020-12-31');
+  assert.deepEqual(Object.keys(p).sort(), ['600002', '600003'], '区间外的股票不需要');
+  assert.equal(p['600002'].to, '2020-12-31');
+  assert.ok(p['600002'].from < '2011-01-01', '纳入前预留预热期');
+  assert.ok(p['600003'].from < '2011-01-01', '区间开始前已是成分：从区间开始往前预热');
+  const dates = dayList(4000);
+  const mk = () => ({ dates, open: dates.map(() => 10), close: dates.map(() => 10), volume: dates.map(() => 1) });
+  const out = pool.assemble(members, { '600002': { code: '600002', bars: mk(), fin: [{ report: '2012-12-31', notice: '2013-03-01', eps: 1 }] } }, '2012-01-01', '2020-12-31');
+  assert.deepEqual(out.coverage, { wanted: 2, got: 1, missing: ['600003'] });
+  const d = out.data['600002'];
+  assert.ok(d.dates[0] >= p['600002'].from && d.dates[d.dates.length - 1] <= '2020-12-31');
+  assert.deepEqual(out.meta.universe['600002'], members.members['600002']);
+  assert.equal(out.meta.fundamentals['600002'].length, 1);
+  // 组装出的数据可以直接回测
+  const bt = new AQ.Backtester(out.data, { meta: out.meta });
+  assert.ok(bt.member['600002'].some((x) => x === 1));
+});
+
+test('eastmoney: klines with turnover and finance rows parse', () => {
+  const k = em.parseKlines({ data: { name: '测试', klines: ['2024-01-02,10,10.5,10.8,9.9,1000,1.25'] } }, '600000');
+  assert.deepEqual(k.turnover, [1.25]);
+  assert.equal(k.name, '测试');
+  const f = em.parseFinance({ result: { data: [{ REPORT_DATE: '2023-12-31 00:00:00', NOTICE_DATE: '2024-03-30 00:00:00', EPSJB: 1.2, BPS: 8, TOTALOPERATEREVETZ: 5, PARENTNETPROFITTZ: null }] } });
+  assert.deepEqual(f[0].report, '2023-12-31');
+  assert.ok(Number.isNaN(f[0].profitYoy));
+  assert.ok(em.financeUrl('000001').includes('000001.SZ') && em.financeUrl('600519').includes('600519.SH'));
+  // 等比前复权时带上不复权价与换手率
+  const hfq = { dates: ['a', 'b'], open: [2, 4], high: [2, 4], low: [2, 4], close: [2, 4], volume: [1, 1] };
+  const raw = { dates: ['a', 'b'], open: [1, 1], high: [1, 1], low: [1, 1], close: [1, 1], volume: [1, 1], turnover: [0.5, 0.6] };
+  const q = em.proportional(hfq, raw, 'x');
+  assert.deepEqual(q.raw, [1, 1]);
+  assert.deepEqual(q.turnover, [0.5, 0.6]);
+});

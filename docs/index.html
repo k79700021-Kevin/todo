@@ -82,7 +82,7 @@ input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent);
 .fields .wide { grid-column: 1 / -1; }
 .note { margin: 0; font-size: 13px; color: var(--muted); }
 .note code, td code { font-family: var(--mono); font-size: 12px; }
-.seg { display: grid; grid-template-columns: repeat(3, 1fr); background: var(--surface-2); border: 1px solid var(--line); border-radius: 9px; padding: 3px; gap: 3px; }
+.seg { display: grid; grid-template-columns: repeat(4, 1fr); background: var(--surface-2); border: 1px solid var(--line); border-radius: 9px; padding: 3px; gap: 3px; }
 .seg button { font: 14px var(--sans); color: var(--muted); background: none; border: 0; border-radius: 6px; padding: 7px 4px; cursor: pointer; }
 .seg button[aria-selected="true"] { background: var(--surface); color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.12); }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; }
@@ -192,6 +192,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
           <button type="button" role="tab" data-src="sample" aria-selected="true">示例</button>
           <button type="button" role="tab" data-src="csv" aria-selected="false">上传 CSV</button>
           <button type="button" role="tab" data-src="online" aria-selected="false">在线获取</button>
+          <button type="button" role="tab" data-src="pool" aria-selected="false">个股池</button>
         </div>
         <div data-pane="sample">
           <p class="note">5 只 ETF 的<strong>模拟行情</strong>（程序生成，不是真实历史），用来熟悉操作。</p>
@@ -222,6 +223,19 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
           </label>
           <button type="button" class="btn btn-secondary block" id="fetchBtn">获取行情</button>
           <p class="note" id="onStatus">从东方财富获取日线（下面的回测区间为空时取 2010 年至今）。个别代码失败会跳过并提示。在 Claude 里打开时外部接口会被拦截，请用 GitHub Pages 地址。</p>
+        </div>
+        <div data-pane="pool" hidden>
+          <p class="note">沪深300 <strong>历史成分</strong>（时点股票池）：每只股票只在它是成分股的时段内可买，被调出后卖出，基准为当期成分等权。成分由中证指数公司历次调整公告重建（含已退市公司），行情与财务数据从东方财富获取，财务数据按公告日对齐。</p>
+          <label for="poolStart">起始年份
+            <select id="poolStart"><option value="2018">2018 年至今（约 560 只）</option><option value="2015">2015 年至今（约 670 只）</option><option value="2010">2010 年至今（约 800 只）</option></select>
+          </label>
+          <div class="row">
+            <button type="button" class="btn btn-secondary" id="poolFetch">获取 / 更新</button>
+            <button type="button" class="btn btn-secondary" id="poolStop" hidden>暂停</button>
+            <button type="button" class="linkbtn" id="poolClear">清空本地股票池</button>
+          </div>
+          <div class="progress" id="poolProgress" hidden><div></div></div>
+          <p class="note" id="poolStatus">首次获取每只股票要请求 3 次，几百只股票需要几分钟，可以随时暂停，下次接着取。数据存在本机浏览器。</p>
         </div>
         <p class="note" id="dataInfo"></p>
       </section>
@@ -299,6 +313,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
           <label for="slippage">滑点（千分之）<input type="number" id="slippage" value="0.5" min="0" step="0.1"></label>
           <label for="band">调仓容差（%）<input type="number" id="band" value="1" min="0" step="0.5"></label>
           <label for="rf">无风险利率（%）<input type="number" id="rf" value="2" min="0" step="0.1"></label>
+          <label for="delistRecovery">退市回收比例（%）<input type="number" id="delistRecovery" value="100" min="0" max="100" step="10"></label>
         </div>
       </details>
 
@@ -320,7 +335,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
           <div class="chart" id="chart"></div>
           <div class="legend">
             <span><i style="background:var(--accent)"></i>策略净值</span>
-            <span><i style="background:var(--bench)"></i>基准（等权买入持有）</span>
+            <span><i style="background:var(--bench)"></i><span id="benchLabel">基准（等权买入持有）</span></span>
             <span><i style="background:var(--down)"></i>回撤</span>
           </div>
         </div>
@@ -502,6 +517,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
 <script src="rules.js"></script>
 <script src="research.js"></script>
 <script src="eastmoney.js"></script>
+<script src="stockpool.js"></script>
 <script src="sample-data.js"></script>
 <script>
 (function () {
@@ -551,9 +567,9 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   // ---------- 持久化（失败时静默，页面照常工作） ----------
   function store(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) { /* 存储不可用 */ } }
   function load(key) { try { return JSON.parse(localStorage.getItem(key)); } catch (e) { return null; } }
-  const TX_IDS = ['start', 'end', 'holdout', 'cash', 'commission', 'minCommission', 'slippage', 'band', 'rf'];
+  const TX_IDS = ['start', 'end', 'holdout', 'cash', 'commission', 'minCommission', 'slippage', 'band', 'rf', 'delistRecovery'];
   function saveSettings() {
-    const s = { config: state.config, source: state.source, onSymbols: $('#onSymbols').value, onAdjust: $('#onAdjust').value, autoRun: $('#autoRun').checked };
+    const s = { config: state.config, source: state.source, onSymbols: $('#onSymbols').value, onAdjust: $('#onAdjust').value, autoRun: $('#autoRun').checked, poolStart: $('#poolStart').value };
     TX_IDS.forEach((id) => (s[id] = $('#' + id).value));
     store(SETTINGS_KEY, s);
   }
@@ -589,7 +605,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     $('#cfg_sizing').value = c.sizing;
     $('#riskFields').innerHTML = Object.entries(AQ.RISK_PARAMS).map(([k, spec]) => paramInput('risk.' + k, spec, c[k])).join('');
     const f = c.factor;
-    const facOpts = (sel) => R.FACTORS.map((x) => `<option value="${x.id}" ${x.id === sel ? 'selected' : ''}>${esc(x.label)}</option>`).join('');
+    const facOpts = (sel) => R.FACTORS.map((x) => `<option value="${x.id}" ${x.id === sel ? 'selected' : ''}>${esc(x.label)}${x.needsFund || x.needsCap ? '（需个股池）' : ''}</option>`).join('');
     $('#factorList').innerHTML = f.factors.map((x, i) =>
       `<div class="factor-row"><label for="in_f${i}_id">因子<select id="in_f${i}_id" data-path="f${i}.id">${facOpts(x.id)}</select></label>` +
       paramInput(`f${i}.weight`, WEIGHT_SPEC, x.weight) +
@@ -657,6 +673,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   }
 
   function rawData() {
+    if (state.source === 'pool') return state.pool ? state.pool.data : {};
     return state.source === 'sample' ? window.AQ_SAMPLE : state.source === 'csv' ? state.csv : state.online;
   }
 
@@ -705,7 +722,8 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     const raw = rawData();
     const syms = Object.keys(raw || {});
     if (!syms.length) {
-      throw new Error(state.source === 'csv' ? '还没有上传 CSV 文件' : state.source === 'online' ? '还没有获取行情，先点"获取行情"' : '示例数据加载失败');
+      throw new Error(state.source === 'csv' ? '还没有上传 CSV 文件' : state.source === 'online' ? '还没有获取行情，先点"获取行情"'
+        : state.source === 'pool' ? (state.poolLoading ? '正在读取本地股票池…' : '股票池还没有数据，先点"获取 / 更新"') : '示例数据加载失败');
     }
     const keep = dateFilter();
     const out = {};
@@ -714,8 +732,9 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       const idx = [];
       src.dates.forEach((d, i) => { if (keep(d)) idx.push(i); });
       if (!idx.length) continue;
+      if (idx.length === src.dates.length) { out[s] = src; continue; } // 整段都在区间内：直接复用，省内存
       const pick = (arr) => (arr ? idx.map((i) => arr[i]) : undefined);
-      out[s] = { dates: pick(src.dates), open: pick(src.open), high: pick(src.high), low: pick(src.low), close: pick(src.close), volume: pick(src.volume) };
+      out[s] = { dates: pick(src.dates), open: pick(src.open), high: pick(src.high), low: pick(src.low), close: pick(src.close), volume: pick(src.volume), raw: pick(src.raw), turnover: pick(src.turnover) };
     }
     if (!Object.keys(out).length) throw new Error(holdoutCap() ? '所选区间都落在最终留出期内，请调整回测区间或留出期起始' : '所选日期区间内没有行情');
     for (const s of Object.keys(out)) AQ.em.checkPositive(out[s], s);
@@ -728,9 +747,23 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       fees: { commissionRate: (+$('#commission').value || 0) / 10000, minCommission: +$('#minCommission').value || 0 },
       slippage: (+$('#slippage').value || 0) / 1000,
       rebalanceBand: (+$('#band').value || 0) / 100,
+      meta: state.source === 'pool' && state.pool ? state.pool.meta : null,
+      delistRecovery: $('#delistRecovery').value === '' ? 1 : Math.min(Math.max(+$('#delistRecovery').value, 0), 100) / 100,
     };
   }
   const rf = () => (+$('#rf').value || 0) / 100;
+
+  // 回测与因子研究共用一个引擎：数据、区间、交易设置不变时不重建（个股池几百只标的，重建又慢又占内存）
+  let btMemo = null;
+  function sharedBacktester() {
+    const eng = engineOpts();
+    const key = JSON.stringify([state.source, state.dataVersion || 0, $('#start').value, $('#end').value, holdoutCap(), { ...eng, meta: !!eng.meta }]);
+    if (btMemo && btMemo.key === key) return btMemo.bt;
+    btMemo = null;
+    const bt = R.makeBacktester(activeData(), eng);
+    btMemo = { key, bt };
+    return bt;
+  }
 
   function updateDataInfo() {
     const raw = rawData() || {};
@@ -816,6 +849,9 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
             ? AQ.em.proportional(await fetchEastmoney(s, start, end, 'hfq'), await fetchEastmoney(s, start, end, 'none'), s)
             : await fetchEastmoney(s, start, end, adjust);
           AQ.em.checkPositive(got[s], s);
+          // 不复权价与换手率只有个股池用得到；这里不保存，免得超出浏览器 5MB 的本地存储上限
+          delete got[s].raw;
+          delete got[s].turnover;
           break;
         } catch (e) {
           if (attempt >= 3 || /没有数据|不能用于回测/.test(e.message)) {
@@ -842,6 +878,69 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     el.className = isErr ? 'error' : 'note';
   }
 
+  // ---------- 个股股票池（沪深300 历史成分） ----------
+  async function loadMembers() {
+    if (!state.members) {
+      const r = await fetch('data/hs300_members.json', { cache: 'no-cache' });
+      if (!r.ok) throw new Error('成分数据加载失败（在 Claude 里打开时不可用，请用 GitHub Pages 地址）');
+      state.members = await r.json();
+    }
+    return state.members;
+  }
+  const poolRange = () => [$('#poolStart').value + '-01-01', new Date().toISOString().slice(0, 10)];
+  function poolStatus(msg, isErr) {
+    const el = $('#poolStatus');
+    el.textContent = msg;
+    el.className = isErr ? 'error' : 'note';
+  }
+  async function loadPool() {
+    state.poolLoading = true;
+    try {
+      if (!AQ.pool || typeof indexedDB === 'undefined') throw new Error('当前浏览器不支持本地数据库，无法使用股票池');
+      const m = await loadMembers();
+      const [a, b] = poolRange();
+      state.pool = await AQ.pool.load(m, a, b);
+      const c = state.pool.coverage;
+      poolStatus(`成分数据截至 ${m.asOf}（重建自 ${m.events} 次调整）。${a.slice(0, 4)} 年以来曾为成分 ${c.wanted} 只，本地已有 ${c.got} 只` +
+        (c.missing.length ? `，缺 ${c.missing.length} 只：点"获取 / 更新"补齐（已退市且东方财富没有行情的会一直缺）。` : '。'));
+    } catch (e) {
+      state.pool = null;
+      poolStatus(e.message, true);
+    }
+    state.poolLoading = false;
+  }
+  async function onPoolFetch() {
+    let m;
+    try { m = await loadMembers(); } catch (e) { poolStatus(e.message, true); return; }
+    const [a, b] = poolRange();
+    state.poolStop = false;
+    $('#poolFetch').disabled = true;
+    $('#poolStop').hidden = false;
+    $('#poolProgress').hidden = false;
+    const t0 = Date.now();
+    let res;
+    try {
+      res = await AQ.pool.build(m, a, b, {
+        onProgress: (done, total, code, failed) => {
+          $('#poolProgress div').style.width = (100 * done / Math.max(total, 1)).toFixed(1) + '%';
+          poolStatus(`已完成 ${done} / ${total}${code ? '（' + code + '）' : ''}${failed.length ? `，失败 ${failed.length}` : ''}，用时 ${Math.round((Date.now() - t0) / 1000)} 秒`);
+        },
+        shouldStop: () => state.poolStop,
+      });
+    } catch (e) {
+      poolStatus(e.message, true);
+    }
+    $('#poolFetch').disabled = false;
+    $('#poolStop').hidden = true;
+    $('#poolProgress').hidden = true;
+    await loadPool();
+    if (res) {
+      const extra = res.stopped ? '已暂停，下次点"获取 / 更新"接着取。' : res.failed.length ? `${res.failed.length} 只失败：${res.failed.slice(0, 8).join('；')}${res.failed.length > 8 ? '…' : ''}` : '';
+      if (extra) poolStatus($('#poolStatus').textContent + ' ' + extra, res.failed.length > 0 && !res.stopped);
+    }
+    if (state.source === 'pool') dataChanged();
+  }
+
   function rangeChanged() {
     state.researchDirty = true;
     setDefaultSplit(true);
@@ -864,6 +963,8 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   }
 
   function dataChanged() {
+    state.dataVersion = (state.dataVersion || 0) + 1;
+    btMemo = null;
     updateDataInfo();
     updateHoldoutUI();
     state.researchDirty = true;
@@ -885,7 +986,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   function runBacktest() {
     showError('');
     try {
-      const bt = R.makeBacktester(activeData(), engineOpts());
+      const bt = sharedBacktester();
       const strategy = buildStrategy();
       const res = bt.run(strategy);
       const bench = bt.run(new AQ.BuyAndHold());
@@ -915,7 +1016,10 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     const { res, m, bm, bt, config } = state.last;
     const n = res.dates.length;
     $('#resTitle').textContent = describeStrategy(config) + (state.source === 'sample' ? '（示例数据）' : '');
-    $('#resMeta').textContent = `${res.dates[0]} ~ ${res.dates[n - 1]} · ${n} 个交易日 · ${bt.symbols.join(', ')}`;
+    const pit = !!bt.member;
+    $('#resMeta').textContent = `${res.dates[0]} ~ ${res.dates[n - 1]} · ${n} 个交易日 · ` +
+      (bt.symbols.length > 12 ? `${bt.symbols.length} 只标的${pit ? '（时点股票池）' : ''}` : bt.symbols.join(', '));
+    $('#benchLabel').textContent = pit ? '基准（当期成分等权）' : '基准（等权买入持有）';
     $('#kpis').innerHTML =
       kpi('累计收益', m.total_return, '基准 ' + fmt.pct(bm.total_return), fmt.pct) +
       kpi('年化收益', m.cagr, '基准 ' + fmt.pct(bm.cagr), fmt.pct) +
@@ -991,7 +1095,10 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     const bars = bt.bars();
     const i = res.dates.length - 1;
     const eq = res.equity[i];
-    const rows = bt.symbols.map((s) => {
+    // 标的很多（个股池）时只列持仓和下一交易日要交易的
+    const many = bt.symbols.length > 30;
+    const shown = many ? bt.symbols.filter((s) => res.finalShares[s] > 0 || (res.nextTargets && res.nextTargets[s] > 0)) : bt.symbols;
+    const rows = shown.map((s) => {
       const sh = res.finalShares[s];
       const w = sh * bars.close[s][i] / eq;
       const tgt = res.nextTargets ? res.nextTargets[s] : null;
@@ -1014,7 +1121,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     const ruleHeads = config.type === 'rules' ? config.rules.map((r) => `<th>${esc(AQ.RULES[r.id].label)}</th>`).join('') : '';
     $('#signalBody').innerHTML =
       `<div class="table-wrap"><table><thead><tr><th>代码</th><th>收盘</th><th>持股</th><th>仓位</th>${ruleHeads}<th>下一交易日</th></tr></thead><tbody>${rows}</tbody></table></div>` +
-      `<p class="note" style="margin-top:8px">${res.nextTargets ? '最后一个交易日收盘出现调仓信号，按回测规则在下一交易日开盘执行。' : '最后一个交易日没有新信号，维持现有持仓。'}数据更新到最新交易日后再看这里，就是明天的操作建议。</p>`;
+      `<p class="note" style="margin-top:8px">${many ? `共 ${bt.symbols.length} 只标的，这里只列持仓和下一交易日要买入的 ${shown.length} 只。` : ''}${res.nextTargets ? '最后一个交易日收盘出现调仓信号，按回测规则在下一交易日开盘执行。' : '最后一个交易日没有新信号，维持现有持仓。'}数据更新到最新交易日后再看这里，就是明天的操作建议。</p>`;
   }
 
   // ---------- 图表 ----------
@@ -1472,12 +1579,14 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   function runResearch() {
     let bt;
     try {
-      bt = R.makeBacktester(activeData(), engineOpts());
+      bt = sharedBacktester();
     } catch (e) {
       $('#tsTable').innerHTML = `<tbody><tr><td>${esc(e.message)}</td></tr></tbody>`;
       return;
     }
-    state.research = { bt, stats: bt.symbols.map((s) => R.seriesStats(bt, s)) };
+    // 个股池标的很多：序列特征只算前 40 只，避免页面卡顿
+    const statSyms = bt.symbols.length > 40 ? bt.symbols.slice(0, 40) : bt.symbols;
+    state.research = { bt, stats: statSyms.map((s) => R.seriesStats(bt, s)) };
     state.researchDirty = false;
     const st = state.research.stats;
     $('#tsTable').innerHTML = '<thead><tr><th>代码</th><th>天数</th><th>年化收益</th><th>年化波动</th><th>偏度</th><th>超额峰度</th><th>ACF(1)</th><th>VR(5)</th><th>VR(20)</th></tr></thead><tbody>' +
@@ -1490,7 +1599,7 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
       }).join('') + '</tbody>';
     const sel = $('#acfSym');
     const prev = sel.value;
-    sel.innerHTML = bt.symbols.map((s) => `<option value="${s}">${s}</option>`).join('');
+    sel.innerHTML = state.research.stats.map(({ symbol: s }) => `<option value="${s}">${s}</option>`).join('');
     if (bt.symbols.includes(prev)) sel.value = prev;
     renderAcf();
     renderIC();
@@ -1599,10 +1708,12 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
   TX_IDS.forEach((id) => { if (saved[id] !== undefined) $('#' + id).value = saved[id]; });
   if (saved.onSymbols) $('#onSymbols').value = saved.onSymbols;
   if (saved.onAdjust) $('#onAdjust').value = saved.onAdjust;
+  if (saved.poolStart) $('#poolStart').value = saved.poolStart;
   if (saved.autoRun === false) $('#autoRun').checked = false;
   const savedData = load(DATA_KEY);
   if (savedData) { state.csv = savedData.csv || {}; state.online = savedData.online || {}; }
-  const src = saved.source && Object.keys((saved.source === 'csv' ? state.csv : saved.source === 'online' ? state.online : { x: 1 })).length ? saved.source : 'sample';
+  const src = saved.source === 'pool' ? 'pool'
+    : saved.source && Object.keys((saved.source === 'csv' ? state.csv : saved.source === 'online' ? state.online : { x: 1 })).length ? saved.source : 'sample';
   setSource(src);
   renderCsvList();
   updateDataInfo();
@@ -1624,7 +1735,25 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     const b = e.target.closest('button[data-src]');
     if (!b || b.dataset.src === state.source) return;
     setSource(b.dataset.src);
+    if (b.dataset.src === 'pool' && !state.pool) {
+      updateDataInfo();
+      loadPool().then(() => { if (state.source === 'pool' && state.pool && state.pool.coverage.got) dataChanged(); else updateDataInfo(); });
+      return;
+    }
     if (Object.keys(rawData() || {}).length) dataChanged(); else updateDataInfo();
+  });
+  $('#poolFetch').addEventListener('click', onPoolFetch);
+  $('#poolStop').addEventListener('click', () => { state.poolStop = true; });
+  $('#poolClear').addEventListener('click', async () => {
+    if (!window.confirm('清空本机保存的全部股票池行情与财务数据？')) return;
+    try { await AQ.pool.dbClear(); } catch (e) { /* 忽略 */ }
+    await loadPool();
+    if (state.source === 'pool') dataChanged();
+  });
+  $('#poolStart').addEventListener('change', async () => {
+    saveSettings();
+    await loadPool();
+    if (state.source === 'pool') dataChanged();
   });
   $('#controls').addEventListener('input', (e) => { if (onConfigInput(e)) autoRun(); });
   $('#controls').addEventListener('change', (e) => {
@@ -1779,8 +1908,13 @@ tr.clickable:hover td, tr.sel td { background: var(--accent-soft); }
     }, 150);
   });
 
-  setDefaultSplit(false);
-  runBacktest();
+  if (src === 'pool') {
+    state.poolLoading = true;
+    loadPool().then(() => dataChanged());
+  } else {
+    setDefaultSplit(false);
+    runBacktest();
+  }
 })();
 </script>
 </html>

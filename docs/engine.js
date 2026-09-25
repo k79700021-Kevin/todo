@@ -67,9 +67,14 @@
 
   // ---------- 引擎 ----------
 
-  /* data: { symbol: { dates: ['YYYY-MM-DD'], open: [], close: [], volume?: [] } } */
+  /* data: { symbol: { dates: ['YYYY-MM-DD'], open: [], close: [], high?, low?, volume?, raw?: 不复权收盘, turnover?: 换手率% } }
+   * meta（可选，个股研究用）：
+   *   universe: { symbol: [[纳入日, 剔除日或 null], ...] }：时点股票池，纳入日当天起算、剔除日当天起不再是成分；
+   *     给出后，不在池内的标的不能新买入，基准为当期成分等权
+   *   delisted: { symbol: 退市日 }：此后仍持有的股份按最后价格 × delistRecovery 注销
+   *   fundamentals: { symbol: [{ report, notice, eps, bps, revYoy, profitYoy }] }：财务数据，公告日之后才可用 */
   class Backtester {
-    constructor(data, { initialCash = 1e6, fees = new FeeModel(), slippage = 0.0005, rebalanceBand = 0.01 } = {}) {
+    constructor(data, { initialCash = 1e6, fees = new FeeModel(), slippage = 0.0005, rebalanceBand = 0.01, meta = null, delistRecovery = 0 } = {}) {
       const symbols = Object.keys(data).sort();
       if (!symbols.length) throw new Error('没有行情数据');
       const dateSet = new Set();
@@ -77,13 +82,17 @@
       const dates = [...dateSet].sort();
       const pos = new Map(dates.map((d, i) => [d, i]));
       const n = dates.length;
-      const open = {}, close = {}, high = {}, low = {}, volume = {}, tradable = {}, prevClose = {};
+      const open = {}, close = {}, high = {}, low = {}, volume = {}, tradable = {}, prevClose = {}, raw = {}, turnover = {};
       for (const s of symbols) {
         const src = data[s];
-        const o = new Array(n).fill(NaN), c = new Array(n).fill(NaN), t = new Array(n).fill(false);
-        const h = new Array(n).fill(NaN), l = new Array(n).fill(NaN), v = new Array(n).fill(NaN);
+        // 开盘、收盘（涨跌停判断用）保持双精度；其余用单精度省内存（个股池有几百只标的）
+        const o = new Float64Array(n).fill(NaN), c = new Float64Array(n).fill(NaN), t = new Uint8Array(n);
+        const h = new Float32Array(n).fill(NaN), l = new Float32Array(n).fill(NaN), v = new Float32Array(n).fill(NaN);
+        const rw = src.raw ? new Float64Array(n).fill(NaN) : null, tv = src.turnover ? new Float32Array(n).fill(NaN) : null;
         src.dates.forEach((d, j) => {
           const i = pos.get(d);
+          if (rw) rw[i] = src.raw[j];
+          if (tv) tv[i] = src.turnover[j];
           o[i] = src.open[j];
           c[i] = src.close[j];
           // 缺少最高/最低价时用开盘、收盘近似
@@ -91,10 +100,12 @@
           l[i] = src.low ? src.low[j] : Math.min(o[i], c[i]);
           v[i] = src.volume ? src.volume[j] : NaN;
           const vol = src.volume ? src.volume[j] : 1;
-          t[i] = o[i] > 0 && c[i] > 0 && vol > 0; // 价格非正（坏数据）也视为不可交易
+          t[i] = o[i] > 0 && c[i] > 0 && vol > 0 ? 1 : 0; // 价格非正（坏数据）也视为不可交易
         });
         high[s] = h; low[s] = l; volume[s] = v;
-        const p = new Array(n).fill(NaN);
+        if (rw) raw[s] = rw;
+        if (tv) turnover[s] = tv;
+        const p = new Float64Array(n).fill(NaN);
         let last = NaN;
         for (let i = 0; i < n; i++) {
           p[i] = last;
@@ -102,7 +113,28 @@
         }
         open[s] = o; close[s] = c; tradable[s] = t; prevClose[s] = p;
       }
-      Object.assign(this, { symbols, dates, open, close, high, low, volume, tradable, prevClose, initialCash, fees, slippage, rebalanceBand });
+      Object.assign(this, { symbols, dates, open, close, high, low, volume, tradable, prevClose, raw, turnover, initialCash, fees, slippage, rebalanceBand });
+      this.meta = meta || {};
+      this.delistRecovery = delistRecovery;
+      // 时点股票池：member[s][i] = 1 表示第 i 天收盘时是成分股
+      this.member = null;
+      if (this.meta.universe) {
+        this.member = {};
+        for (const s of symbols) {
+          const m = new Uint8Array(n);
+          for (const [from, to] of this.meta.universe[s] || []) {
+            for (let i = 0; i < n; i++) if (dates[i] >= from && (!to || dates[i] < to)) m[i] = 1;
+          }
+          this.member[s] = m;
+        }
+      }
+      // 退市：第一个晚于退市日的交易日序号
+      this.delistAt = {};
+      for (const [s, d] of Object.entries(this.meta.delisted || {})) {
+        if (!symbols.includes(s)) continue;
+        const i = dates.findIndex((x) => x > d);
+        if (i >= 0) this.delistAt[s] = i;
+      }
     }
 
     closeFfill() {
@@ -112,19 +144,26 @@
     ffill(panel) {
       const out = {};
       for (const s of this.symbols) {
+        if (!panel[s]) continue;
         let last = NaN;
-        out[s] = panel[s].map((v) => (Number.isFinite(v) ? (last = v) : last));
+        out[s] = Array.from(panel[s], (v) => (Number.isFinite(v) ? (last = v) : last));
       }
       return out;
     }
 
-    // 停牌日前向填充后的完整行情，按需构建并缓存，供需要高低价、成交量的策略使用
+    // 停牌日前向填充后的完整行情，各项在第一次用到时才构建并缓存（个股池省内存）
     bars() {
       if (!this._bars) {
-        this._bars = {
-          open: this.ffill(this.open), high: this.ffill(this.high), low: this.ffill(this.low),
-          close: this.closeFfill(), volume: this.volume, cache: new Map(),
-        };
+        const self = this;
+        const lazy = {};
+        const b = { volume: this.volume, turnover: this.turnover, member: this.member, meta: this.meta, dates: this.dates, cache: new Map() };
+        for (const k of ['open', 'high', 'low', 'close', 'raw']) {
+          Object.defineProperty(b, k, {
+            enumerable: true,
+            get() { return lazy[k] || (lazy[k] = self.ffill(self[k])); },
+          });
+        }
+        this._bars = b;
       }
       return this._bars;
     }
@@ -153,6 +192,19 @@
       const ctx = { shares, book };
 
       dates.forEach((d, i) => {
+        // 退市：仍持有的股份按最后价格 × 回收比例注销，记为一笔卖出
+        for (const s in this.delistAt) {
+          if (i < this.delistAt[s]) continue;
+          if (pending) pending.delete(s);
+          if (!shares[s]) continue;
+          const price = lastClose[s] * this.delistRecovery;
+          const amount = shares[s] * price;
+          cash += amount;
+          trades.push({ date: d, symbol: s, side: 'sell', shares: shares[s], price, amount, fee: 0, delisted: true });
+          shares[s] = 0;
+          book[s] = { cost: NaN, entry: -1, exit: i };
+        }
+        if (pending && !pending.size) pending = null;
         if (pending) [cash, pending] = this.rebalance(i, pending, cash, shares, lastClose, trades, book);
         let value = 0;
         for (const s of symbols) {
@@ -273,8 +325,21 @@
   class BuyAndHold {
     constructor() { this.name = 'buy_hold'; }
     params() { return {}; }
-    generate(close, dates, symbols) {
+    generate(close, dates, symbols, bars) {
       const out = dates.map(() => null);
+      const member = bars && bars.member;
+      if (member) {
+        // 时点股票池：持有当期全部成分股等权，成分变化时调仓
+        let prev = '';
+        dates.forEach((_, i) => {
+          const on = symbols.map((s) => member[s][i] === 1 && Number.isFinite(close[s][i]));
+          const key = on.map(Number).join('');
+          const count = on.filter(Boolean).length;
+          if (key !== prev && count) out[i] = on.map((x) => (x ? 1 / count : 0));
+          prev = key;
+        });
+        return out;
+      }
       const i = dates.findIndex((_, k) => symbols.every((s) => Number.isFinite(close[s][k])));
       if (i >= 0) out[i] = symbols.map(() => 1 / symbols.length);
       return out;
@@ -308,12 +373,13 @@
     params() {
       return { lookback: this.lookback, top_n: this.topN, rebalance: this.rebalance, abs_filter: this.absFilter };
     }
-    generate(close, dates, symbols) {
+    generate(close, dates, symbols, bars) {
       const out = dates.map(() => null);
       const top = Math.min(this.topN, symbols.length);
+      const member = bars && bars.member;
       for (let i = this.lookback; i < dates.length; i += this.rebalance) {
         let scores = symbols
-          .map((s, k) => [k, close[s][i] / close[s][i - this.lookback] - 1])
+          .map((s, k) => [k, member && !member[s][i] ? NaN : close[s][i] / close[s][i - this.lookback] - 1])
           .filter(([, v]) => Number.isFinite(v));
         if (this.absFilter) scores = scores.filter(([, v]) => v > 0);
         scores.sort((a, b) => b[1] - a[1]);
