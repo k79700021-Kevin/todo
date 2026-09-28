@@ -260,3 +260,44 @@ test('6c: resuming after the source revised the last settled close is reported',
   assert.equal(r.revisions.length, 1);
   close(r.revisions[0].now / r.revisions[0].frozen, 1.2, 1e-9);
 });
+
+// ---------- 9. 真实数据发现：东方财富后复权是仿射的（不复权 × a + b），不能按比例缩放当作等比复权 ----------
+test('9a: an affine back-adjusted series does not leak cash into the account', () => {
+  const n = 250;
+  const dates = dayList(n);
+  let x = 9, p = 1600;
+  const rnd = () => ((x = (x * 1664525 + 1013904223) >>> 0) / 4294967296);
+  const raw = dates.map(() => +(p *= 1 + (rnd() - 0.5) * 0.04).toFixed(2));
+  // 600519 在 2024 年 6 月的实测关系：后复权 ≈ 5.0246 × 不复权 + 931
+  const hfq = raw.map((r) => +(5.0246 * r + 931).toFixed(2));
+  const em = require(path.join(docs, 'eastmoney.js'));
+  const mk = (arr) => ({ dates, open: arr.slice(), high: arr.slice(), low: arr.slice(), close: arr.slice(), volume: dates.map(() => 1e5), turnover: dates.map(() => 1) });
+  const bars = em.proportional(mk(hfq), mk(raw), '600519');
+  // 缩放后的"复权价"日收益被压缩（这就是为什么不能用它）
+  const r1 = bars.close[10] / bars.close[9] - 1, r0 = raw[10] / raw[9] - 1;
+  assert.ok(Math.abs(r1) < Math.abs(r0) * 0.95, `${r1} vs ${r0}`);
+  const bt = new AQ.Backtester({ '600519': bars }, { initialCash: 1e7, fees: free(), slippage: 0, rebalanceBand: 0 });
+  const res = bt.run(new AQ.BuyAndHold());
+  assert.equal(res.inferredActions, 0, '漂移不是公司行为');
+  assert.ok(bt.caNoise > 0);
+  const buy = res.trades[0];
+  close(res.equity[n - 1], 1e7 - buy.amount - buy.fee + buy.shares * raw[n - 1], 1e-6, '净值 = 现金 + 股数 × 真实价，没有凭空的分红');
+});
+
+test('9b: self-built proportional adjustment from raw prices and dividend details (600519, 2024-06-19)', () => {
+  const em = require(path.join(docs, 'eastmoney.js'));
+  const dates = ['2024-06-17', '2024-06-18', '2024-06-19', '2024-06-20'];
+  const c = [1541.5, 1521.5, 1501.0, 1500.1];
+  const raw = { dates, open: c.slice(), high: c.slice(), low: c.slice(), close: c.slice(), volume: [1, 1, 1, 1], turnover: [1, 1, 1, 1] };
+  const bars = em.adjustFromEvents(raw, [{ date: '2024-06-19', cash: 30.876, bonus: 0 }], '600519');
+  const exRef = 1521.5 - 30.876;
+  close(bars.close[2] / bars.close[1] - 1, 1501 / exRef - 1, 1e-12, '除息日：含分红的总收益');
+  close(bars.close[1] / bars.close[0] - 1, 1521.5 / 1541.5 - 1, 1e-12, '非除息日：等于真实涨跌');
+  close(bars.close[3] / bars.close[2] - 1, 1500.1 / 1501 - 1, 1e-12);
+  assert.equal(bars.close[3], 1500.1, '最新价格不变');
+  assert.deepEqual(bars.raw, c);
+  // 与明细一起进引擎：事件与复权因子完全对得上，没有漂移
+  const bt = new AQ.Backtester({ '600519': bars }, { meta: { corporateActions: { '600519': [{ date: '2024-06-19', cash: 30.876, bonus: 0 }] } } });
+  assert.equal(bt.caMismatch.length, 0);
+  assert.equal(bt.caNoise, 0);
+});

@@ -226,6 +226,7 @@
        *   不凭空增加股数与市场暴露；推断次数在结果里报告。 */
       this.caEvents = {};
       this.caMismatch = []; // 明细与复权因子对不上的事件（数据源之一有误），供页面提示
+      this.caNoise = 0;     // 复权因子的小幅或不持续的漂移（近似复权数据），不当作公司行为
       const explicit = this.meta.corporateActions || {};
       for (const s of symbols) {
         const ev = new Map();
@@ -245,9 +246,20 @@
         }
         const ca = caf[s];
         if (ca) {
+          /* 没有明细对应的复权跳变：只接受"幅度 ≥ 2% 且之后几天复权因子维持在新水平"的，才视为一次公司行为。
+           * 东方财富的后复权是仿射的（不复权 × a + b），据此缩放的复权价与真实价之比会随股价每天漂移；
+           * 这些漂移不是公司行为，若当成分红，下跌日会凭空得到现金。它们只计数（caNoise）。 */
+          const g = gfac[s];
           for (let i = 0; i < n; i++) {
             if (ca[i] === 1 || ev.has(i)) continue;
-            ev.set(i, { factor: ca[i], source: 'inferred' });
+            let persistent = Math.abs(ca[i] - 1) >= 0.02, seen = 0;
+            for (let t = i + 1; t < n && seen < 3 && persistent; t++) {
+              if (!(px[t] > 0)) continue;
+              seen++;
+              if (Math.abs(g[t] / g[i] - 1) > 0.005) persistent = false;
+            }
+            if (persistent) ev.set(i, { factor: ca[i], source: 'inferred' });
+            else this.caNoise++;
           }
           // 对账：明细事件隐含的复权因子跳变 = 前收 / 除权参考价，应与观察到的跳变一致（容差含分位舍入）
           for (const [i, e] of ev) {

@@ -8,7 +8,7 @@
   const DB_NAME = 'aq-stockpool';
   const STORE = 'stocks';
   const WARMUP_DAYS = 420; // 纳入前预留约 280 个交易日，供 250 日指标预热
-  const VERSION = 3;       // 本地记录格式：2 = 含股本变动历史、原始净利润与更新日；3 = 股本双时态（生效日 + 公告日）、分红送配明细
+  const VERSION = 4;       // 本地记录格式：2 = 股本变动历史；3 = 股本双时态、分红送配明细；4 = 复权价由不复权价与分红送配明细自建（不再缩放东方财富的仿射后复权）
   const INDEX_KEY = 'IDX000300';
 
   const addDays = (d, n) => {
@@ -89,7 +89,8 @@
       const ratio = have / wanted;
       if (ratio < minDaily) { minDaily = ratio; worst = { date: d, ratio, wanted, missing: lack.slice(0, 50) }; }
     }
-    const coverage = { wanted: Object.keys(want).length, got, missing, minDaily, worst, stale: Object.values(records).filter((r) => r.code !== INDEX_KEY && r.v !== VERSION).length };
+    const approxAdj = Object.keys(data).filter((code) => records[code] && records[code].bars && records[code].bars.adj !== 'events').length;
+    const coverage = { wanted: Object.keys(want).length, got, missing, minDaily, worst, approxAdj, stale: Object.values(records).filter((r) => r.code !== INDEX_KEY && r.v !== VERSION).length };
     if (strict && (minDaily < minCoverage || (!days.size && coverage.wanted))) {
       const w = worst ? `最低的一天 ${worst.date} 为 ${(worst.ratio * 100).toFixed(1)}%（${worst.wanted} 只应在池内，缺 ${worst.wanted - Math.round(worst.ratio * worst.wanted)} 只：${worst.missing.slice(0, 10).join('、')}${worst.missing.length > 10 ? '…' : ''}）` : '没有任何行情';
       throw new Error(`时点股票池覆盖率不足 ${(minCoverage * 100).toFixed(1)}%：${w}。缺数据的历史成分不能静默删除（幸存者偏差）；请补齐数据，或关闭严格模式后自行承担偏差。`);
@@ -181,19 +182,18 @@
     }
   }
 
-  // 一只股票：后复权 + 不复权（含换手率）→ 等比前复权；财务主要指标；股本变动历史
+  /* 一只股票：不复权行情（含换手率）+ 分红送配明细 → 自建等比前复权；明细取不到时退回"缩放后复权"（近似，记 adj = 'hfq'）；
+   * 另取财务主要指标、股本变动历史。 */
   async function fetchStock(code, from, to) {
     const k = (adj) => withRetry(async () => em.parseKlines(await jsonp((cb) => em.klineUrl(code, from, to, adj, cb)), code));
-    const hfq = await k('hfq');
     const raw = await k('none');
-    const bars = em.proportional(hfq, raw, code);
+    let ca = null;
+    try { ca = em.parseBonus(await withRetry(() => jsonp((cb) => em.bonusUrl(code, cb)))); } catch (e) { ca = null; }
+    const bars = ca ? em.adjustFromEvents(raw, ca, code) : em.proportional(await k('hfq'), raw, code);
     let fin = [];
     try { fin = em.parseFinance(await withRetry(() => jsonp((cb) => em.financeUrl(code, cb)))); } catch (e) { /* 财务数据缺失不影响行情 */ }
     let shares = [];
     try { shares = em.parseShares(await withRetry(() => jsonp((cb) => em.sharesUrl(code, cb)))); } catch (e) { /* 缺股本时估值退回每股口径 */ }
-    // 分红送配明细：取不到时为 null，回测对复权因子跳变按"价值不变折现"处理并计数
-    let ca = null;
-    try { ca = em.parseBonus(await withRetry(() => jsonp((cb) => em.bonusUrl(code, cb)))); } catch (e) { ca = null; }
     return { code, v: VERSION, name: raw.name || hfq.name || '', bars, fin, shares, ca, from, to, fetched: new Date().toISOString().slice(0, 10) };
   }
 
@@ -236,7 +236,7 @@
     return assemble(members, await dbAll(), start, end, opts);
   }
 
-  const api = { plan, trim, assemble, build, load, dbAll, dbClear, WARMUP_DAYS, VERSION, INDEX_KEY };
+  const api = { plan, trim, assemble, build, load, dbAll, dbClear, jsonp, WARMUP_DAYS, VERSION, INDEX_KEY };
   if (isNode) module.exports = api;
   else root.AQ.pool = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

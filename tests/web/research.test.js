@@ -665,7 +665,7 @@ test('stock pool: plan windows, trim with warmup, assemble meta and coverage', (
   const dates = dayList(4000);
   const mk = () => ({ dates, open: dates.map(() => 10), close: dates.map(() => 10), volume: dates.map(() => 1) });
   const out = pool.assemble(members, { '600002': { code: '600002', bars: mk(), fin: [{ report: '2012-12-31', notice: '2013-03-01', eps: 1 }] } }, '2012-01-01', '2020-12-31');
-  const { minDaily, worst, ...cov } = out.coverage;
+  const { minDaily, worst, approxAdj, ...cov } = out.coverage;
   assert.deepEqual(cov, { wanted: 2, got: 1, missing: ['600003'], stale: 1 }, '没有版本号的旧记录计为待更新');
   assert.ok(minDaily <= 0.5 && worst.missing.includes('600003'));
   assert.throws(() => pool.assemble(members, { '600002': { code: '600002', bars: mk(), fin: [] } }, '2012-01-01', '2020-12-31', { strict: true }), /覆盖率/);

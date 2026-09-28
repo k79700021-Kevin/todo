@@ -240,7 +240,7 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
             <button type="button" class="linkbtn" id="poolClear">清空本地股票池</button>
           </div>
           <div class="progress" id="poolProgress" hidden><div></div></div>
-          <p class="note" id="poolStatus">首次获取每只股票要请求 5 次，几百只股票需要几分钟，可以随时暂停，下次接着取。数据存在本机浏览器。</p>
+          <p class="note" id="poolStatus">首次获取每只股票要请求 4 次，几百只股票需要几分钟，可以随时暂停，下次接着取。数据存在本机浏览器。</p>
         </div>
         <p class="note" id="dataInfo"></p>
       </section>
@@ -1034,10 +1034,18 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
       // 东方财富偶尔直接断开连接，失败后稍等重试，最多 3 次；仍失败则跳过这只
       for (let attempt = 1; ; attempt++) {
         try {
-          // 等比前复权 = 后复权价按最新真实价缩放，需要后复权与不复权两份数据
-          got[s] = adjust === 'qfq'
-            ? AQ.em.proportional(await fetchEastmoney(s, start, end, 'hfq'), await fetchEastmoney(s, start, end, 'none'), s)
-            : await fetchEastmoney(s, start, end, adjust);
+          // 等比前复权：股票用不复权价 + 分红送配明细自建（东方财富的后复权是仿射的，缩放后日收益会被压缩）；
+          // ETF 或明细取不到时退回"后复权按最新真实价缩放"的近似
+          if (adjust === 'qfq') {
+            const raw = await fetchEastmoney(s, start, end, 'none');
+            let ca = null;
+            if (!AQ.isEtf(s) && AQ.pool) {
+              try { ca = AQ.em.parseBonus(await AQ.pool.jsonp((cb) => AQ.em.bonusUrl(s, cb))); } catch (e) { ca = null; }
+            }
+            got[s] = ca ? AQ.em.adjustFromEvents(raw, ca, s) : AQ.em.proportional(await fetchEastmoney(s, start, end, 'hfq'), raw, s);
+          } else {
+            got[s] = await fetchEastmoney(s, start, end, adjust);
+          }
           AQ.em.checkPositive(got[s], s);
           // 不复权价与换手率只有个股池用得到；这里不保存，免得超出浏览器 5MB 的本地存储上限
           delete got[s].raw;
@@ -1106,6 +1114,7 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
         (c.stale ? ` 其中 ${c.stale} 只是旧格式（缺分红送配明细或股本公告日：公司行为只能从复权因子推断、报告期股本可能偏差），点"获取 / 更新"会重新获取。` : '') +
         (state.pool.meta.index ? '' : ' 还没有沪深300 指数行情（获取 / 更新时一并取）。') +
         (c.got ? ` 逐日覆盖率最低 ${(c.minDaily * 100).toFixed(1)}%${c.worst ? '（' + c.worst.date + '）' : ''}。` : '') +
+        (c.approxAdj ? ` ${c.approxAdj} 只的复权价是近似的（没有分红送配明细，由东方财富后复权缩放，非除权日收益被压缩），点"获取 / 更新"重新获取。` : '') +
         (state.pool.blocked ? ' ' + state.pool.blocked : ''), !!state.pool.blocked);
     } catch (e) {
       state.pool = null;

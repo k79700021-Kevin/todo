@@ -96,8 +96,10 @@
       }));
   }
 
-  /* 等比前复权：后复权价（按比例调整，恒为正）整体乘以"最新不复权价 / 最新后复权价"，
-   * 使最新价格等于真实股价。东方财富自带的前复权是减法调整，分红多的股票早年价格会变成 0 或负数。 */
+  /* 近似的等比前复权：后复权价整体乘以"最新不复权价 / 最新后复权价"，使最新价格等于真实股价。
+   * 只在拿不到分红送配明细时使用（ETF、明细接口失败）：东方财富的后复权是"不复权 × a + b"的仿射形式，
+   * 缩放后非除权日的收益会被压缩（分红越多压缩越多）；有明细时用 adjustFromEvents。
+   * 东方财富自带的前复权是减法调整，分红多的股票早年价格会变成 0 或负数，也不能用。 */
   function proportional(hfq, raw, sym) {
     const rawClose = new Map(raw.dates.map((d, i) => [d, raw.close[i]]));
     let k = hfq.dates.length - 1;
@@ -107,7 +109,7 @@
     const scale = (a) => a.map((v) => v * f);
     const out = {
       dates: hfq.dates.slice(), open: scale(hfq.open), high: scale(hfq.high), low: scale(hfq.low),
-      close: scale(hfq.close), volume: hfq.volume.slice(),
+      close: scale(hfq.close), volume: hfq.volume.slice(), adj: 'hfq',
     };
     // 个股研究用：对齐后的不复权收盘价与换手率（市值、估值因子需要）
     if (raw.turnover) {
@@ -115,6 +117,37 @@
       out.raw = hfq.dates.map((d) => rawClose.get(d) ?? NaN);
       out.turnover = hfq.dates.map((d) => rawTv.get(d) ?? NaN);
     }
+    return out;
+  }
+
+  /* 等比前复权（自建）：用不复权 OHLC 与分红送配明细构造，最新价格不变。
+   * 除权除息日 e（明细日期及以后的第一个交易日）的比例 r_e = 除权参考价 / 前收，除权参考价 = (前收 − 每股派现) / (1 + 每股送转)；
+   * 复权价_t = 不复权价_t × Π_{e > t} r_e。于是非除权日的复权收益 = 真实涨跌，除权日的复权收益 = 含分红再投资的总收益。
+   * 不用东方财富的后复权缩放：它是"不复权 × a + b"的仿射形式（分红按加法累计），按比例缩放后非除权日的收益会被压缩
+   * （例如 000001 在 2024 年约 0.88 倍、600519 约 0.90 倍）。配股不在明细里，不做调整（不认购的持有人确实承担这部分损失）。 */
+  function adjustFromEvents(raw, events, sym) {
+    const n = raw.dates.length;
+    if (!n) throw new Error(`${sym}：没有不复权数据`);
+    const ratios = [];
+    for (const e of events || []) {
+      let i = raw.dates.findIndex((d) => d >= e.date);
+      if (i <= 0) continue;
+      let k = i - 1;
+      while (k >= 0 && !(raw.close[k] > 0)) k--;
+      if (k < 0) continue;
+      const prev = raw.close[k], exRef = (prev - (e.cash || 0)) / (1 + (e.bonus || 0));
+      if (exRef > 0) ratios.push([i, exRef / prev]);
+    }
+    ratios.sort((a, b) => a[0] - b[0]);
+    const f = new Float64Array(n);
+    let acc = 1, p = ratios.length - 1;
+    for (let t = n - 1; t >= 0; t--) {
+      while (p >= 0 && ratios[p][0] > t) { acc *= ratios[p][1]; p--; }
+      f[t] = acc;
+    }
+    const scale = (a) => a.map((v, i) => v * f[i]);
+    const out = { dates: raw.dates.slice(), open: scale(raw.open), high: scale(raw.high), low: scale(raw.low), close: scale(raw.close), volume: raw.volume.slice(), adj: 'events' };
+    if (raw.turnover) { out.raw = raw.close.slice(); out.turnover = raw.turnover.slice(); }
     return out;
   }
 
@@ -129,7 +162,7 @@
     return d;
   }
 
-  const api = { market, klineUrl, parseKlines, proportional, checkPositive, financeUrl, parseFinance, sharesUrl, parseShares, bonusUrl, parseBonus, indexKlineUrl };
+  const api = { market, klineUrl, parseKlines, proportional, checkPositive, financeUrl, parseFinance, sharesUrl, parseShares, bonusUrl, parseBonus, adjustFromEvents, indexKlineUrl };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else (root.AQ = root.AQ || {}).em = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

@@ -14,6 +14,11 @@ const SYMBOLS = ['510300', '510500', '159915', '600519', '000333', '300750', '68
 const START = '2016-01-01';
 const END = new Date().toISOString().slice(0, 10);
 const BASE = process.env.EM_BASE; // 测试时可指向本地假服务
+// 东方财富会断开不像浏览器的请求（境外网络尤其明显），与 Python 版一样带浏览器请求头
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+  Referer: 'https://quote.eastmoney.com/',
+};
 
 async function fetchRaw(sym, adjust) {
   const cb = 'cb_' + sym;
@@ -21,7 +26,7 @@ async function fetchRaw(sym, adjust) {
   if (BASE) url = url.replace('https://push2his.eastmoney.com', BASE);
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const res = await fetch(url, { headers: { Referer: 'https://quote.eastmoney.com/' } });
+      const res = await fetch(url, { headers: HEADERS });
       const text = await res.text();
       const m = text.match(new RegExp(`^\\s*${cb}\\(([\\s\\S]*)\\);?\\s*$`));
       if (!m) throw new Error(`返回不是预期的 JSONP：${text.slice(0, 120)}`);
@@ -34,9 +39,29 @@ async function fetchRaw(sym, adjust) {
   }
 }
 
-// 与网页"等比前复权"相同：后复权 + 不复权两份数据
+// 分红送配明细（数据中心接口，JSONP）
+async function fetchBonus(sym) {
+  const cb = 'cbb_' + sym;
+  let url = em.bonusUrl(sym, cb);
+  if (BASE) url = url.replace('https://datacenter.eastmoney.com', BASE);
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const text = await (await fetch(url, { headers: HEADERS })).text();
+      const m = text.match(new RegExp(`^\\s*${cb}\\(([\\s\\S]*)\\);?\\s*$`));
+      if (!m) throw new Error(`返回不是预期的 JSONP：${text.slice(0, 120)}`);
+      return em.parseBonus(JSON.parse(m[1]));
+    } catch (e) {
+      if (attempt === 3) throw e;
+      await new Promise((r) => setTimeout(r, 2000 * attempt));
+    }
+  }
+}
+
+// 与网页"等比前复权"相同：股票用不复权价 + 分红送配明细自建；ETF 用后复权按最新真实价缩放
 async function fetchOne(sym) {
-  return em.checkPositive(em.proportional(await fetchRaw(sym, 'hfq'), await fetchRaw(sym, 'none'), sym), sym);
+  const raw = await fetchRaw(sym, 'none');
+  const bars = AQ.isEtf(sym) ? em.proportional(await fetchRaw(sym, 'hfq'), raw, sym) : em.adjustFromEvents(raw, await fetchBonus(sym), sym);
+  return em.checkPositive(bars, sym);
 }
 
 function check(sym, d) {
