@@ -99,11 +99,89 @@ def _eastmoney_request(symbol: str, start: str, end: str, fqt: int, retries: int
     return parse_eastmoney(payload, symbol)
 
 
-def proportional_adjust(hfq: pd.DataFrame, raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
-    """等比前复权：后复权价（按比例调整，恒为正）整体乘以"最新不复权价 / 最新后复权价"。
+EASTMONEY_DC = "https://datacenter.eastmoney.com/securities/api/data/v1/get"
 
-    东方财富自带的前复权是减法调整，分红多的股票早年价格会被减成 0 或负数，无法用于回测。
-    与网页版 docs/eastmoney.js 的 proportional 算法相同。
+
+def eastmoney_secucode(symbol: str) -> str:
+    if eastmoney_market(symbol) == 1:
+        return f"{symbol}.SH"
+    return f"{symbol}.BJ" if symbol.startswith(("4", "8", "92")) else f"{symbol}.SZ"
+
+
+def parse_bonus(payload: dict) -> list[dict]:
+    """分红送配明细（只取已实施）：[{date: 除权除息日, cash: 每股派现（税前）, bonus: 每股送转}]，与网页版 parseBonus 相同。"""
+    rows = ((payload or {}).get("result") or {}).get("data") or []
+    out = []
+    for r in rows:
+        if not r.get("EX_DIVIDEND_DATE") or r.get("ASSIGN_PROGRESS") != "实施分配":
+            continue
+        cash = round(float(r.get("PRETAX_BONUS_RMB") or 0) / 10, 8)
+        bonus = round(float(r.get("BONUS_IT_RATIO") or 0) / 10, 8)
+        if cash > 0 or bonus > 0:
+            out.append({"date": r["EX_DIVIDEND_DATE"][:10], "cash": cash, "bonus": bonus})
+    return sorted(out, key=lambda e: e["date"])
+
+
+def _eastmoney_bonus(symbol: str, retries: int, retry_wait: float) -> list[dict]:
+    query = urllib.parse.urlencode(
+        {
+            "reportName": "RPT_SHAREBONUS_DET",
+            "columns": "EX_DIVIDEND_DATE,PRETAX_BONUS_RMB,BONUS_IT_RATIO,ASSIGN_PROGRESS",
+            "filter": f'(SECUCODE="{eastmoney_secucode(symbol)}")',
+            "pageSize": 200,
+            "sortColumns": "EX_DIVIDEND_DATE",
+            "sortTypes": 1,
+        }
+    )
+    request = urllib.request.Request(f"{EASTMONEY_DC}?{query}", headers=EASTMONEY_HEADERS)
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(request, timeout=15) as resp:
+                return parse_bonus(json.loads(resp.read().decode("utf-8")))
+        except OSError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(retry_wait * 2**attempt)
+    return []
+
+
+def adjust_from_events(raw: pd.DataFrame, events: list[dict]) -> pd.DataFrame:
+    """等比前复权（自建）：不复权价 × Π(之后各除权除息日的 除权参考价 / 前收)，最新价格不变。
+
+    除权参考价 = (前收 − 每股派现) / (1 + 每股送转)。非除权日的复权收益等于真实涨跌，除权日等于含分红再投资的总收益。
+    东方财富的后复权是"不复权 × a + b"的仿射形式，按比例缩放后非除权日的收益会被压缩，所以不用它。
+    与网页版 docs/eastmoney.js 的 adjustFromEvents 相同。
+    """
+    close = raw["close"].to_numpy(dtype=float)
+    dates = raw.index
+    n = len(close)
+    ratios = []
+    for e in events:
+        i = int(dates.searchsorted(pd.Timestamp(e["date"])))
+        if i <= 0 or i >= n:
+            continue
+        k = i - 1
+        while k >= 0 and not close[k] > 0:
+            k -= 1
+        if k < 0:
+            continue
+        prev = close[k]
+        ex_ref = (prev - e.get("cash", 0)) / (1 + e.get("bonus", 0))
+        if ex_ref > 0:
+            ratios.append((i, ex_ref / prev))
+    factor = np.ones(n)
+    for i, r in ratios:
+        factor[:i] *= r
+    out = raw.copy()
+    out[["open", "high", "low", "close"]] = out[["open", "high", "low", "close"]].mul(factor, axis=0)
+    return out
+
+
+def proportional_adjust(hfq: pd.DataFrame, raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """近似的等比前复权：后复权价整体乘以"最新不复权价 / 最新后复权价"。
+
+    只在拿不到分红送配明细时使用（ETF、明细接口失败）：东方财富的后复权是仿射的（不复权 × a + b），
+    缩放后非除权日的收益会被压缩。东方财富自带的前复权是减法调整，分红多的股票早年价格会被减成 0 或负数。
     """
     common = hfq.index.intersection(raw.index[raw["close"] > 0])
     if common.empty:
@@ -126,16 +204,25 @@ def load_eastmoney(
 ) -> pd.DataFrame:
     """直接请求东方财富日线接口（网页版 docs/eastmoney.js 使用同一接口），不依赖 akshare。
 
-    adjust："qfq" 为等比前复权（默认），"hfq" 后复权，"" 或 "none" 不复权。
+    adjust："qfq" 为等比前复权（默认；股票由不复权价与分红送配明细自建，ETF 用后复权缩放近似），"hfq" 后复权，"" 或 "none" 不复权。
     """
-    tag = {"qfq": "qfq-ratio", "hfq": "hfq"}.get(adjust, "none")
+    tag = {"qfq": "qfq-events", "hfq": "hfq"}.get(adjust, "none")
     cache = Path(cache_dir) / f"{symbol}_{tag}_{start}_{end}.csv"
     if cache.exists():
         return normalize_bars(pd.read_csv(cache))
     if adjust == "qfq":
-        hfq = _eastmoney_request(symbol, start, end, FQT["hfq"], retries, retry_wait)
         raw = _eastmoney_request(symbol, start, end, FQT["none"], retries, retry_wait)
-        df = proportional_adjust(hfq, raw, symbol)
+        events = None
+        if not is_etf(symbol):
+            try:
+                events = _eastmoney_bonus(symbol, retries, retry_wait)
+            except (OSError, ValueError):
+                events = None
+        if events is not None:
+            df = adjust_from_events(raw, events)
+        else:
+            hfq = _eastmoney_request(symbol, start, end, FQT["hfq"], retries, retry_wait)
+            df = proportional_adjust(hfq, raw, symbol)
     else:
         df = _eastmoney_request(symbol, start, end, FQT[adjust], retries, retry_wait)
     cache.parent.mkdir(parents=True, exist_ok=True)

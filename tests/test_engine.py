@@ -180,7 +180,8 @@ def test_load_eastmoney_parses_and_retries(tmp_path, monkeypatch):
 
 
 def test_eastmoney_qfq_is_proportional_and_positive(tmp_path, monkeypatch):
-    """等比前复权 = 后复权按最新真实价缩放：涨跌幅与后复权一致、价格恒正、最新价等于真实价。"""
+    """股票：等比前复权由不复权价与分红送配明细自建（非除息日收益 = 真实涨跌，除息日 = 含分红总收益），价格恒正、最新价等于真实价。
+    ETF（没有明细）：退回后复权按最新真实价缩放。"""
     import io
     import json
     import urllib.parse
@@ -188,20 +189,25 @@ def test_eastmoney_qfq_is_proportional_and_positive(tmp_path, monkeypatch):
 
     from ashare_quant import data as data_mod
 
-    # 后复权（比例调整）与不复权：2024-01-03 除权，每股分红 5 元
+    # 2024-01-03 除息，每股派 5 元（每 10 股 50 元）
     hfq = ["2024-01-02,100,100,101,99,10", "2024-01-03,98,97.5,99,97,10", "2024-01-04,98,99,100,97,10"]
     raw = ["2024-01-02,40,40,41,39,10", "2024-01-03,34,34,35,33,10", "2024-01-04,34.2,34.5,35,34,10"]
+    bonus = [{"EX_DIVIDEND_DATE": "2024-01-03 00:00:00", "PRETAX_BONUS_RMB": 50, "BONUS_IT_RATIO": None, "ASSIGN_PROGRESS": "实施分配"}]
 
     def fake_urlopen(req, timeout):
-        fqt = urllib.parse.parse_qs(urllib.parse.urlparse(req.full_url).query)["fqt"][0]
-        return io.BytesIO(json.dumps({"data": {"klines": hfq if fqt == "2" else raw}}).encode())
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(req.full_url).query)
+        if "reportName" in q:
+            return io.BytesIO(json.dumps({"result": {"data": bonus}}).encode())
+        return io.BytesIO(json.dumps({"data": {"klines": hfq if q["fqt"][0] == "2" else raw}}).encode())
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     df = data_mod.load_eastmoney("000333", "2024-01-01", "2024-01-31", cache_dir=tmp_path)
     assert df["close"].iloc[-1] == pytest.approx(34.5)
     ret = df["close"].pct_change().dropna().to_numpy()
-    assert ret == pytest.approx(np.array([97.5 / 100 - 1, 99 / 97.5 - 1]))
+    assert ret == pytest.approx(np.array([34 / 35 - 1, 34.5 / 34 - 1]))
     assert (df[["open", "high", "low", "close"]] > 0).all().all()
+    etf = data_mod.load_eastmoney("510300", "2024-01-01", "2024-01-31", cache_dir=tmp_path)
+    assert etf["close"].pct_change().dropna().to_numpy() == pytest.approx(np.array([97.5 / 100 - 1, 99 / 97.5 - 1]))
 
 
 def test_non_positive_prices_are_rejected():

@@ -55,3 +55,21 @@ def test_fee_rule_history():
     # 2015-08-01 起按成交额 0.02‰，2022-04-29 起 0.01‰
     assert fees.cost("000001", pd.Timestamp("2018-03-01"), "buy", 100_000, 10_000) == 2.0
     assert fees.cost("000001", pd.Timestamp("2023-03-01"), "buy", 100_000, 10_000) == 1.0
+
+
+def test_adjust_from_events_matches_total_return():
+    """自建等比前复权：非除息日收益等于真实涨跌，除息日等于含分红的总收益（600519，2024-06-19 每股派 30.876 元）。"""
+    import pandas as pd
+
+    from ashare_quant.data import adjust_from_events, parse_bonus
+
+    idx = pd.to_datetime(["2024-06-17", "2024-06-18", "2024-06-19", "2024-06-20"])
+    c = [1541.5, 1521.5, 1501.0, 1500.1]
+    raw = pd.DataFrame({"open": c, "high": c, "low": c, "close": c, "volume": [1.0] * 4}, index=idx)
+    events = parse_bonus({"result": {"data": [
+        {"EX_DIVIDEND_DATE": "2024-06-19 00:00:00", "PRETAX_BONUS_RMB": 308.76, "BONUS_IT_RATIO": None, "ASSIGN_PROGRESS": "实施分配"},
+    ]}})
+    adj = adjust_from_events(raw, events)["close"].to_numpy()
+    assert abs(adj[2] / adj[1] - 1 - (1501.0 / (1521.5 - 30.876) - 1)) < 1e-12
+    assert abs(adj[1] / adj[0] - 1521.5 / 1541.5) < 1e-12
+    assert adj[3] == 1500.1
