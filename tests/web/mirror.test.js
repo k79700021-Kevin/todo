@@ -121,3 +121,13 @@ test('stock pool reads the mirror first and trims to the requested window', asyn
     globalThis.fetch = old;
   }
 });
+
+test('coverage: a suspension (no rows, but trading resumes later in the full record) is not missing data', () => {
+  const members = { members: { '600001': [['2018-01-01', null]], '600002': [['2018-01-01', null]] } };
+  const dates = ['2018-01-02', '2018-01-03', '2018-01-04'];
+  const bars = (ds) => ({ dates: ds, open: ds.map(() => 10), high: ds.map(() => 10), low: ds.map(() => 10), close: ds.map(() => 10), volume: ds.map(() => 1) });
+  const recs = { '600001': { code: '600001', bars: bars(dates) }, '600002': { code: '600002', bars: bars(dates.slice(0, 1)), source: 'mirror', mirrorDate: '2019-05-06' } };
+  assert.equal(pool.assemble(members, recs, '2018-01-01', '2018-01-31').coverage.minDaily, 1);
+  recs['600002'].mirrorDate = '2018-01-02'; // 之后再没有交易：真的缺
+  assert.equal(pool.assemble(members, recs, '2018-01-01', '2018-01-31').coverage.minDaily, 0.5);
+});
