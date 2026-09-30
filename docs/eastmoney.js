@@ -146,8 +146,8 @@
       f[t] = acc;
     }
     const scale = (a) => a.map((v, i) => v * f[i]);
-    const out = { dates: raw.dates.slice(), open: scale(raw.open), high: scale(raw.high), low: scale(raw.low), close: scale(raw.close), volume: raw.volume.slice(), adj: 'events' };
-    if (raw.turnover) { out.raw = raw.close.slice(); out.turnover = raw.turnover.slice(); }
+    const out = { dates: raw.dates.slice(), open: scale(raw.open), high: scale(raw.high), low: scale(raw.low), close: scale(raw.close), volume: raw.volume.slice(), adj: 'events', raw: raw.close.slice() };
+    if (raw.turnover) out.turnover = raw.turnover.slice();
     return out;
   }
 

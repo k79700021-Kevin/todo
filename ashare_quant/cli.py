@@ -42,7 +42,12 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--symbols", required=True, help="逗号分隔，如 510300,510500,159915")
     p.add_argument("--start", default="2016-01-01")
     p.add_argument("--end", default="2024-12-31")
-    p.add_argument("--source", choices=["eastmoney", "akshare", "csv", "synthetic"], default="eastmoney")
+    p.add_argument(
+        "--source",
+        choices=["auto", "mirror", "eastmoney", "akshare", "csv", "synthetic"],
+        default="auto",
+        help="auto：先读行情镜像（云端可用），没有时找东方财富",
+    )
     p.add_argument("--data-dir", default="data", help="在线数据缓存目录 / CSV 目录")
     p.add_argument("--adjust", default="qfq", choices=["qfq", "hfq", ""], help="复权方式")
     p.add_argument("--cash", type=float, default=1_000_000)

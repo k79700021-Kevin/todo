@@ -217,3 +217,41 @@ def test_non_positive_prices_are_rejected():
                         "low": [-1.5, 2.9], "close": [-0.3, 3.05], "volume": [1, 1]})
     with pytest.raises(ValueError, match="价格 ≤ 0"):
         normalize_bars(bad)
+
+
+def test_mirror_loader_and_auto_fallback(tmp_path, monkeypatch):
+    """行情镜像：不复权价 + 明细自建等比前复权（与网页版 mirror.toBars 相同）；镜像里没有的代码 auto 退回东方财富。"""
+    import io
+    import json
+    import urllib.error
+    import urllib.request
+
+    from ashare_quant import data as data_mod
+
+    rec = {
+        "v": 1, "code": "600000", "kind": "stock", "name": "x",
+        "ca": [{"date": "2024-01-03", "cash": 1, "bonus": 0}],
+        "bars": {"dates": ["2024-01-02", "2024-01-03", "2024-01-04"], "open": [10, 9, 9.9], "high": [10, 9, 9.9],
+                 "low": [10, 9, 9.9], "close": [10, 9, 9.9], "volume": [1, 1, 1]},
+    }
+    seen = []
+
+    def fake_urlopen(req, timeout):
+        seen.append(req.full_url)
+        if req.full_url.endswith("/600000.json"):
+            return io.BytesIO(json.dumps(rec).encode())
+        if req.full_url.endswith(".json"):
+            raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
+        return io.BytesIO(json.dumps({"data": {"klines": ["2024-01-02,5,5,5,5,1"]}}).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    df = data_mod.load_mirror("600000", "2024-01-01", "2024-01-31")
+    assert seen[0] == data_mod.MIRROR_BASE + "stocks/600000.json"
+    assert df["close"].tolist() == pytest.approx([9, 9, 9.9])
+    assert data_mod.load_mirror("600000", "2024-01-01", "2024-01-31", adjust="hfq")["close"].tolist() == pytest.approx([10, 10, 11])
+    assert data_mod.load_mirror("600000", "2024-01-03", "2024-01-31", adjust="")["close"].tolist() == [9, 9.9]
+    with pytest.raises(ValueError, match="不在行情镜像里"):
+        data_mod.load_mirror("600001", "2024-01-01", "2024-01-31", retry_wait=0)
+    data = data_mod.load_universe(["600000", "600001"], "2024-01-01", "2024-01-31", csv_dir=tmp_path, adjust="hfq")
+    assert data["600000"]["close"].iloc[-1] == pytest.approx(11)
+    assert data["600001"]["close"].tolist() == [5]  # 退回东方财富

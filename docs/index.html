@@ -223,10 +223,10 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
             <select id="onAdjust"><option value="qfq">等比前复权（推荐）</option><option value="hfq">后复权</option><option value="none">不复权</option></select>
           </label>
           <button type="button" class="btn btn-secondary block" id="fetchBtn">获取行情</button>
-          <p class="note" id="onStatus">从东方财富获取日线（下面的回测区间为空时取 2010 年至今）。个别代码失败会跳过并提示。在 Claude 里打开时外部接口会被拦截，请用 GitHub Pages 地址。</p>
+          <p class="note" id="onStatus">优先读本仓库的行情镜像（沪深300 历史成分股、常用 ETF 与沪深300 指数，每个交易日收盘后更新，境外与云端浏览器也能访问），镜像里没有的代码从东方财富获取。个别代码失败会跳过并提示。在 Claude 里打开时外部接口会被拦截，请用 GitHub Pages 地址。</p>
         </div>
         <div data-pane="pool" hidden>
-          <p class="note">沪深300 <strong>历史成分</strong>（时点股票池）：每只股票只在它是成分股的时段内可买，被调出后卖出，基准为当期成分等权。成分由中证指数公司历次调整公告重建（含已退市公司），行情与财务数据从东方财富获取，财务数据按公告日对齐。</p>
+          <p class="note">沪深300 <strong>历史成分</strong>（时点股票池）：每只股票只在它是成分股的时段内可买，被调出后卖出，基准为当期成分等权。成分由中证指数公司历次调整公告重建（含已退市公司），行情与财务数据优先读本仓库的行情镜像（GitHub Actions 每个交易日收盘后从腾讯日线与东方财富数据中心抓取，境外、云端浏览器也能访问），读不到时直接找东方财富；财务数据按公告日对齐。</p>
           <label for="poolStart">起始年份
             <select id="poolStart"><option value="2018">2018 年至今（约 560 只）</option><option value="2015">2015 年至今（约 670 只）</option><option value="2010">2010 年至今（约 800 只）</option></select>
           </label>
@@ -240,7 +240,7 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
             <button type="button" class="linkbtn" id="poolClear">清空本地股票池</button>
           </div>
           <div class="progress" id="poolProgress" hidden><div></div></div>
-          <p class="note" id="poolStatus">首次获取每只股票要请求 4 次，几百只股票需要几分钟，可以随时暂停，下次接着取。数据存在本机浏览器。</p>
+          <p class="note" id="poolStatus">首次获取几百只股票：从行情镜像读约半分钟，镜像不可用时找东方财富（每只 4 次请求，要几分钟）；可以随时暂停，下次接着取。数据存在本机浏览器。</p>
         </div>
         <p class="note" id="dataInfo"></p>
       </section>
@@ -586,6 +586,7 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
 <script src="portfolio.js"></script>
 <script src="research.js"></script>
 <script src="eastmoney.js"></script>
+<script src="mirror.js"></script>
 <script src="stockpool.js"></script>
 <script src="ledger.js"></script>
 <script src="sample-data.js"></script>
@@ -1034,9 +1035,15 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
       // 东方财富偶尔直接断开连接，失败后稍等重试，最多 3 次；仍失败则跳过这只
       for (let attempt = 1; ; attempt++) {
         try {
-          // 等比前复权：股票用不复权价 + 分红送配明细自建（东方财富的后复权是仿射的，缩放后日收益会被压缩）；
+          // 先读行情镜像（境外、云端也能访问）；镜像里没有这只或读不到时找东方财富
+          let rec = null;
+          try { rec = await AQ.mirror.load(s); } catch (e) { rec = null; }
+          // 东方财富的等比前复权：股票用不复权价 + 分红送配明细自建（东方财富的后复权是仿射的，缩放后日收益会被压缩）；
           // ETF 或明细取不到时退回"后复权按最新真实价缩放"的近似
-          if (adjust === 'qfq') {
+          if (rec) {
+            got[s] = AQ.mirror.toBars(rec, adjust);
+            delete got[s].name;
+          } else if (adjust === 'qfq') {
             const raw = await fetchEastmoney(s, start, end, 'none');
             let ca = null;
             if (!AQ.isEtf(s) && AQ.pool) {
@@ -1111,6 +1118,7 @@ table.corr th, table.corr td { padding: 4px 5px; font-size: 11px; }
         : null;
       poolStatus(`成分数据截至 ${m.asOf}（重建自 ${m.events} 次调整）。${a.slice(0, 4)} 年以来曾为成分 ${c.wanted} 只，本地已有 ${c.got} 只` +
         (c.missing.length ? `，缺 ${c.missing.length} 只：点"获取 / 更新"补齐（已退市且东方财富没有行情的会一直缺）。` : '。') +
+        (c.mirror ? ` 其中 ${c.mirror} 只来自行情镜像（数据截至 ${c.mirrorDate}，每个交易日收盘后更新）。` : '') +
         (c.stale ? ` 其中 ${c.stale} 只是旧格式（缺分红送配明细或股本公告日：公司行为只能从复权因子推断、报告期股本可能偏差），点"获取 / 更新"会重新获取。` : '') +
         (state.pool.meta.index ? '' : ' 还没有沪深300 指数行情（获取 / 更新时一并取）。') +
         (c.got ? ` 逐日覆盖率最低 ${(c.minDaily * 100).toFixed(1)}%${c.worst ? '（' + c.worst.date + '）' : ''}。` : '') +
