@@ -83,7 +83,9 @@
         if (!w.intervals.some(([f, t]) => f <= d && (!t || d < t))) continue;
         wanted++;
         const b = data[code];
-        if (b && b.dates[0] <= d && (b.dates[b.dates.length - 1] >= d || delisted[code])) have++;
+        // 停牌期间没有日线（腾讯不给停牌日的行）：完整记录在该日之后还有交易（mirrorDate）就不算缺数据
+        const r = records[code];
+        if (b && b.dates[0] <= d && (b.dates[b.dates.length - 1] >= d || delisted[code] || (r.mirrorDate && r.mirrorDate >= d))) have++;
         else lack.push(code);
       }
       if (!wanted) continue;
