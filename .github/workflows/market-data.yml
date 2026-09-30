@@ -1,0 +1,61 @@
+name: Market data mirror
+
+# 东方财富的日线接口拒绝境外机房访问（GitHub、各家 AI 的云端浏览器都在其中），
+# 所以每个交易日收盘后在这里抓取沪深300 历史成分股、常用 ETF 与沪深300 指数，存成静态 JSON 推到 market-data 分支，
+# 网页与 Python 从 raw.githubusercontent.com 读取（见 docs/mirror.js、tools/build_market_data.js）。
+# market-data 分支每次只保留一个提交（强制推送），仓库历史不会越来越大。
+on:
+  schedule:
+    - cron: "40 8 * * 1-5" # 北京时间 16:40
+  workflow_dispatch:
+    inputs:
+      full:
+        description: 全量重建（重新抓取全部历史日线与基本面）
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: market-data
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 取回上一版镜像（增量更新的基础）
+        run: |
+          mkdir md
+          if git fetch --depth 1 origin market-data; then git archive FETCH_HEAD | tar -x -C md; else echo "还没有 market-data 分支，全量构建"; fi
+      - name: 抓取
+        run: node tools/build_market_data.js --out md ${{ inputs.full && '--full' || '' }}
+      - name: 推送到 market-data 分支
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd md
+          cat > README.md <<'MD'
+          # 行情镜像（自动生成，请勿手工修改）
+
+          由 `.github/workflows/market-data.yml` 每个交易日收盘后生成，只保留最新一个提交。
+
+          - `manifest.json`：更新时间、数据截至日、每只标的的区间与行数、失败清单
+          - `stocks/<代码>.json`：`bars` 不复权日线（腾讯）、`ca` 分红送转明细、`fin` 财务主要指标、`shares` 股本变动（东方财富）
+
+          读取方法见主分支的 `docs/mirror.js`（网页）与 `ashare_quant/data.py` 的 `load_mirror`（Python）。
+          MD
+          last=$(node -e "console.log(require('./manifest.json').lastDate)")
+          git init -q -b market-data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "行情镜像：数据截至 ${last}"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" market-data
+          node -e "const m=require('./manifest.json');console.log('## 行情镜像\n\n数据截至 '+m.lastDate+'，'+m.count+' 只，失败 '+m.failed.length+(m.failed.length?'：'+m.failed.map(f=>f.code+'（'+f.error+'）').join('、'):''))" >> "$GITHUB_STEP_SUMMARY"

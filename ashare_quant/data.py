@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -193,6 +194,69 @@ def proportional_adjust(hfq: pd.DataFrame, raw: pd.DataFrame, symbol: str) -> pd
     return out
 
 
+MIRROR_BASE = "https://raw.githubusercontent.com/k79700021-Kevin/todo/market-data/"
+MIRROR_FORMAT = 1
+
+
+def mirror_bars(rec: dict, adjust: str = "qfq") -> pd.DataFrame:
+    """镜像记录 → 日线。qfq：不复权价 + 分红送转明细自建等比前复权；hfq：同一序列按首日真实价缩放；none：不复权。指数不做调整。"""
+    b = rec["bars"]
+    df = normalize_bars(pd.DataFrame({k: b[k] for k in ["dates", "open", "high", "low", "close", "volume"]}).rename(columns={"dates": "date"}))
+    if adjust in ("", "none") or rec.get("kind") == "index":
+        return df
+    out = adjust_from_events(df, rec.get("ca") or [])
+    if adjust == "hfq":
+        k = df["close"].iloc[0] / out["close"].iloc[0]
+        out[["open", "high", "low", "close"]] = out[["open", "high", "low", "close"]] * k
+    return out
+
+
+def load_mirror(
+    symbol: str,
+    start: str,
+    end: str,
+    adjust: str = "qfq",
+    base: str = MIRROR_BASE,
+    retries: int = 3,
+    retry_wait: float = 2.0,
+) -> pd.DataFrame:
+    """读本仓库 market-data 分支上的行情镜像（GitHub Actions 每个交易日收盘后更新，见 tools/build_market_data.js）。
+
+    东方财富的日线接口拒绝境外机房访问，云端环境请用这个数据源。镜像只含沪深300 历史成分股、常用 ETF 与沪深300 指数；
+    没有的代码抛 ValueError。
+    """
+    request = urllib.request.Request(f"{base}stocks/{symbol}.json", headers=EASTMONEY_HEADERS)
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as resp:
+                rec = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise ValueError(f"{symbol} 不在行情镜像里") from exc
+            if attempt == retries - 1:
+                raise
+            time.sleep(retry_wait * 2**attempt)
+        except OSError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(retry_wait * 2**attempt)
+    if not isinstance(rec, dict) or rec.get("v") != MIRROR_FORMAT or not (rec.get("bars") or {}).get("dates"):
+        raise ValueError(f"{symbol} 的镜像记录格式不对")
+    df = mirror_bars(rec, adjust).loc[start:end]
+    if df.empty:
+        raise ValueError(f"{symbol} 在 {start} ~ {end} 没有数据")
+    return df
+
+
+def load_auto(symbol: str, start: str, end: str, adjust: str = "qfq", cache_dir: str | Path = "data") -> pd.DataFrame:
+    """先读行情镜像，镜像里没有或读不到时直接请求东方财富。"""
+    try:
+        return load_mirror(symbol, start, end, adjust)
+    except (OSError, ValueError):
+        return load_eastmoney(symbol, start, end, adjust, cache_dir)
+
+
 def load_eastmoney(
     symbol: str,
     start: str,
@@ -319,7 +383,7 @@ def load_universe(
     symbols: list[str],
     start: str,
     end: str,
-    source: str = "eastmoney",
+    source: str = "auto",
     csv_dir: str | Path = "data",
     adjust: str = "qfq",
     seed: int = 42,
@@ -329,6 +393,10 @@ def load_universe(
     if source == "csv":
         data = {s: load_csv(Path(csv_dir) / f"{s}.csv") for s in symbols}
         return {s: df.loc[start:end] for s, df in data.items()}
+    if source == "auto":
+        return {s: load_auto(s, start, end, adjust, csv_dir) for s in symbols}
+    if source == "mirror":
+        return {s: load_mirror(s, start, end, adjust) for s in symbols}
     if source == "eastmoney":
         return {s: load_eastmoney(s, start, end, adjust, csv_dir) for s in symbols}
     if source == "akshare":

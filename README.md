@@ -41,7 +41,20 @@ python -m ashare_quant backtest --strategy momentum --symbols 510300,510500,1599
 
 报告输出在 `output/`：`summary.md`、`report.png`、`equity.csv`、`trades.csv`。
 
-常用参数：`--cash` 初始资金、`--commission` 佣金率、`--min-commission` 最低佣金、`--slippage` 滑点、`--band` 调仓容差、`--adjust qfq|hfq|""` 复权方式、`--source eastmoney|akshare|csv|synthetic`、`--data-dir` 缓存/CSV 目录（CSV 命名为 `<代码>.csv`，需含 `date,open,high,low,close,volume` 列）。
+常用参数：`--cash` 初始资金、`--commission` 佣金率、`--min-commission` 最低佣金、`--slippage` 滑点、`--band` 调仓容差、`--adjust qfq|hfq|""` 复权方式、`--source auto|mirror|eastmoney|akshare|csv|synthetic`（默认 auto：先读行情镜像，没有的代码找东方财富）、`--data-dir` 缓存/CSV 目录（CSV 命名为 `<代码>.csv`，需含 `date,open,high,low,close,volume` 列）。
+
+## 数据源与行情镜像
+
+东方财富的日线接口（push2his）拒绝境外机房访问，GitHub 的服务器、各家 AI 的云端浏览器与云端代码环境都取不到。为此仓库自带一份**行情镜像**：
+
+- `.github/workflows/market-data.yml` 每个交易日北京时间 16:40 运行 `tools/build_market_data.js`，抓取沪深300 历史成分股（含已退市）、网页预设的 ETF 与沪深300 指数，存成静态 JSON 推到 `market-data` 分支（只保留最新一个提交）
+  - 日线：腾讯（不复权；与东方财富逐日核对一致，开高低收到分、成交量到手；覆盖已退市公司）
+  - 分红送配、财务主要指标、股本变动：东方财富数据中心；ETF 分红与份额拆分：东方财富基金 F10（境外都能访问）
+  - 复权价由使用方用不复权价 + 明细自建等比前复权；数据中心没有明细的已退市公司用腾讯日线里附带的分红送转
+- 读取：`https://raw.githubusercontent.com/k79700021-Kevin/todo/market-data/stocks/<代码>.json`（允许跨域，约 5 分钟缓存），清单在 `manifest.json`
+- 网页版的个股池与在线获取、Python 版的默认数据源（`--source auto`）都先读镜像，镜像里没有或读不到时再直接找东方财富
+- 手动重建：Actions → Market data mirror → Run workflow（勾选"全量重建"会重新抓全部历史）；本地试跑：`node tools/build_market_data.js --out /tmp/md --codes 000333,510300`
+- 局限：镜像只到最近一个交易日收盘；只含上面这些标的，其他代码仍要东方财富（境内网络）；成交额、换手率不在镜像里（流通市值用股本变动计算）
 
 ## 网页版（手机可用）
 
@@ -97,7 +110,7 @@ python -m ashare_quant backtest --strategy momentum --symbols 510300,510500,1599
 
 指标口径与通达信一致（EMA 首值为种子，RSI/KDJ 用 SMA(X,N,1) 平滑，MACD 柱 = 2×(DIF−DEA)）。测试覆盖：`tests/test_web_indicators.py` 逐点对照 pandas 独立实现；`tests/test_web_parity.py` 比对网页版与 Python 版引擎的逐日净值；`tests/web/research.test.js` 覆盖策略状态机、优化、前推与统计函数。
 
-- 数据来源：内置示例（程序合成的模拟行情）、上传 CSV（可直接用 Python 版缓存在 `data/` 的文件）、在线从东方财富获取（一次取 2005 年至今全历史，等比前复权（股票由不复权价与分红送配明细自建；ETF 没有明细，用后复权按最新价缩放近似），个别代码失败会跳过；预设大类资产 ETF、行业 ETF、大盘蓝筹股票池）、个股池（见上）；上传与获取的数据保存在本机浏览器
+- 数据来源：内置示例（程序合成的模拟行情）、上传 CSV（可直接用 Python 版缓存在 `data/` 的文件）、在线获取（先读行情镜像，镜像里没有的代码从东方财富取；一次取全历史，等比前复权（股票由不复权价与分红送配明细自建；ETF 没有明细，用后复权按最新价缩放近似），个别代码失败会跳过；预设大类资产 ETF、行业 ETF、大盘蓝筹股票池）、个股池（见上）；上传与获取的数据保存在本机浏览器
 - 更新沪深300 成分：`pip install openpyxl xlrd pdfplumber && python tools/build_hs300.py`；若中证发布了新的临时调整，脚本会因校验不通过而报错并指出差异，按公告补进 `tools/hs300_adhoc.json` 即可；每周的真实数据检查会报告仓库里的成分数据是否过期
 - 在线地址：<https://k79700021-kevin.github.io/todo/>（GitHub Pages 从 `main` 分支根目录发布，根目录的 `index.html` 跳转到 `docs/`）
 - 真实数据检查：`.github/workflows/data-smoke.yml` 在 GitHub 服务器上用真实行情验证网页版与 Python 版的东方财富数据源（两边逐日核对），顺带报告 akshare 是否可用，并在真实数据上跑一遍回测、优化与因子分析，结果见该工作流的运行摘要；每周一自动运行
@@ -145,9 +158,9 @@ ashare_quant/
   optimize.py    网格搜索 + 样本外检验
   report.py      报告输出
   cli.py         命令行
-docs/            网页版（indicators / engine / rules / research / eastmoney / stockpool / worker）
+docs/            网页版（indicators / engine / rules / research / eastmoney / mirror / stockpool / worker）
   data/          沪深300 历史成分（tools/build_hs300.py 生成）
-tools/           示例数据生成、沪深300 成分重建、真实数据检查脚本
+tools/           示例数据生成、沪深300 成分重建、行情镜像构建、真实数据检查脚本
 tests/           单元测试（pytest，含网页版一致性测试）
 ```
 
@@ -155,9 +168,9 @@ tests/           单元测试（pytest，含网页版一致性测试）
 
 - 仅日线、仅做多，按开盘价成交，不模拟盘中撮合；成交量约束是按前 20 日均额的参与率上限
 - 真实价格只在有不复权价时可用（个股池、在线获取）；上传的 CSV 与示例数据只有一套价格，成交价就是给定价格
-- 未处理 ST 股 5% 涨跌幅；派现按税前金额计（红利税因持有期与账户类型而异，未扣）；配股不在分红送配明细里，不做复权调整（不认购的持有人确实承担除权损失，未模拟缴款认购）；没有明细的复权跳变只有幅度 ≥ 2% 且之后维持在新水平才按"价值不变折现"处理；ETF 的复权价是后复权缩放的近似；复权价与不复权价各自舍入到分，低于舍入容差（约 0.01/股价 × 2，低价股约 0.3~0.7%）的小额分红会被忽略
+- 未处理 ST 股 5% 涨跌幅；派现按税前金额计（红利税因持有期与账户类型而异，未扣）；配股不在分红送配明细里，不做复权调整（不认购的持有人确实承担除权损失，未模拟缴款认购）；没有明细的复权跳变只有幅度 ≥ 2% 且之后维持在新水平才按"价值不变折现"处理；ETF 从行情镜像读取时按分红与份额拆分明细自建复权，直接从东方财富获取时是后复权缩放的近似；复权价与不复权价各自舍入到分，低于舍入容差（约 0.01/股价 × 2，低价股约 0.3~0.7%）的小额分红会被忽略
 - 创业板 ETF 的 20% 涨跌幅名单只含已核实的 159915、159949（其他可用 `meta.priceLimit` 覆盖）
-- 个股池只有沪深300；已退市公司能否取到行情取决于东方财富，取不到的会在页面上列为缺失
+- 个股池只有沪深300；已退市公司的行情来自行情镜像（腾讯）或东方财富，都取不到的会在页面上列为缺失
 - 财务数据没有真正的"原始披露库"：净利润、每股净资产按数据源记录（抽查与原始披露一致），营收与利润同比增速可能用了追溯调整后的上年数；保守口径（最后更新日）可以检验结论是否依赖这一点
 - 沪深300 官方指数为价格指数，不含分红（全收益约高 2%/年）
 - 行业分类不是时点数据：信号层不能用行业中性化 / 行业约束，要用需要自备时点行业库

@@ -5,6 +5,7 @@
 
   const isNode = typeof module !== 'undefined' && module.exports;
   const em = isNode ? require('./eastmoney.js') : root.AQ.em;
+  const mirror = isNode ? require('./mirror.js') : root.AQ.mirror;
   const DB_NAME = 'aq-stockpool';
   const STORE = 'stocks';
   const WARMUP_DAYS = 420; // 纳入前预留约 280 个交易日，供 250 日指标预热
@@ -90,7 +91,9 @@
       if (ratio < minDaily) { minDaily = ratio; worst = { date: d, ratio, wanted, missing: lack.slice(0, 50) }; }
     }
     const approxAdj = Object.keys(data).filter((code) => records[code] && records[code].bars && records[code].bars.adj !== 'events').length;
-    const coverage = { wanted: Object.keys(want).length, got, missing, minDaily, worst, approxAdj, stale: Object.values(records).filter((r) => r.code !== INDEX_KEY && r.v !== VERSION).length };
+    const fromMirror = Object.keys(data).filter((code) => records[code].source === 'mirror');
+    const mirrorDate = fromMirror.reduce((m, code) => (records[code].mirrorDate > m ? records[code].mirrorDate : m), '') || null;
+    const coverage = { wanted: Object.keys(want).length, got, missing, minDaily, worst, approxAdj, mirror: fromMirror.length, mirrorDate, stale: Object.values(records).filter((r) => r.code !== INDEX_KEY && r.v !== VERSION).length };
     if (strict && (minDaily < minCoverage || (!days.size && coverage.wanted))) {
       const w = worst ? `最低的一天 ${worst.date} 为 ${(worst.ratio * 100).toFixed(1)}%（${worst.wanted} 只应在池内，缺 ${worst.wanted - Math.round(worst.ratio * worst.wanted)} 只：${worst.missing.slice(0, 10).join('、')}${worst.missing.length > 10 ? '…' : ''}）` : '没有任何行情';
       throw new Error(`时点股票池覆盖率不足 ${(minCoverage * 100).toFixed(1)}%：${w}。缺数据的历史成分不能静默删除（幸存者偏差）；请补齐数据，或关闭严格模式后自行承担偏差。`);
@@ -182,9 +185,23 @@
     }
   }
 
-  /* 一只股票：不复权行情（含换手率）+ 分红送配明细 → 自建等比前复权；明细取不到时退回"缩放后复权"（近似，记 adj = 'hfq'）；
-   * 另取财务主要指标、股本变动历史。 */
+  /* 一只股票：先读行情镜像（GitHub 上每个交易日收盘后更新，境外与云端也能访问，见 mirror.js），
+   * 镜像没有或读不到时直接找东方财富。 */
   async function fetchStock(code, from, to) {
+    try {
+      const rec = await mirror.load(code);
+      if (rec.kind === 'stock' && Array.isArray(rec.ca)) {
+        const bars = trim(mirror.toBars(rec, 'qfq'), from, to);
+        bars.adj = 'events';
+        return { code, v: VERSION, name: rec.name || '', bars, fin: rec.fin || [], shares: rec.shares || [], ca: rec.ca, from, to, fetched: new Date().toISOString().slice(0, 10), source: 'mirror', mirrorDate: rec.bars.dates[rec.bars.dates.length - 1] };
+      }
+    } catch (e) { /* 退回东方财富 */ }
+    return fetchStockEastmoney(code, from, to);
+  }
+
+  /* 东方财富：不复权行情（含换手率）+ 分红送配明细 → 自建等比前复权；明细取不到时退回"缩放后复权"（近似，记 adj = 'hfq'）；
+   * 另取财务主要指标、股本变动历史。 */
+  async function fetchStockEastmoney(code, from, to) {
     const k = (adj) => withRetry(async () => em.parseKlines(await jsonp((cb) => em.klineUrl(code, from, to, adj, cb)), code));
     const raw = await k('none');
     let ca = null;
@@ -194,7 +211,7 @@
     try { fin = em.parseFinance(await withRetry(() => jsonp((cb) => em.financeUrl(code, cb)))); } catch (e) { /* 财务数据缺失不影响行情 */ }
     let shares = [];
     try { shares = em.parseShares(await withRetry(() => jsonp((cb) => em.sharesUrl(code, cb)))); } catch (e) { /* 缺股本时估值退回每股口径 */ }
-    return { code, v: VERSION, name: raw.name || hfq.name || '', bars, fin, shares, ca, from, to, fetched: new Date().toISOString().slice(0, 10) };
+    return { code, v: VERSION, name: raw.name || '', bars, fin, shares, ca, from, to, fetched: new Date().toISOString().slice(0, 10), source: 'eastmoney' };
   }
 
   /* 构建股票池：已存且覆盖所需区间的股票跳过（可中断后继续）。onProgress(done, total, code, failed) */
@@ -207,8 +224,12 @@
     });
     // 官方指数（第二基准）：取全历史（成分股行情含预热期，早于起始年份），每次都更新
     try {
-      const bars = em.parseKlines(await withRetry(() => jsonp((cb) => em.indexKlineUrl('000300', '2005-01-01', end, cb))), '000300');
-      await dbPut({ code: INDEX_KEY, bars, fetched: new Date().toISOString().slice(0, 10) });
+      let bars, source = 'mirror';
+      try { bars = mirror.toBars(await mirror.load('000300'), 'none'); } catch (e) {
+        bars = em.parseKlines(await withRetry(() => jsonp((cb) => em.indexKlineUrl('000300', '2005-01-01', end, cb))), '000300');
+        source = 'eastmoney';
+      }
+      await dbPut({ code: INDEX_KEY, bars, fetched: new Date().toISOString().slice(0, 10), source });
     } catch (e) { /* 取不到指数时只用成分等权基准 */ }
     const failed = [];
     let done = Object.keys(want).length - todo.length;
@@ -236,7 +257,7 @@
     return assemble(members, await dbAll(), start, end, opts);
   }
 
-  const api = { plan, trim, assemble, build, load, dbAll, dbClear, jsonp, WARMUP_DAYS, VERSION, INDEX_KEY };
+  const api = { plan, trim, assemble, build, load, dbAll, dbClear, jsonp, fetchStock, WARMUP_DAYS, VERSION, INDEX_KEY };
   if (isNode) module.exports = api;
   else root.AQ.pool = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
