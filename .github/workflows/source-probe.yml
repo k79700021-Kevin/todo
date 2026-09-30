@@ -1,0 +1,21 @@
+name: Data source probe (temporary)
+on:
+  push:
+    branches: [claude/claim-credit-endpoint-e6ahpk]
+    paths: [.github/workflows/source-probe.yml]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe candidate market data sources from a GitHub runner
+        run: |
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0 Safari/537.36'
+          probe() { for i in 1 2 3; do printf '%s #%s: ' "$1" "$i"; curl -sS -m 20 -A "$UA" -e "$3" -o /tmp/o -w '%{http_code} %{size_download}B ' "$2" 2>&1 | tail -c 80; head -c 90 /tmp/o | tr '\n' ' '; echo; sleep 2; done; }
+          probe tencent-kline 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,2016-01-01,2021-12-31,2000,' 'https://gu.qq.com/'
+          probe tencent-delisted 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh601299,day,2010-01-01,2016-12-31,2000,' 'https://gu.qq.com/'
+          probe em-datacenter 'https://datacenter.eastmoney.com/securities/api/data/v1/get?reportName=RPT_SHAREBONUS_DET&columns=EX_DIVIDEND_DATE,PRETAX_BONUS_RMB&filter=(SECUCODE%3D%22000333.SZ%22)&pageSize=5' 'https://data.eastmoney.com/'
+          probe em-fundf10 'https://fundf10.eastmoney.com/fhsp_510300.html' 'https://fund.eastmoney.com/'
+          probe em-push2his 'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=0.000333&fields1=f1&fields2=f51,f53&klt=101&fqt=0&beg=20240101&end=20240110' 'https://quote.eastmoney.com/'
+          probe sina-kline 'https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData?symbol=sz000333&scale=240&ma=no&datalen=5' 'https://finance.sina.com.cn/'
+          probe yahoo 'https://query1.finance.yahoo.com/v8/finance/chart/000333.SZ?range=5d&interval=1d' ''
+          probe csindex 'https://www.csindex.com.cn/csindex-home/index/weight/index-weight-list?indexCode=000300' 'https://www.csindex.com.cn/'
